@@ -12,7 +12,9 @@ FetchContent_MakeAvailable(googletest)
 # Unit tests
 add_executable(unit_tests
     unit/test_connection_state_machine.cpp
+    unit/test_sec_cert_interface.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/connection_state_machine.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_cert_interface.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
