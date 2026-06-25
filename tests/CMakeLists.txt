@@ -21,12 +21,14 @@ add_executable(unit_tests
     unit/test_offline_cache_queue.cpp
     unit/test_route_bridge.cpp
     unit/test_config_manager.cpp
+    unit/test_internal_bus_interface.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/connection_state_machine.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_cert_interface.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_client_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/offline_cache_queue.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/route_bridge.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/config_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/internal_bus_interface.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
