@@ -29,7 +29,7 @@ public:
     void onDisconnect();
 
 private:
-    void transitionTo(ConnectionState new_state);
+    StateChangeCallback transitionTo(ConnectionState new_state);
     void calculateNextRetry();
 
     mutable std::mutex mutex_;
