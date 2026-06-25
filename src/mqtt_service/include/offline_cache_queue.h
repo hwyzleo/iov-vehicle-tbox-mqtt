@@ -5,6 +5,7 @@
 #include <map>
 #include <mutex>
 #include <chrono>
+#include <optional>
 
 namespace tbox {
 namespace mqtt {
@@ -15,7 +16,7 @@ struct MessageComparator {
         if (a.priority != b.priority) {
             return a.priority < b.priority;  // Higher priority first
         }
-        return a.created_at < b.created_at;  // Newer messages first within same priority
+        return a.created_at > b.created_at;  // Older messages first within same priority (FIFO)
     }
 };
 
@@ -29,7 +30,7 @@ public:
     bool enqueue(const OutboundMessage& message);
 
     // Dequeue highest priority message
-    OutboundMessage dequeue();
+    std::optional<OutboundMessage> dequeue();
 
     // Get queue size
     size_t size() const;

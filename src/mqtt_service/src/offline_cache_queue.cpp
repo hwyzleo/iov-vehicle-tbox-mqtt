@@ -27,18 +27,25 @@ bool OfflineCacheQueue::enqueue(const OutboundMessage& message) {
     return true;
 }
 
-OutboundMessage OfflineCacheQueue::dequeue() {
+std::optional<OutboundMessage> OfflineCacheQueue::dequeue() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (queue_.empty()) {
-        return OutboundMessage{};
+    while (!queue_.empty()) {
+        auto message = queue_.top();
+        queue_.pop();
+
+        // Check if message still exists in map (may have been updated)
+        auto it = message_map_.find(message.msg_id);
+        if (it != message_map_.end()) {
+            // Get current state from map (single source of truth)
+            auto current_message = it->second;
+            message_map_.erase(it);
+            return current_message;
+        }
+        // Message was already removed (e.g., dropped), skip it
     }
 
-    auto message = queue_.top();
-    queue_.pop();
-    message_map_.erase(message.msg_id);
-
-    return message;
+    return std::nullopt;
 }
 
 size_t OfflineCacheQueue::size() const {
@@ -121,10 +128,19 @@ OfflineCacheQueue::QueueStats OfflineCacheQueue::getStats() const {
 void OfflineCacheQueue::dropOldestMessage() {
     if (queue_.empty()) return;
 
-    // Find oldest message
-    auto oldest_msg = queue_.top();
-    queue_.pop();
-    message_map_.erase(oldest_msg.msg_id);
+    // Find oldest message (queue_.top() returns highest priority, oldest first)
+    while (!queue_.empty()) {
+        auto oldest_msg = queue_.top();
+        queue_.pop();
+
+        // Check if message still exists in map
+        auto it = message_map_.find(oldest_msg.msg_id);
+        if (it != message_map_.end()) {
+            message_map_.erase(it);
+            return;
+        }
+        // Message was already removed, try next
+    }
 }
 
 void OfflineCacheQueue::dropLowestPriorityMessage() {
@@ -146,13 +162,15 @@ void OfflineCacheQueue::dropLowestPriorityMessage() {
         // Rebuild queue (simplified approach)
         std::vector<OutboundMessage> messages;
         while (!queue_.empty()) {
-            messages.push_back(queue_.top());
+            auto msg = queue_.top();
             queue_.pop();
+            // Only keep messages that are still in the map
+            if (message_map_.find(msg.msg_id) != message_map_.end()) {
+                messages.push_back(msg);
+            }
         }
         for (const auto& msg : messages) {
-            if (msg.msg_id != lowest_priority_id) {
-                queue_.push(msg);
-            }
+            queue_.push(msg);
         }
     }
 }
