@@ -14,8 +14,12 @@ void ConnectionStateMachine::setStateChangeCallback(StateChangeCallback callback
 }
 
 void ConnectionStateMachine::start() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    transitionTo(ConnectionState::CERT_WAIT);
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cb = transitionTo(ConnectionState::CERT_WAIT);
+    }
+    if (cb) cb(ConnectionState::CERT_WAIT);
 }
 
 ConnectionState ConnectionStateMachine::getCurrentState() const {
@@ -34,69 +38,97 @@ void ConnectionStateMachine::setMaxRetries(uint32_t max_retries) {
 }
 
 void ConnectionStateMachine::onCertificateReady() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::CERT_WAIT) {
-        transitionTo(ConnectionState::CONNECTING);
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CERT_WAIT) {
+            cb = transitionTo(ConnectionState::CONNECTING);
+        }
     }
+    if (cb) cb(ConnectionState::CONNECTING);
 }
 
 void ConnectionStateMachine::onConnectionSuccess() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::CONNECTING) {
-        state_info_.retry_count = 0;
-        transitionTo(ConnectionState::CONNECTED);
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTING) {
+            state_info_.retry_count = 0;
+            cb = transitionTo(ConnectionState::CONNECTED);
+        }
     }
+    if (cb) cb(ConnectionState::CONNECTED);
 }
 
 void ConnectionStateMachine::onConnectionFailure(const std::string& error) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::CONNECTING) {
-        state_info_.last_error = error;
-        state_info_.retry_count++;
+    StateChangeCallback cb;
+    ConnectionState new_state;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTING) {
+            state_info_.last_error = error;
+            state_info_.retry_count++;
 
-        if (state_info_.retry_count >= max_retries_) {
-            transitionTo(ConnectionState::OFFLINE);
-        } else {
-            transitionTo(ConnectionState::RECONNECTING);
-            calculateNextRetry();
+            if (state_info_.retry_count >= max_retries_) {
+                new_state = ConnectionState::OFFLINE;
+                cb = transitionTo(ConnectionState::OFFLINE);
+            } else {
+                new_state = ConnectionState::RECONNECTING;
+                cb = transitionTo(ConnectionState::RECONNECTING);
+                calculateNextRetry();
+            }
         }
     }
+    if (cb) cb(new_state);
 }
 
 void ConnectionStateMachine::onRetryTimeout() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::RECONNECTING) {
-        if (state_info_.retry_count >= max_retries_) {
-            transitionTo(ConnectionState::OFFLINE);
-        } else {
-            transitionTo(ConnectionState::CONNECTING);
+    StateChangeCallback cb;
+    ConnectionState new_state;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::RECONNECTING) {
+            if (state_info_.retry_count >= max_retries_) {
+                new_state = ConnectionState::OFFLINE;
+                cb = transitionTo(ConnectionState::OFFLINE);
+            } else {
+                new_state = ConnectionState::CONNECTING;
+                cb = transitionTo(ConnectionState::CONNECTING);
+            }
         }
     }
+    if (cb) cb(new_state);
 }
 
 void ConnectionStateMachine::onNetworkRestored() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::OFFLINE) {
-        state_info_.retry_count = 0;
-        transitionTo(ConnectionState::CERT_WAIT);
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::OFFLINE) {
+            state_info_.retry_count = 0;
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        }
     }
+    if (cb) cb(ConnectionState::CERT_WAIT);
 }
 
 void ConnectionStateMachine::onDisconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_info_.state == ConnectionState::CONNECTED) {
-        state_info_.last_error = "Connection disconnected";
-        state_info_.retry_count++;
-        transitionTo(ConnectionState::RECONNECTING);
-        calculateNextRetry();
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTED) {
+            state_info_.last_error = "Connection disconnected";
+            state_info_.retry_count++;
+            cb = transitionTo(ConnectionState::RECONNECTING);
+            calculateNextRetry();
+        }
     }
+    if (cb) cb(ConnectionState::RECONNECTING);
 }
 
-void ConnectionStateMachine::transitionTo(ConnectionState new_state) {
+ConnectionStateMachine::StateChangeCallback ConnectionStateMachine::transitionTo(ConnectionState new_state) {
     state_info_.state = new_state;
-    if (callback_) {
-        callback_(new_state);
-    }
+    return callback_;
 }
 
 void ConnectionStateMachine::calculateNextRetry() {
