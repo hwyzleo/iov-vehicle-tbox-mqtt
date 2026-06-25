@@ -38,7 +38,9 @@ set(MQTT_SERVICE_SOURCES
 
 # Main library
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})
+target_link_directories(mqtt_service_lib PUBLIC ${MOSQUITTO_LIBRARY_DIRS})
 target_link_libraries(mqtt_service_lib
+    PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     ${MOSQUITTO_LIBRARIES}
@@ -49,8 +51,7 @@ target_link_libraries(mqtt_service_lib
 
 # Main executable
 add_executable(tbox_mqtt_service src/main.cpp)
-target_link_directories(tbox_mqtt_service PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
-target_link_libraries(tbox_mqtt_service mqtt_service_lib ${MOSQUITTO_LIBRARIES})
+target_link_libraries(tbox_mqtt_service mqtt_service_lib)
 
 # Testing
 enable_testing()

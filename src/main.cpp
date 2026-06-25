@@ -6,16 +6,15 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <atomic>
 
 using namespace tbox::mqtt;
 
+std::atomic<bool> g_running{true};
 std::unique_ptr<MqttService> g_service;
 
 void signal_handler(int signal) {
-    if (g_service) {
-        g_service->stop();
-    }
-    exit(0);
+    g_running = false;
 }
 
 int main(int argc, char* argv[]) {
@@ -29,8 +28,9 @@ int main(int argc, char* argv[]) {
     auto sec = std::make_shared<SecCertInterface>();
     auto bus = std::make_shared<InternalBusInterface>();
 
-    // Simulate certificate ready (in real scenario, this would come from SEC)
+#ifdef SIMULATE_CERT
     sec->simulateCertificateReady();
+#endif
 
     // Create and initialize service
     g_service = std::make_unique<MqttService>();
@@ -71,16 +71,23 @@ int main(int argc, char* argv[]) {
     std::cout << "TBOX MQTT Service started successfully" << std::endl;
 
     // Main loop
-    while (true) {
+    ConnectionState last_logged_state = ConnectionState::INIT;
+    bool first_iteration = true;
+    while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
-        // Monitor connection state
+        // Monitor connection state - only log on transitions
         auto state = g_service->getConnectionState();
-        if (state.state != ConnectionState::CONNECTED) {
+        if (first_iteration || state.state != last_logged_state) {
             std::cout << "Connection state: " << static_cast<int>(state.state)
                       << " - " << state.last_error << std::endl;
+            last_logged_state = state.state;
+            first_iteration = false;
         }
     }
 
+    std::cout << "Shutting down..." << std::endl;
+    g_service->stop();
+    g_service.reset();
     return 0;
 }
