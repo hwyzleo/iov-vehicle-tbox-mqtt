@@ -59,9 +59,6 @@ bool MqttClientManager::initialize(const std::string& broker_host,
                                   uint16_t broker_port,
                                   const std::string& client_id,
                                   const SecCertInterface& sec_interface) {
-    // Store client ID
-    client_id_ = client_id;
-
     // Create mosquitto instance with client ID
     mosq_ = mosquitto_new(client_id.c_str(), true, this);
     if (!mosq_) return false;
@@ -87,10 +84,7 @@ bool MqttClientManager::initialize(const std::string& broker_host,
                               nullptr,            // password
                               nullptr);           // callback
 
-    // For testing purposes, we'll consider initialization successful
-    // even if TLS configuration fails (e.g., CA file not found)
-    // In production, we'd return rc == MOSQ_ERR_SUCCESS
-    return true;
+    return rc == MOSQ_ERR_SUCCESS;
 }
 
 bool MqttClientManager::connect(const ConnectionConfig& config) {

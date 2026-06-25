@@ -66,7 +66,6 @@ public:
 private:
     struct mosquitto* mosq_;  // mosquitto instance
     bool connected_ = false;
-    std::string client_id_;
     MessageCallback message_callback_;
     ConnectionCallback connection_callback_;
     LwtConfig lwt_config_;
