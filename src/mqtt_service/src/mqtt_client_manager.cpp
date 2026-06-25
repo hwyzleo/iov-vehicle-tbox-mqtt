@@ -58,7 +58,8 @@ MqttClientManager::~MqttClientManager() {
 bool MqttClientManager::initialize(const std::string& broker_host,
                                   uint16_t broker_port,
                                   const std::string& client_id,
-                                  const SecCertInterface& sec_interface) {
+                                  const SecCertInterface& sec_interface,
+                                  const std::string& ca_file_path) {
     // Create mosquitto instance with client ID
     mosq_ = mosquitto_new(client_id.c_str(), true, this);
     if (!mosq_) return false;
@@ -78,7 +79,7 @@ bool MqttClientManager::initialize(const std::string& broker_host,
     // For testing, we'll skip TLS configuration if CA file doesn't exist
     // In production, this would be required
     int rc = mosquitto_tls_set(mosq_,
-                              "/path/to/ca.crt",  // root CA
+                              ca_file_path.c_str(),  // root CA
                               nullptr,            // cert path
                               nullptr,            // key path
                               nullptr,            // password
