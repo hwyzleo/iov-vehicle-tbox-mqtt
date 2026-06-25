@@ -113,19 +113,19 @@ enum class ErrorCode {
 
 // API result types
 struct PublishResult {
-    bool accepted;
+    bool accepted = false;
     std::optional<ErrorCode> error;
 };
 
 struct SubscribeResult {
-    bool status;
+    bool status = false;
     std::optional<ErrorCode> error;
 };
 
 struct ConnectionStateResult {
-    ConnectionState state;
+    ConnectionState state = ConnectionState::INIT;
     std::string last_error;
-    uint32_t retry_count;
+    uint32_t retry_count = 0;
 };
 
 } // namespace mqtt
