@@ -45,15 +45,15 @@ enum class Priority : uint8_t {
 // Connection configuration (Design §3)
 struct ConnectionConfig {
     std::string broker_host;
-    uint16_t broker_port;
+    uint16_t broker_port = 8883;
     std::string root_ca_ref;
     std::string client_id;  // VIN + SN
-    uint16_t keepalive;
+    uint16_t keepalive = 60;
     bool clean_start = false;
-    uint32_t session_expiry;
+    uint32_t session_expiry = 3600;
     std::string tls_cert_ref;  // SEC handle
-    enum Source { FACTORY, OTA } source;
-    uint32_t version;
+    enum class Source : uint8_t { FACTORY, OTA } source = Source::FACTORY;
+    uint32_t version = 0;
 };
 
 // Connection state tracking (Design §3)
@@ -87,8 +87,8 @@ struct Subscription {
 struct RouteEntry {
     std::string internal_addr;
     std::string mqtt_topic;
-    enum Direction { UP, DOWN } direction;
-    QoS qos;
+    enum class Direction : uint8_t { UP, DOWN } direction = Direction::UP;
+    QoS qos = QoS::AT_MOST_ONCE;
 };
 
 // LWT configuration (Design §3)
@@ -96,7 +96,7 @@ struct LwtConfig {
     std::string topic;
     std::vector<uint8_t> payload;  // offline status
     QoS qos = QoS::AT_LEAST_ONCE;
-    bool retain;
+    bool retain = false;
 };
 
 // Error codes (Requirements §6)

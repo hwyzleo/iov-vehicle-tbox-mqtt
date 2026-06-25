@@ -16,16 +16,6 @@ pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 # SQLite for offline cache
 find_package(SQLite3 REQUIRED)
 
-# Include directories
-include_directories(
-    ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
-    ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
-    ${MOSQUITTO_INCLUDE_DIRS}
-)
-
-# Link directories
-link_directories(${MOSQUITTO_LIBRARY_DIRS})
-
 # Source files
 set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/mqtt_service.cpp
@@ -40,6 +30,12 @@ set(MQTT_SERVICE_SOURCES
 
 # Main library
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})
+target_include_directories(mqtt_service_lib PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${MOSQUITTO_INCLUDE_DIRS}
+)
+target_link_directories(mqtt_service_lib PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
 target_link_libraries(mqtt_service_lib
     OpenSSL::SSL
     OpenSSL::Crypto
