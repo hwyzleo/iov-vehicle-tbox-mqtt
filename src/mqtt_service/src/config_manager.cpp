@@ -26,21 +26,25 @@ bool ConfigManager::loadDefaultConfig() {
 
 bool ConfigManager::applyConfig(const ConnectionConfig& config,
                                ConnectionConfig::Source source) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    ChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
 
-    if (!validateConfig(config)) {
-        return false;
+        if (!validateConfig(config)) {
+            return false;
+        }
+
+        if (source == ConnectionConfig::Source::OTA &&
+            config.version <= current_version_) {
+            return false;
+        }
+
+        current_config_ = config;
+        current_version_ = config.version;
+        cb = change_callback_;
     }
 
-    if (source == ConnectionConfig::Source::OTA &&
-        config.version <= current_version_) {
-        return false;
-    }
-
-    current_config_ = config;
-    current_version_ = config.version;
-
-    notifyChange();
+    if (cb) cb();
     return true;
 }
 
