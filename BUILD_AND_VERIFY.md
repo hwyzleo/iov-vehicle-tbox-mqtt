@@ -41,85 +41,118 @@ sudo yum install -y \
     gtest-devel
 ```
 
-## 2. 构建步骤
+## 2. 快速开始
 
-### 2.1 克隆项目
+### 2.1 使用脚本（推荐）
+
 ```bash
+# 首次构建
+./scripts/build.sh --clean
+
+# 运行测试
+./scripts/test.sh
+
+# 快速验证（自动检测更新）
+./scripts/quick.sh
+
+# 完整验证（构建+测试）
+./scripts/verify.sh
+
+# 清理构建
+./scripts/clean.sh
+```
+
+### 2.2 手动构建
+
+```bash
+# 克隆项目
 git clone <repository-url>
 cd iov-vehicle-tbox-mqtt
-```
 
-### 2.2 创建构建目录
-```bash
+# 创建构建目录
 mkdir -p build
 cd build
-```
 
-### 2.3 配置 CMake
-```bash
+# 配置 CMake
 cmake ..
-```
 
-**常见问题排查：**
-
-如果 CMake 找不到 mosquitto，可能需要手动指定路径：
-```bash
-# macOS
-cmake -DMOSQUITTO_INCLUDE_DIRS=/opt/homebrew/include \
-      -DMOSQUITTO_LIBRARY_DIRS=/opt/homebrew/lib ..
-
-# Linux (如果安装在非标准路径)
-cmake -DMOSQUITTO_INCLUDE_DIRS=/usr/local/include \
-      -DMOSQUITTO_LIBRARY_DIRS=/usr/local/lib ..
-```
-
-### 2.4 编译
-```bash
+# 编译
 make -j$(nproc)
 ```
 
-编译成功后，将生成以下文件：
-- `tbox_mqtt_service` - 主可执行文件
-- `libmqtt_service_lib.a` - 静态库
+## 3. 脚本使用说明
 
-## 3. 测试验证
+### 3.1 build.sh - 构建脚本
+```bash
+./scripts/build.sh              # Release 模式构建
+./scripts/build.sh --debug      # Debug 模式构建
+./scripts/build.sh --clean      # 清理后重新构建
+```
 
-### 3.1 运行所有测试
+### 3.2 test.sh - 测试脚本
+```bash
+./scripts/test.sh               # 运行所有测试
+./scripts/test.sh --unit        # 仅运行单元测试
+./scripts/test.sh --integration # 仅运行集成测试
+./scripts/test.sh --verbose     # 显示详细输出
+./scripts/test.sh --filter "Mqtt*"  # 运行匹配的测试
+```
+
+### 3.3 clean.sh - 清理脚本
+```bash
+./scripts/clean.sh              # 清理构建目录
+./scripts/clean.sh --all        # 清理所有生成文件
+```
+
+### 3.4 verify.sh - 完整验证脚本
+```bash
+./scripts/verify.sh             # 完整构建和测试
+./scripts/verify.sh --clean     # 清理后验证
+./scripts/verify.sh --debug     # Debug 模式验证
+./scripts/verify.sh --skip-test # 仅构建不测试
+```
+
+### 3.5 quick.sh - 快速验证脚本
+```bash
+./scripts/quick.sh              # 快速构建并测试（自动检测更新）
+```
+
+## 4. 测试验证
+
+### 4.1 运行所有测试
 ```bash
 cd build
 ctest --output-on-failure
 ```
 
-### 3.2 运行单个测试
+### 4.2 运行单个测试
 ```bash
-# 运行连接状态机测试
+# 连接状态机测试
 ./test_connection_state_machine
 
-# 运行 MQTT 客户端管理器测试
+# MQTT 客户端管理器测试
 ./test_mqtt_client_manager
 
-# 运行离线缓存队列测试
+# 离线缓存队列测试
 ./test_offline_cache_queue
 
-# 运行路由桥接测试
+# 路由桥接测试
 ./test_route_bridge
 
-# 运行配置管理器测试
+# 配置管理器测试
 ./test_config_manager
 
-# 运行内部总线接口测试
+# 内部总线接口测试
 ./test_internal_bus_interface
 
-# 运行集成测试
+# 集成测试
 ./test_mqtt_service_integration
 
-# 运行端到端测试
+# 端到端测试
 ./test_end_to_end
 ```
 
-### 3.3 测试覆盖率
-
-当前测试套件包含 9 个测试模块，共 63+ 个测试用例：
+### 4.3 测试覆盖率
 
 | 测试模块 | 测试数量 | 覆盖范围 |
 |---------|---------|---------|
@@ -133,44 +166,22 @@ ctest --output-on-failure
 | MqttServiceIntegrationTest | 7 | 服务集成、生命周期 |
 | EndToEndTest | 5 | 完整流程、离线缓存 |
 
-## 4. 运行服务
+## 5. 运行服务
 
-### 4.1 启动 MQTT 服务
+### 5.1 启动 MQTT 服务
 ```bash
-./tbox_mqtt_service
+./build/tbox_mqtt_service
 ```
 
-### 4.2 服务输出示例
+### 5.2 服务输出示例
 ```
 Starting TBOX MQTT Service...
 TBOX MQTT Service started successfully
 Connection state: 2 -  (CONNECTING 状态)
 ```
 
-### 4.3 停止服务
+### 5.3 停止服务
 按 `Ctrl+C` 发送 SIGINT 信号，服务将优雅关闭。
-
-## 5. 代码质量检查
-
-### 5.1 静态分析（可选）
-```bash
-# 使用 clang-tidy
-clang-tidy src/mqtt_service/src/*.cpp -- -std=c++17
-
-# 使用 cppcheck
-cppcheck --enable=all src/mqtt_service/
-```
-
-### 5.2 内存检查（可选）
-```bash
-# 使用 Valgrind（Linux）
-valgrind --leak-check=full ./test_connection_state_machine
-
-# 使用 Address Sanitizer
-cmake -DCMAKE_CXX_FLAGS="-fsanitize=address" ..
-make
-./test_connection_state_machine
-```
 
 ## 6. 常见问题
 
@@ -179,7 +190,9 @@ make
 解决方案：
 1. 确认 mosquitto 已安装
 2. 检查 pkg-config 是否能找到：pkg-config --libs libmosquitto
-3. 手动指定路径（见 2.3 节）
+3. 手动指定路径：
+   cmake -DMOSQUITTO_INCLUDE_DIRS=/path/to/include \
+         -DMOSQUITTO_LIBRARY_DIRS=/path/to/lib ..
 ```
 
 ### 6.2 测试超时
@@ -201,6 +214,12 @@ make
 iov-vehicle-tbox-mqtt/
 ├── CMakeLists.txt                 # 主构建配置
 ├── BUILD_AND_VERIFY.md            # 本文档
+├── scripts/                       # 构建脚本
+│   ├── build.sh                   # 构建脚本
+│   ├── test.sh                    # 测试脚本
+│   ├── clean.sh                   # 清理脚本
+│   ├── verify.sh                  # 完整验证脚本
+│   └── quick.sh                   # 快速验证脚本
 ├── src/
 │   ├── main.cpp                   # 主程序入口
 │   └── mqtt_service/
@@ -225,7 +244,7 @@ iov-vehicle-tbox-mqtt/
 | SQLite3 | >= 3.0 | 离线消息缓存 |
 | nlohmann/json | >= 3.0 | 配置文件解析 |
 | Protobuf | >= 3.0 | 消息序列化 |
-| GoogleTest | 1.14.0 | 单元测试框架 |
+| GoogleTest | 1.14.0 | 单元测试框架
 
 ## 9. 开发工作流
 
@@ -242,8 +261,8 @@ iov-vehicle-tbox-mqtt/
 3. 验证测试通过
 4. 提交代码
 
-### 9.3 代码审查清单
-- [ ] 所有测试通过
+### 9.3 提交前检查清单
+- [ ] 运行 `./scripts/verify.sh` 全部通过
 - [ ] 无编译警告
 - [ ] 符合代码规范
 - [ ] 文档已更新（如需要）
