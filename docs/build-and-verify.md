@@ -41,26 +41,50 @@ sudo yum install -y \
     gtest-devel
 ```
 
-## 2. 构建步骤
+## 2. 快速开始
 
-### 2.1 克隆项目
+### 2.1 使用脚本（推荐）
+
 ```bash
+# 首次构建
+./scripts/build.sh --clean
+
+# 运行测试
+./scripts/test.sh
+
+# 快速验证（自动检测更新）
+./scripts/quick.sh
+
+# 完整验证（构建+测试）
+./scripts/verify.sh
+
+# 清理构建
+./scripts/clean.sh
+```
+
+### 2.2 手动构建
+
+```bash
+# 克隆项目
 git clone <repository-url>
 cd iov-vehicle-tbox-mqtt
-```
 
-### 2.2 创建构建目录
-```bash
+# 创建构建目录
 mkdir -p build
 cd build
-```
 
-### 2.3 配置 CMake
-```bash
+# 配置 CMake
 cmake ..
+
+# 编译
+make -j$(nproc)
 ```
 
-**常见问题排查：**
+编译成功后，将生成以下文件：
+- `tbox_mqtt_service` - 主可执行文件
+- `libmqtt_service_lib.a` - 静态库
+
+### 2.3 常见问题排查
 
 如果 CMake 找不到 mosquitto，可能需要手动指定路径：
 ```bash
@@ -73,24 +97,52 @@ cmake -DMOSQUITTO_INCLUDE_DIRS=/usr/local/include \
       -DMOSQUITTO_LIBRARY_DIRS=/usr/local/lib ..
 ```
 
-### 2.4 编译
+## 3. 脚本使用说明
+
+### 3.1 build.sh - 构建脚本
 ```bash
-make -j$(nproc)
+./scripts/build.sh              # Release 模式构建
+./scripts/build.sh --debug      # Debug 模式构建
+./scripts/build.sh --clean      # 清理后重新构建
 ```
 
-编译成功后，将生成以下文件：
-- `tbox_mqtt_service` - 主可执行文件
-- `libmqtt_service_lib.a` - 静态库
+### 3.2 test.sh - 测试脚本
+```bash
+./scripts/test.sh               # 运行所有测试
+./scripts/test.sh --unit        # 仅运行单元测试
+./scripts/test.sh --integration # 仅运行集成测试
+./scripts/test.sh --verbose     # 显示详细输出
+./scripts/test.sh --filter "Mqtt*"  # 运行匹配的测试
+```
 
-## 3. 测试验证
+### 3.3 clean.sh - 清理脚本
+```bash
+./scripts/clean.sh              # 清理构建目录
+./scripts/clean.sh --all        # 清理所有生成文件
+```
 
-### 3.1 运行所有测试
+### 3.4 verify.sh - 完整验证脚本
+```bash
+./scripts/verify.sh             # 完整构建和测试
+./scripts/verify.sh --clean     # 清理后验证
+./scripts/verify.sh --debug     # Debug 模式验证
+./scripts/verify.sh --skip-test # 仅构建不测试
+```
+
+### 3.5 quick.sh - 快速验证脚本
+```bash
+./scripts/quick.sh              # 快速构建并测试（自动检测更新）
+```
+
+## 4. 测试验证
+
+### 4.1 运行所有测试
 ```bash
 cd build
 ctest --output-on-failure
 ```
 
-### 3.2 运行单个测试
+### 4.2 运行单个测试
 ```bash
 # 运行连接状态机测试
 ./test_connection_state_machine
@@ -195,12 +247,19 @@ make
 这些警告不影响功能，但建议修复。
 ```
 
-## 7. 项目结构
+## 8. 项目结构
 
 ```
 iov-vehicle-tbox-mqtt/
 ├── CMakeLists.txt                 # 主构建配置
-├── BUILD_AND_VERIFY.md            # 本文档
+├── docs/
+│   └── build-and-verify.md        # 本文档
+├── scripts/                       # 构建脚本
+│   ├── build.sh                   # 构建脚本
+│   ├── test.sh                    # 测试脚本
+│   ├── clean.sh                   # 清理脚本
+│   ├── verify.sh                  # 完整验证脚本
+│   └── quick.sh                   # 快速验证脚本
 ├── src/
 │   ├── main.cpp                   # 主程序入口
 │   └── mqtt_service/
@@ -242,8 +301,8 @@ iov-vehicle-tbox-mqtt/
 3. 验证测试通过
 4. 提交代码
 
-### 9.3 代码审查清单
-- [ ] 所有测试通过
+### 9.3 提交前检查清单
+- [ ] 运行 `./scripts/verify.sh` 全部通过
 - [ ] 无编译警告
 - [ ] 符合代码规范
 - [ ] 文档已更新（如需要）
