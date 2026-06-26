@@ -70,3 +70,10 @@ Testing/
 
 graphify-out
 docs/superpowers
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
