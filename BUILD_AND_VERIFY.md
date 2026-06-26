@@ -1,0 +1,249 @@
+# TBOX MQTT 服务 - 构建与验证指南
+
+## 1. 环境要求
+
+### 1.1 开发工具
+- **CMake**: >= 3.16
+- **C++ 编译器**: 支持 C++17（GCC >= 7, Clang >= 5, Apple Clang >= 10）
+- **Git**: 用于获取 GoogleTest 依赖
+
+### 1.2 系统依赖
+
+#### macOS (Homebrew)
+```bash
+brew install openssl mosquitto sqlite3 nlohmann-json protobuf pkg-config
+```
+
+#### Ubuntu/Debian
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    libssl-dev \
+    libmosquitto-dev \
+    libsqlite3-dev \
+    nlohmann-json3-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    pkg-config \
+    libgtest-dev
+```
+
+#### CentOS/RHEL
+```bash
+sudo yum install -y \
+    openssl-devel \
+    mosquitto-devel \
+    sqlite-devel \
+    json-devel \
+    protobuf-devel \
+    protobuf-compiler \
+    pkgconfig \
+    gtest-devel
+```
+
+## 2. 构建步骤
+
+### 2.1 克隆项目
+```bash
+git clone <repository-url>
+cd iov-vehicle-tbox-mqtt
+```
+
+### 2.2 创建构建目录
+```bash
+mkdir -p build
+cd build
+```
+
+### 2.3 配置 CMake
+```bash
+cmake ..
+```
+
+**常见问题排查：**
+
+如果 CMake 找不到 mosquitto，可能需要手动指定路径：
+```bash
+# macOS
+cmake -DMOSQUITTO_INCLUDE_DIRS=/opt/homebrew/include \
+      -DMOSQUITTO_LIBRARY_DIRS=/opt/homebrew/lib ..
+
+# Linux (如果安装在非标准路径)
+cmake -DMOSQUITTO_INCLUDE_DIRS=/usr/local/include \
+      -DMOSQUITTO_LIBRARY_DIRS=/usr/local/lib ..
+```
+
+### 2.4 编译
+```bash
+make -j$(nproc)
+```
+
+编译成功后，将生成以下文件：
+- `tbox_mqtt_service` - 主可执行文件
+- `libmqtt_service_lib.a` - 静态库
+
+## 3. 测试验证
+
+### 3.1 运行所有测试
+```bash
+cd build
+ctest --output-on-failure
+```
+
+### 3.2 运行单个测试
+```bash
+# 运行连接状态机测试
+./test_connection_state_machine
+
+# 运行 MQTT 客户端管理器测试
+./test_mqtt_client_manager
+
+# 运行离线缓存队列测试
+./test_offline_cache_queue
+
+# 运行路由桥接测试
+./test_route_bridge
+
+# 运行配置管理器测试
+./test_config_manager
+
+# 运行内部总线接口测试
+./test_internal_bus_interface
+
+# 运行集成测试
+./test_mqtt_service_integration
+
+# 运行端到端测试
+./test_end_to_end
+```
+
+### 3.3 测试覆盖率
+
+当前测试套件包含 9 个测试模块，共 63+ 个测试用例：
+
+| 测试模块 | 测试数量 | 覆盖范围 |
+|---------|---------|---------|
+| ConnectionStateMachineTest | 11 | 状态转换、指数退避、回调 |
+| SecCertInterfaceTest | 5 | 证书管理、句柄获取 |
+| MqttClientManagerTest | 11 | 初始化、连接、发布、订阅 |
+| OfflineCacheQueueTest | 7 | 优先级队列、丢弃策略 |
+| RouteBridgeTest | 6 | 路由注册、查找、删除 |
+| ConfigManagerTest | 6 | 配置验证、版本管理 |
+| InternalBusInterfaceTest | 5 | 服务注册、消息发送 |
+| MqttServiceIntegrationTest | 7 | 服务集成、生命周期 |
+| EndToEndTest | 5 | 完整流程、离线缓存 |
+
+## 4. 运行服务
+
+### 4.1 启动 MQTT 服务
+```bash
+./tbox_mqtt_service
+```
+
+### 4.2 服务输出示例
+```
+Starting TBOX MQTT Service...
+TBOX MQTT Service started successfully
+Connection state: 2 -  (CONNECTING 状态)
+```
+
+### 4.3 停止服务
+按 `Ctrl+C` 发送 SIGINT 信号，服务将优雅关闭。
+
+## 5. 代码质量检查
+
+### 5.1 静态分析（可选）
+```bash
+# 使用 clang-tidy
+clang-tidy src/mqtt_service/src/*.cpp -- -std=c++17
+
+# 使用 cppcheck
+cppcheck --enable=all src/mqtt_service/
+```
+
+### 5.2 内存检查（可选）
+```bash
+# 使用 Valgrind（Linux）
+valgrind --leak-check=full ./test_connection_state_machine
+
+# 使用 Address Sanitizer
+cmake -DCMAKE_CXX_FLAGS="-fsanitize=address" ..
+make
+./test_connection_state_machine
+```
+
+## 6. 常见问题
+
+### 6.1 链接错误：找不到 mosquitto
+```
+解决方案：
+1. 确认 mosquitto 已安装
+2. 检查 pkg-config 是否能找到：pkg-config --libs libmosquitto
+3. 手动指定路径（见 2.3 节）
+```
+
+### 6.2 测试超时
+```
+端到端测试包含 2 秒等待时间，这是正常的。
+如果其他测试超时，可能是系统资源问题。
+```
+
+### 6.3 编译警告
+```
+项目使用 -Wall -Wextra 编译选项。
+如果出现警告，可能是未使用的变量或类型转换问题。
+这些警告不影响功能，但建议修复。
+```
+
+## 7. 项目结构
+
+```
+iov-vehicle-tbox-mqtt/
+├── CMakeLists.txt                 # 主构建配置
+├── BUILD_AND_VERIFY.md            # 本文档
+├── src/
+│   ├── main.cpp                   # 主程序入口
+│   └── mqtt_service/
+│       ├── include/               # 头文件
+│       ├── src/                   # 源文件
+│       └── types/                 # 类型定义
+├── tests/
+│   ├── CMakeLists.txt             # 测试构建配置
+│   ├── unit/                      # 单元测试
+│   └── integration/               # 集成测试
+└── docs/
+    └── superpowers/
+        └── plans/                 # 开发计划
+```
+
+## 8. 依赖版本
+
+| 依赖 | 版本 | 用途 |
+|-----|------|------|
+| OpenSSL | >= 1.1 | TLS/mTLS 加密 |
+| Mosquitto | >= 2.0 | MQTT 客户端库 |
+| SQLite3 | >= 3.0 | 离线消息缓存 |
+| nlohmann/json | >= 3.0 | 配置文件解析 |
+| Protobuf | >= 3.0 | 消息序列化 |
+| GoogleTest | 1.14.0 | 单元测试框架 |
+
+## 9. 开发工作流
+
+### 9.1 添加新功能
+1. 在 `src/mqtt_service/include/` 添加头文件
+2. 在 `src/mqtt_service/src/` 添加实现
+3. 在 `tests/unit/` 添加单元测试
+4. 更新 `tests/CMakeLists.txt`
+5. 运行测试验证
+
+### 9.2 修复 Bug
+1. 编写失败的测试用例
+2. 修复 Bug
+3. 验证测试通过
+4. 提交代码
+
+### 9.3 代码审查清单
+- [ ] 所有测试通过
+- [ ] 无编译警告
+- [ ] 符合代码规范
+- [ ] 文档已更新（如需要）
