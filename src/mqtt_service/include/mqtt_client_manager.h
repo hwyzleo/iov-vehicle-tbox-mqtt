@@ -26,7 +26,9 @@ public:
                    uint16_t broker_port,
                    const std::string& client_id,
                    const SecCertInterface& sec_interface,
-                    const std::string& ca_file_path);
+                    const std::string& ca_file_path,
+                    const std::string& cert_file_path = "",
+                    const std::string& key_file_path = "");
 
     // Connect to broker
     bool connect(const ConnectionConfig& config);

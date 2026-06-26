@@ -78,8 +78,9 @@ TEST_F(MqttClientManagerTest, ConnectWithoutInitialize) {
     config.clean_start = false;
     config.session_expiry = 3600;
 
-    // Should fail because client is not initialized
-    EXPECT_FALSE(client.connect(config));
+    // connect() now auto-initializes the mosquitto instance
+    EXPECT_TRUE(client.connect(config));
+    client.disconnect();
 }
 
 TEST_F(MqttClientManagerTest, PublishWithoutConnect) {

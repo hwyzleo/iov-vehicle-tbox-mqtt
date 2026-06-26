@@ -1,16 +1,19 @@
 # tests/CMakeLists.txt
 
-# Fetch GoogleTest
+# Fetch GoogleTest (cached outside build dir to survive clean builds)
 include(FetchContent)
+set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.cache/deps" CACHE PATH "Dependency cache directory" FORCE)
 FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG v1.14.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(googletest)
 
-# Find mosquitto for tests
+# Find dependencies
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
 # Unit tests
@@ -47,7 +50,7 @@ target_include_directories(test_mqtt_client_manager PRIVATE
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 target_link_directories(test_mqtt_client_manager PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
-target_link_libraries(test_mqtt_client_manager GTest::gtest_main ${MOSQUITTO_LIBRARIES} pthread)
+target_link_libraries(test_mqtt_client_manager GTest::gtest_main ${MOSQUITTO_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto pthread)
 
 add_executable(test_offline_cache_queue
     unit/test_offline_cache_queue.cpp
@@ -80,7 +83,7 @@ target_include_directories(test_config_manager PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
     ${MOSQUITTO_INCLUDE_DIRS}
 )
-target_link_libraries(test_config_manager GTest::gtest_main pthread)
+target_link_libraries(test_config_manager GTest::gtest_main nlohmann_json::nlohmann_json pthread)
 
 add_executable(test_internal_bus_interface
     unit/test_internal_bus_interface.cpp

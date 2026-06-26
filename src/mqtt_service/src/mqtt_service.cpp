@@ -6,6 +6,7 @@
 #include "config_manager.h"
 #include "sec_cert_interface.h"
 #include "internal_bus_interface.h"
+#include <iostream>
 
 namespace tbox {
 namespace mqtt {
@@ -33,6 +34,17 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
 
     state_machine_->setStateChangeCallback(
         [this](ConnectionState new_state) {
+            std::cout << "[MQTT] State -> " << [&]() -> const char* {
+                switch (new_state) {
+                    case ConnectionState::INIT: return "INIT";
+                    case ConnectionState::CERT_WAIT: return "CERT_WAIT";
+                    case ConnectionState::CONNECTING: return "CONNECTING";
+                    case ConnectionState::CONNECTED: return "CONNECTED";
+                    case ConnectionState::RECONNECTING: return "RECONNECTING";
+                    case ConnectionState::OFFLINE: return "OFFLINE";
+                    default: return "UNKNOWN";
+                }
+            }() << std::endl;
             onConnectionStateChanged(new_state);
         });
 
@@ -53,6 +65,7 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
     config_manager_->setChangeCallback(
         [this]() {
             auto config = config_manager_->getConfig();
+            std::cout << "[MQTT] Applying config: " << config.broker_host << ":" << config.broker_port << std::endl;
             client_manager_->connect(config);
         });
 
@@ -64,16 +77,21 @@ bool MqttService::start() {
         return false;
     }
 
+    std::cout << "[MQTT] Starting service..." << std::endl;
     state_machine_->start();
 
     if (sec_interface_->isCertificateReady()) {
+        std::cout << "[MQTT] Certificate ready" << std::endl;
         state_machine_->onCertificateReady();
+    } else {
+        std::cout << "[MQTT] Waiting for certificate..." << std::endl;
     }
 
     return true;
 }
 
 void MqttService::stop() {
+    std::cout << "[MQTT] Stopping service..." << std::endl;
     client_manager_->disconnect();
 }
 
@@ -158,6 +176,10 @@ bool MqttService::applyConfig(const ConnectionConfig& config,
 
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
     if (new_state == ConnectionState::CONNECTED) {
+        int cached = cache_queue_->size();
+        if (cached > 0) {
+            std::cout << "[MQTT] Flushing " << cached << " cached message(s)" << std::endl;
+        }
         while (!cache_queue_->empty()) {
             auto msg = cache_queue_->dequeue();
             if (msg.has_value()) {
@@ -166,6 +188,9 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
         }
 
         auto downstream_routes = route_bridge_->getDownstreamRoutes();
+        if (!downstream_routes.empty()) {
+            std::cout << "[MQTT] Subscribing to " << downstream_routes.size() << " route(s)" << std::endl;
+        }
         for (const auto& route : downstream_routes) {
             client_manager_->subscribe(route.mqtt_topic, route.qos);
         }

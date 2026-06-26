@@ -1,8 +1,12 @@
 #include "config_manager.h"
+#include <nlohmann/json.hpp>
 #include <fstream>
+#include <iostream>
 
 namespace tbox {
 namespace mqtt {
+
+using json = nlohmann::json;
 
 ConfigManager::ConfigManager() {
 }
@@ -85,12 +89,70 @@ void ConfigManager::setChangeCallback(ChangeCallback callback) {
 
 bool ConfigManager::saveToFile(const std::string& filepath) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return false;
+
+    json j;
+    j["broker_host"] = current_config_.broker_host;
+    j["broker_port"] = current_config_.broker_port;
+    j["client_id"] = current_config_.client_id;
+    j["keepalive"] = current_config_.keepalive;
+    j["clean_start"] = current_config_.clean_start;
+    j["session_expiry"] = current_config_.session_expiry;
+    j["root_ca_ref"] = current_config_.root_ca_ref;
+    j["tls_cert_ref"] = current_config_.tls_cert_ref;
+    j["tls_key_ref"] = current_config_.tls_key_ref;
+    j["key_source"] = (current_config_.key_source == KeySource::HSM) ? "hsm" : "file";
+
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+        std::cerr << "Failed to open config file for writing: " << filepath << std::endl;
+        return false;
+    }
+
+    ofs << j.dump(4) << std::endl;
+    return true;
 }
 
 bool ConfigManager::loadFromFile(const std::string& filepath) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return false;
+
+    std::ifstream ifs(filepath);
+    if (!ifs.is_open()) {
+        std::cerr << "Config file not found: " << filepath << std::endl;
+        return false;
+    }
+
+    json j;
+    try {
+        ifs >> j;
+    } catch (const json::parse_error& e) {
+        std::cerr << "Failed to parse config file: " << e.what() << std::endl;
+        return false;
+    }
+
+    ConnectionConfig config;
+    if (j.contains("broker_host")) config.broker_host = j["broker_host"].get<std::string>();
+    if (j.contains("broker_port")) config.broker_port = j["broker_port"].get<uint16_t>();
+    if (j.contains("client_id")) config.client_id = j["client_id"].get<std::string>();
+    if (j.contains("keepalive")) config.keepalive = j["keepalive"].get<uint16_t>();
+    if (j.contains("clean_start")) config.clean_start = j["clean_start"].get<bool>();
+    if (j.contains("session_expiry")) config.session_expiry = j["session_expiry"].get<uint32_t>();
+    if (j.contains("root_ca_ref")) config.root_ca_ref = j["root_ca_ref"].get<std::string>();
+    if (j.contains("tls_cert_ref")) config.tls_cert_ref = j["tls_cert_ref"].get<std::string>();
+    if (j.contains("tls_key_ref")) config.tls_key_ref = j["tls_key_ref"].get<std::string>();
+    if (j.contains("key_source")) {
+        std::string ks = j["key_source"].get<std::string>();
+        config.key_source = (ks == "hsm") ? KeySource::HSM : KeySource::FILE;
+    }
+
+    if (!validateConfig(config)) {
+        std::cerr << "Invalid config from file: " << filepath << std::endl;
+        return false;
+    }
+
+    current_config_ = config;
+    current_version_++;
+    std::cout << "Loaded config from: " << filepath << std::endl;
+    return true;
 }
 
 void ConfigManager::notifyChange() {

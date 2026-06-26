@@ -42,6 +42,12 @@ enum class Priority : uint8_t {
     CRITICAL = 3
 };
 
+// Key source type
+enum class KeySource : uint8_t {
+    FILE,   // Private key from file (development)
+    HSM     // Private key in HSM via PKCS#11 (production)
+};
+
 // Connection configuration (Design §3)
 struct ConnectionConfig {
     std::string broker_host;
@@ -51,7 +57,9 @@ struct ConnectionConfig {
     uint16_t keepalive = 60;
     bool clean_start = false;
     uint32_t session_expiry = 3600;
-    std::string tls_cert_ref;  // SEC handle
+    std::string tls_cert_ref;   // Certificate file path
+    std::string tls_key_ref;    // File path or PKCS#11 URI
+    KeySource key_source = KeySource::FILE;
     enum class Source : uint8_t { FACTORY, OTA } source = Source::FACTORY;
     uint32_t version = 0;
 };

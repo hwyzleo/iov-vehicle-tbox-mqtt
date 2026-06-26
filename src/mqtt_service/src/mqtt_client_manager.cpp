@@ -1,6 +1,9 @@
 #include "mqtt_client_manager.h"
 #include <mosquitto.h>
 #include <iostream>
+#include <openssl/conf.h>
+#include <openssl/err.h>
+#include <openssl/provider.h>
 
 namespace tbox {
 namespace mqtt {
@@ -59,7 +62,9 @@ bool MqttClientManager::initialize(const std::string& broker_host,
                                   uint16_t broker_port,
                                   const std::string& client_id,
                                   const SecCertInterface& sec_interface,
-                                  const std::string& ca_file_path) {
+                                  const std::string& ca_file_path,
+                                  const std::string& cert_file_path,
+                                  const std::string& key_file_path) {
     // Create mosquitto instance with client ID
     mosq_ = mosquitto_new(client_id.c_str(), true, this);
     if (!mosq_) return false;
@@ -79,17 +84,87 @@ bool MqttClientManager::initialize(const std::string& broker_host,
     // For testing, we'll skip TLS configuration if CA file doesn't exist
     // In production, this would be required
     int rc = mosquitto_tls_set(mosq_,
-                              ca_file_path.c_str(),  // root CA
-                              nullptr,            // cert path
-                              nullptr,            // key path
-                              nullptr,            // password
-                              nullptr);           // callback
+                              ca_file_path.c_str(),          // root CA
+                              nullptr,                        // CA path
+                              cert_file_path.empty() ? nullptr : cert_file_path.c_str(),  // client cert
+                              key_file_path.empty() ? nullptr : key_file_path.c_str(),    // client key
+                              nullptr);                       // password callback
 
     return rc == MOSQ_ERR_SUCCESS;
 }
 
 bool MqttClientManager::connect(const ConnectionConfig& config) {
-    if (!mosq_) return false;
+    // Initialize mosquitto instance if not done yet
+    if (!mosq_) {
+        std::cout << "[MQTT] Creating mosquitto instance, client_id: " << config.client_id << std::endl;
+        mosq_ = mosquitto_new(config.client_id.c_str(), true, this);
+        if (!mosq_) {
+            std::cerr << "[MQTT] Failed to create mosquitto instance" << std::endl;
+            return false;
+        }
+
+        mosquitto_connect_callback_set(mosq_, on_connect_wrapper);
+        mosquitto_disconnect_callback_set(mosq_, on_disconnect_wrapper);
+        mosquitto_message_callback_set(mosq_, on_message_wrapper);
+        mosquitto_publish_callback_set(mosq_, on_publish_wrapper);
+        mosquitto_subscribe_callback_set(mosq_, on_subscribe_wrapper);
+        std::cout << "[MQTT] Mosquitto instance created" << std::endl;
+    }
+
+    // Configure TLS if CA certificate is specified
+    if (!config.root_ca_ref.empty()) {
+        std::cout << "[MQTT] Configuring TLS..." << std::endl;
+        std::cout << "[MQTT]   CA:        " << config.root_ca_ref << std::endl;
+        if (!config.tls_cert_ref.empty())
+            std::cout << "[MQTT]   Cert:      " << config.tls_cert_ref << std::endl;
+
+        const char* key_path = nullptr;
+
+        if (config.key_source == KeySource::HSM) {
+            std::cout << "[MQTT]   Key:       " << config.tls_key_ref << " (PKCS#11)" << std::endl;
+            std::cout << "[MQTT]   Key source: HSM" << std::endl;
+
+            // Configure OpenSSL to use PKCS#11 engine for HSM key operations
+            // tls_key_ref should be a PKCS#11 URI (e.g. "pkcs11:object=device-key;type=private")
+            // Requires OpenSSL pkcs11 engine/provider installed on the system
+            key_path = config.tls_key_ref.c_str();
+        } else {
+            std::cout << "[MQTT]   Key:       " << config.tls_key_ref << " (file)" << std::endl;
+            std::cout << "[MQTT]   Key source: FILE" << std::endl;
+            key_path = config.tls_key_ref.empty() ? nullptr : config.tls_key_ref.c_str();
+        }
+
+        int rc = mosquitto_tls_set(mosq_,
+                                  config.root_ca_ref.c_str(),
+                                  nullptr,
+                                  config.tls_cert_ref.empty() ? nullptr : config.tls_cert_ref.c_str(),
+                                  key_path,
+                                  nullptr);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            std::cerr << "[MQTT] TLS configuration failed: " << mosquitto_strerror(rc) << std::endl;
+            return false;
+        }
+
+        // For HSM mode, enable PKCS#11 URI as key reference in OpenSSL 3.x
+        if (config.key_source == KeySource::HSM) {
+            // OpenSSL 3.x: load the pkcs11 provider if available
+            // This allows OpenSSL to understand pkcs11: URIs as key references
+            OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
+            OSSL_PROVIDER* pkcs11 = OSSL_PROVIDER_load(nullptr, "pkcs11");
+            if (pkcs11) {
+                std::cout << "[MQTT] OpenSSL pkcs11 provider loaded" << std::endl;
+            } else {
+                std::cout << "[MQTT] Warning: OpenSSL pkcs11 provider not found, "
+                          << "HSM may not work. Install pkcs11-provider." << std::endl;
+            }
+            // legacy provider is optional, ignore if not available
+            (void)legacy;
+        }
+
+        std::cout << "[MQTT] TLS configured" << std::endl;
+    } else {
+        std::cout << "[MQTT] TLS disabled (no CA certificate)" << std::endl;
+    }
 
     // Set LWT if configured
     if (!lwt_config_.topic.empty()) {
@@ -101,12 +176,16 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
                           lwt_config_.retain);
     }
 
+    std::cout << "[MQTT] Connecting to " << config.broker_host << ":" << config.broker_port
+              << " (keepalive: " << config.keepalive << "s)" << std::endl;
+
     int rc = mosquitto_connect(mosq_,
                               config.broker_host.c_str(),
                               config.broker_port,
                               config.keepalive);
 
     if (rc == MOSQ_ERR_SUCCESS) {
+        std::cout << "[MQTT] Connection initiated" << std::endl;
         // Start network loop
         mosquitto_loop_start(mosq_);
         // Set connected flag immediately (in real scenario, on_connect callback would do this)
@@ -114,6 +193,7 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         return true;
     }
 
+    std::cerr << "[MQTT] Connection failed: " << mosquitto_strerror(rc) << std::endl;
     return false;
 }
 
@@ -207,6 +287,11 @@ void MqttClientManager::setLwtConfig(const LwtConfig& lwt_config) {
 
 void MqttClientManager::on_connect(int rc) {
     connected_ = (rc == 0);
+    if (connected_) {
+        std::cout << "[MQTT] Connected to broker" << std::endl;
+    } else {
+        std::cerr << "[MQTT] Connection rejected: " << mosquitto_connack_string(rc) << std::endl;
+    }
     if (connection_callback_) {
         connection_callback_(connected_);
     }
@@ -214,6 +299,11 @@ void MqttClientManager::on_connect(int rc) {
 
 void MqttClientManager::on_disconnect(int rc) {
     connected_ = false;
+    if (rc == 0) {
+        std::cout << "[MQTT] Disconnected cleanly" << std::endl;
+    } else {
+        std::cerr << "[MQTT] Unexpected disconnect: " << mosquitto_strerror(rc) << std::endl;
+    }
     if (connection_callback_) {
         connection_callback_(false);
     }

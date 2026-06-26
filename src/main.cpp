@@ -1,12 +1,14 @@
 #include "mqtt_service.h"
 #include "sec_cert_interface.h"
 #include "internal_bus_interface.h"
+#include "config_manager.h"
 #include <iostream>
 #include <signal.h>
 #include <memory>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <filesystem>
 
 using namespace tbox::mqtt;
 
@@ -40,14 +42,30 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Apply default configuration
+    // Load configuration from file or use defaults
     ConnectionConfig config;
-    config.broker_host = "localhost";
-    config.broker_port = 1883;
-    config.client_id = "VIN123SN456";
-    config.keepalive = 60;
-    config.clean_start = false;
-    config.session_expiry = 3600;
+    const std::string config_path = "./mqtt_config.json";
+
+    if (std::filesystem::exists(config_path)) {
+        ConfigManager config_manager;
+        if (config_manager.loadFromFile(config_path)) {
+            config = config_manager.getConfig();
+            std::cout << "Using config from: " << config_path << std::endl;
+        } else {
+            std::cerr << "Failed to load config from " << config_path
+                      << ", using defaults" << std::endl;
+            config.broker_host = "localhost";
+            config.broker_port = 1883;
+            config.client_id = "VIN123SN456";
+        }
+    } else {
+        std::cout << "Config file not found: " << config_path
+                  << ", using defaults" << std::endl;
+        config.broker_host = "localhost";
+        config.broker_port = 1883;
+        config.client_id = "VIN123SN456";
+    }
+
     config.source = ConnectionConfig::Source::FACTORY;
     config.version = 1;
 

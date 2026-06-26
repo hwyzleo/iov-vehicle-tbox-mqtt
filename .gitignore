@@ -71,6 +71,11 @@ Testing/
 graphify-out
 docs/superpowers
 
+# Runtime config (contains local deployment settings)
+mqtt_config.json
+mqtt_config.hsm.example
+mqtt_config.json.example
+
 # IDE
 .idea/
 .vscode/
