@@ -60,6 +60,8 @@ struct ConnectionConfig {
     std::string tls_cert_ref;   // Certificate file path
     std::string tls_key_ref;    // File path or PKCS#11 URI
     KeySource key_source = KeySource::FILE;
+    std::string username;       // MQTT username (e.g. from cert CN)
+    std::string password;       // MQTT password (optional)
     enum class Source : uint8_t { FACTORY, OTA } source = Source::FACTORY;
     uint32_t version = 0;
 };

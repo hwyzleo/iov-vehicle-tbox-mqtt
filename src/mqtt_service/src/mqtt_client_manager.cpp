@@ -166,6 +166,17 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         std::cout << "[MQTT] TLS disabled (no CA certificate)" << std::endl;
     }
 
+    // Set username from client certificate CN for broker authentication
+    if (!config.username.empty()) {
+        int rc = mosquitto_username_pw_set(mosq_, config.username.c_str(),
+                                           config.password.empty() ? nullptr : config.password.c_str());
+        if (rc != MOSQ_ERR_SUCCESS) {
+            std::cerr << "[MQTT] Failed to set username: " << mosquitto_strerror(rc) << std::endl;
+        } else {
+            std::cout << "[MQTT] Username set: " << config.username << std::endl;
+        }
+    }
+
     // Set LWT if configured
     if (!lwt_config_.topic.empty()) {
         mosquitto_will_set(mosq_,

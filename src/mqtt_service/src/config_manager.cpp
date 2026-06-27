@@ -101,6 +101,8 @@ bool ConfigManager::saveToFile(const std::string& filepath) const {
     j["tls_cert_ref"] = current_config_.tls_cert_ref;
     j["tls_key_ref"] = current_config_.tls_key_ref;
     j["key_source"] = (current_config_.key_source == KeySource::HSM) ? "hsm" : "file";
+    if (!current_config_.username.empty()) j["username"] = current_config_.username;
+    if (!current_config_.password.empty()) j["password"] = current_config_.password;
 
     std::ofstream ofs(filepath);
     if (!ofs.is_open()) {
@@ -143,6 +145,8 @@ bool ConfigManager::loadFromFile(const std::string& filepath) {
         std::string ks = j["key_source"].get<std::string>();
         config.key_source = (ks == "hsm") ? KeySource::HSM : KeySource::FILE;
     }
+    if (j.contains("username")) config.username = j["username"].get<std::string>();
+    if (j.contains("password")) config.password = j["password"].get<std::string>();
 
     if (!validateConfig(config)) {
         std::cerr << "Invalid config from file: " << filepath << std::endl;
