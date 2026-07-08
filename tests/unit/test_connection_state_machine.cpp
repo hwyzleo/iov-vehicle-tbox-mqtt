@@ -2,6 +2,8 @@
 #include "connection_state_machine.h"
 #include "store.h"
 #include <filesystem>
+#include <thread>
+#include <chrono>
 
 using namespace tbox::mqtt;
 
@@ -182,9 +184,10 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         sm.onCertificateReady();
         sm.onConnectionFailure("persistent error");
         // State is now RECONNECTING, persisted to store
+        sm.stop();
     }
 
-    // Second session: restore from store
+    // Second session: restore from store, should downgrade to CERT_WAIT
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -192,18 +195,18 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         sm.setStore(store);
         sm.start();
 
-        // Should restore to RECONNECTING (not CERT_WAIT)
-        EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
+        // RECONNECTING should be downgraded to CERT_WAIT on restart
+        EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
 
         auto state_info = sm.getStateInfo();
-        EXPECT_EQ(state_info.last_error, "persistent error");
-        EXPECT_EQ(state_info.retry_count, 1);
+        EXPECT_EQ(state_info.retry_count, 0u);
+        sm.stop();
     }
 
     cleanupTempStoreDir(store_dir);
 }
 
-TEST(ConnectionStateMachineTest, ConnectedDowngradedToReconnectingOnRestore) {
+TEST(ConnectionStateMachineTest, ConnectedDowngradedToCertWaitOnRestore) {
     std::string store_dir = createTempStoreDir();
 
     // First session: reach CONNECTED state (persisted to store)
@@ -216,9 +219,10 @@ TEST(ConnectionStateMachineTest, ConnectedDowngradedToReconnectingOnRestore) {
         sm.onCertificateReady();
         sm.onConnectionSuccess();
         // State is now CONNECTED, persisted to store
+        sm.stop();
     }
 
-    // Second session: CONNECTED should be downgraded to RECONNECTING
+    // Second session: CONNECTED should be downgraded to CERT_WAIT
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -226,8 +230,49 @@ TEST(ConnectionStateMachineTest, ConnectedDowngradedToReconnectingOnRestore) {
         sm.setStore(store);
         sm.start();
 
-        EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
+        EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+        sm.stop();
     }
 
     cleanupTempStoreDir(store_dir);
+}
+
+TEST(ConnectionStateMachineTest, RetryTimerAutoTransitionsToConnecting) {
+    ConnectionStateMachine sm;
+    sm.setMaxRetries(5);
+
+    std::vector<ConnectionState> transitions;
+    sm.setStateChangeCallback([&transitions](ConnectionState state) {
+        transitions.push_back(state);
+    });
+
+    sm.start();
+    sm.onCertificateReady();
+    // Now in CONNECTING
+
+    // Simulate connection failure -> RECONNECTING with short backoff
+    sm.onConnectionFailure("timeout");
+    // Now in RECONNECTING, timer thread should auto-fire after backoff delay
+
+    // Wait for the timer to fire (base delay is 1s * 2^1 = 2s + jitter)
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+
+    // Timer should have auto-transitioned to CONNECTING
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
+
+    sm.stop();
+}
+
+TEST(ConnectionStateMachineTest, RetryTimerStopsOnStop) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onCertificateReady();
+    sm.onConnectionFailure("timeout");
+    // Now in RECONNECTING
+
+    // Stop should cleanly join the timer thread
+    sm.stop();
+
+    // State machine should still be usable after stop
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
 }

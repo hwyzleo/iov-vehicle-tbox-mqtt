@@ -7,6 +7,9 @@
 #include <mutex>
 #include <random>
 #include <memory>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 
 namespace tbox {
 namespace mqtt {
@@ -16,9 +19,11 @@ public:
     using StateChangeCallback = std::function<void(ConnectionState)>;
 
     ConnectionStateMachine();
+    ~ConnectionStateMachine();
 
     void setStateChangeCallback(StateChangeCallback callback);
     void start();
+    void stop();
     ConnectionState getCurrentState() const;
     ConnectionStateInfo getStateInfo() const;
     void setMaxRetries(uint32_t max_retries);
@@ -38,6 +43,7 @@ private:
     void calculateNextRetry();
     void persistState();
     void restoreState();
+    void timerLoop();
 
     mutable std::mutex mutex_;
     ConnectionStateInfo state_info_;
@@ -47,6 +53,10 @@ private:
     std::chrono::milliseconds max_retry_delay_{30000};
     std::mt19937 rng_{std::random_device{}()};
     std::shared_ptr<hwyz::store::Store> store_;
+
+    std::thread timer_thread_;
+    std::condition_variable timer_cv_;
+    std::atomic<bool> timer_running_{false};
 };
 
 } // namespace mqtt

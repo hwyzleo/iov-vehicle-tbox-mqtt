@@ -56,6 +56,17 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
     // Set store for state machine persistence
     state_machine_->setStore(store_);
 
+    // Load certificates from configured paths (unless already ready, e.g. via simulateCertificateReady in tests)
+    if (!sec_interface_->isCertificateReady()) {
+        auto config = config_manager_->getConfig();
+        if (!sec_interface_->loadCertificates(config.root_ca_ref,
+                                               config.tls_cert_ref,
+                                               config.tls_key_ref,
+                                               config.key_source)) {
+            std::cerr << "[MQTT] Certificate load failed: " << sec_interface_->getLastError() << std::endl;
+        }
+    }
+
     // Configure offline cache queue from framework-config snapshot
     auto queue_config = config_manager_->getOfflineQueueConfig();
     cache_queue_ = std::make_unique<OfflineCacheQueue>(queue_config.max_size);
@@ -123,6 +134,7 @@ bool MqttService::start() {
 
 void MqttService::stop() {
     std::cout << "[MQTT] Stopping service..." << std::endl;
+    state_machine_->stop();
     client_manager_->disconnect();
 }
 
@@ -206,7 +218,14 @@ bool MqttService::applyConfig(const ConnectionConfig& config,
 }
 
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
-    if (new_state == ConnectionState::CONNECTED) {
+    if (new_state == ConnectionState::CONNECTING) {
+        auto config = config_manager_->getConfig();
+        std::cout << "[MQTT] Initiating connection to " << config.broker_host
+                  << ":" << config.broker_port << std::endl;
+        if (!client_manager_->connect(config)) {
+            state_machine_->onConnectionFailure("Failed to initiate MQTT connection");
+        }
+    } else if (new_state == ConnectionState::CONNECTED) {
         int cached = cache_queue_->size();
         if (cached > 0) {
             std::cout << "[MQTT] Flushing " << cached << " cached message(s)" << std::endl;

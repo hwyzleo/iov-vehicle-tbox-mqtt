@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Read store root path from store.root (Design §5)
-    std::string store_root = snapshot->getString("store.root", "/var/lib/tbox");
+    std::string store_root = snapshot->getString("common.store.root", "/var/lib/tbox");
     std::cout << "Config loaded from: " << config_root << std::endl;
     std::cout << "Store root: " << store_root << std::endl;
 

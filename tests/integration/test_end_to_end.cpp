@@ -141,8 +141,9 @@ TEST_F(EndToEndTest, MessageRouting) {
 
 TEST_F(EndToEndTest, ConnectionStateMonitoring) {
     auto state = service->getConnectionState();
-    // Service is in CONNECTING state since no real MQTT broker is available
-    EXPECT_EQ(state.state, ConnectionState::CONNECTING);
+    // Connection attempt fails (fake cert paths / no real broker), state transitions to RECONNECTING
+    EXPECT_TRUE(state.state == ConnectionState::CONNECTING ||
+                state.state == ConnectionState::RECONNECTING);
 }
 
 TEST_F(EndToEndTest, ConfigurationUpdate) {

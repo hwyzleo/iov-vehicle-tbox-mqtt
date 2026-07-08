@@ -9,6 +9,10 @@ ConnectionStateMachine::ConnectionStateMachine() {
     state_info_.state = ConnectionState::INIT;
 }
 
+ConnectionStateMachine::~ConnectionStateMachine() {
+    stop();
+}
+
 void ConnectionStateMachine::setStateChangeCallback(StateChangeCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = callback;
@@ -20,6 +24,9 @@ void ConnectionStateMachine::setStore(std::shared_ptr<hwyz::store::Store> store)
 }
 
 void ConnectionStateMachine::start() {
+    // Stop any previously running timer thread before starting fresh
+    stop();
+
     StateChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -27,24 +34,43 @@ void ConnectionStateMachine::start() {
         // Restore previous state from framework-store before starting
         restoreState();
 
-        // If restored state was CONNECTED, downgrade to RECONNECTING
-        // (cannot resume a live TCP/TLS connection across restart)
-        if (state_info_.state == ConnectionState::CONNECTED) {
-            state_info_.state = ConnectionState::RECONNECTING;
-            state_info_.last_error = "Restored from store, downgrading CONNECTED to RECONNECTING";
+        // On restart, any active connection state is invalid - a live
+        // TCP/TLS session cannot be resumed across process boundaries.
+        // Downgrade CONNECTED / CONNECTING / RECONNECTING to CERT_WAIT so
+        // the normal flow (CERT_WAIT -> onCertificateReady -> CONNECTING)
+        // re-establishes the connection from scratch.
+        if (state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CONNECTING ||
+            state_info_.state == ConnectionState::RECONNECTING) {
+            state_info_.state = ConnectionState::CERT_WAIT;
+            state_info_.last_error = "Restarted, re-entering CERT_WAIT";
+            state_info_.retry_count = 0;
             persistState();
         }
 
-        // Transition to CERT_WAIT to begin connection flow
         if (state_info_.state == ConnectionState::INIT ||
             state_info_.state == ConnectionState::OFFLINE) {
             cb = transitionTo(ConnectionState::CERT_WAIT);
         } else {
-            // Already in a non-initial state from restore; notify callback
             cb = callback_;
         }
+
+        // Start the retry timer thread
+        timer_running_ = true;
+        timer_thread_ = std::thread(&ConnectionStateMachine::timerLoop, this);
     }
     if (cb) cb(state_info_.state);
+}
+
+void ConnectionStateMachine::stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        timer_running_ = false;
+        timer_cv_.notify_all();
+    }
+    if (timer_thread_.joinable()) {
+        timer_thread_.join();
+    }
 }
 
 ConnectionState ConnectionStateMachine::getCurrentState() const {
@@ -104,6 +130,7 @@ void ConnectionStateMachine::onConnectionFailure(const std::string& error) {
             }
         }
     }
+    timer_cv_.notify_all();
     if (cb) cb(new_state);
 }
 
@@ -148,6 +175,7 @@ void ConnectionStateMachine::onDisconnect() {
             calculateNextRetry();
         }
     }
+    timer_cv_.notify_all();
     if (cb) cb(ConnectionState::RECONNECTING);
 }
 
@@ -203,6 +231,34 @@ void ConnectionStateMachine::restoreState() {
         }
     } catch (const hwyz::store::StoreException& e) {
         std::cerr << "[MQTT] State restore failed: " << e.what() << std::endl;
+    }
+}
+
+void ConnectionStateMachine::timerLoop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (timer_running_) {
+        if (state_info_.state == ConnectionState::RECONNECTING) {
+            auto wake_time = state_info_.next_retry_at;
+            bool predicate_changed = timer_cv_.wait_until(lock, wake_time, [this] {
+                return !timer_running_ ||
+                       state_info_.state != ConnectionState::RECONNECTING;
+            });
+
+            if (!timer_running_) break;
+            if (predicate_changed) continue; // State changed externally, re-evaluate
+
+            // Timeout expired and state is still RECONNECTING -> trigger retry.
+            // Unlock before calling onRetryTimeout() (it acquires the same mutex).
+            lock.unlock();
+            onRetryTimeout();
+            lock.lock();
+        } else {
+            // Not in RECONNECTING; sleep until state changes or we stop
+            timer_cv_.wait(lock, [this] {
+                return !timer_running_ ||
+                       state_info_.state == ConnectionState::RECONNECTING;
+            });
+        }
     }
 }
 

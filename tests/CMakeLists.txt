@@ -48,7 +48,7 @@ target_include_directories(test_sec_cert_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
     ${MOSQUITTO_INCLUDE_DIRS}
 )
-target_link_libraries(test_sec_cert_interface GTest::gtest_main pthread)
+target_link_libraries(test_sec_cert_interface GTest::gtest_main OpenSSL::SSL OpenSSL::Crypto pthread)
 
 add_executable(test_mqtt_client_manager
     unit/test_mqtt_client_manager.cpp

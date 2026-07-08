@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mqtt_types.h"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -30,6 +31,16 @@ public:
     // Get certificate chain
     std::vector<uint8_t> getCertificateChain() const;
 
+    // Load and validate certificates from configured file paths
+    // Returns true if all certificates are valid and loaded successfully
+    bool loadCertificates(const std::string& root_ca_ref,
+                          const std::string& tls_cert_ref,
+                          const std::string& tls_key_ref,
+                          KeySource key_source);
+
+    // Get last error message from loadCertificates
+    std::string getLastError() const;
+
     // Simulate certificate ready (for testing)
     void simulateCertificateReady();
 
@@ -37,6 +48,7 @@ private:
     bool certificate_ready_ = false;
     std::vector<uint8_t> cert_chain_;
     void* key_handle_ = nullptr;
+    std::string last_error_;
 };
 
 } // namespace mqtt

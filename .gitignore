@@ -87,3 +87,4 @@ mqtt.yaml
 *.crt
 *.csr
 *.der
+*.pem

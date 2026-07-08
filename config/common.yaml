@@ -1,0 +1,21 @@
+# TBOX Common Configuration (framework-config layer 0: common.yaml)
+# This file contains settings shared across all TBOX services.
+# Placed at: /etc/tbox/common.yaml
+#
+# framework-config requires a top-level 'log' map (validated).
+
+# Framework-store root path (Design §5)
+# Each service opens its store via Store::open("mqtt", store.root)
+store:
+  root: /var/lib/tbox
+
+# Internal bus address (shared across services)
+bus:
+  address: /tmp/tbox-bus.sock
+
+# Logging (required by framework-config validator)
+log:
+  level: info
+  file: /var/log/tbox/mqtt.log
+  max_size_mb: 10
+  max_files: 5
