@@ -3,7 +3,9 @@
 #include <iostream>
 #include <openssl/conf.h>
 #include <openssl/err.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #include <openssl/provider.h>
+#endif
 
 namespace tbox {
 namespace mqtt {
@@ -145,10 +147,11 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
             return false;
         }
 
-        // For HSM mode, enable PKCS#11 URI as key reference in OpenSSL 3.x
+        // For HSM mode, enable PKCS#11 URI as key reference
         if (config.key_source == KeySource::HSM) {
+            // tls_key_ref should be a PKCS#11 URI (e.g. "pkcs11:object=device-key;type=private")
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
             // OpenSSL 3.x: load the pkcs11 provider if available
-            // This allows OpenSSL to understand pkcs11: URIs as key references
             OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
             OSSL_PROVIDER* pkcs11 = OSSL_PROVIDER_load(nullptr, "pkcs11");
             if (pkcs11) {
@@ -157,8 +160,11 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
                 std::cout << "[MQTT] Warning: OpenSSL pkcs11 provider not found, "
                           << "HSM may not work. Install pkcs11-provider." << std::endl;
             }
-            // legacy provider is optional, ignore if not available
             (void)legacy;
+#else
+            std::cout << "[MQTT] Warning: OpenSSL 1.1.x does not support "
+                      << "native PKCS#11 provider. HSM may require pkcs11-engine." << std::endl;
+#endif
         }
 
         std::cout << "[MQTT] TLS configured" << std::endl;
