@@ -1,12 +1,8 @@
 #include "config_manager.h"
-#include <nlohmann/json.hpp>
-#include <fstream>
 #include <iostream>
 
 namespace tbox {
 namespace mqtt {
-
-using json = nlohmann::json;
 
 ConfigManager::ConfigManager() {
 }
@@ -14,22 +10,84 @@ ConfigManager::ConfigManager() {
 ConfigManager::~ConfigManager() {
 }
 
-bool ConfigManager::loadDefaultConfig() {
+bool ConfigManager::loadFromFramework(const std::string& config_root) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    current_config_.broker_host = "localhost";
-    current_config_.broker_port = 1883;
-    current_config_.keepalive = 60;
-    current_config_.clean_start = false;
-    current_config_.session_expiry = 3600;
+    auto& fw_config = hwyz::config::ConfigManager::instance();
+    auto err = fw_config.load("mqtt", config_root);
+    if (err != hwyz::config::ConfigError::kOk) {
+        auto info = fw_config.getLastError();
+        std::cerr << "[MQTT] Config load failed: " << info.message << std::endl;
+        return false;
+    }
+
+    config_snapshot_ = fw_config.getSnapshot();
+    if (!config_snapshot_) {
+        std::cerr << "[MQTT] Config snapshot is null" << std::endl;
+        return false;
+    }
+
+    // Read static config fields from framework-config snapshot
+    current_config_.root_ca_ref = config_snapshot_->getString("mqtt.root_ca_ref", "");
+    current_config_.client_id = config_snapshot_->getString("mqtt.client_id", "");
+    current_config_.keepalive = static_cast<uint16_t>(config_snapshot_->getInt("mqtt.keepalive", 60));
+    current_config_.clean_start = config_snapshot_->getBool("mqtt.clean_start", false);
+    current_config_.session_expiry = static_cast<uint32_t>(config_snapshot_->getInt("mqtt.session_expiry", 3600));
+    current_config_.tls_cert_ref = config_snapshot_->getString("mqtt.tls_cert_ref", "");
+    current_config_.tls_key_ref = config_snapshot_->getString("mqtt.tls_key_ref", "");
+
+    std::string ks = config_snapshot_->getString("mqtt.key_source", "file");
+    current_config_.key_source = (ks == "hsm") ? KeySource::HSM : KeySource::FILE;
+
+    current_config_.username = config_snapshot_->getString("mqtt.username", "");
+
+    // Read default broker values from framework-config (may be overridden by store)
+    current_config_.broker_host = config_snapshot_->getString("mqtt.broker_host", "localhost");
+    current_config_.broker_port = static_cast<uint16_t>(config_snapshot_->getInt("mqtt.broker_port", 1883));
+
     current_config_.source = ConnectionConfig::Source::FACTORY;
     current_config_.version = 0;
 
+    // Read offline queue config
+    offline_queue_config_ = readOfflineQueueConfig();
+
+    std::cout << "[MQTT] Config loaded from framework-config (root: " << config_root << ")" << std::endl;
+    return true;
+}
+
+bool ConfigManager::loadFromStore(hwyz::store::Store& store) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!store.isReady()) {
+        std::cerr << "[MQTT] Store not ready, skipping store load" << std::endl;
+        return false;
+    }
+
+    // Load OTA-updatable params from framework-store
+    if (store.has(StoreKeys::kBrokerHost)) {
+        current_config_.broker_host = store.loadOr<std::string>(StoreKeys::kBrokerHost, current_config_.broker_host);
+        current_config_.source = ConnectionConfig::Source::OTA;
+    }
+
+    if (store.has(StoreKeys::kBrokerPort)) {
+        int port = store.loadOr<int>(StoreKeys::kBrokerPort, static_cast<int>(current_config_.broker_port));
+        current_config_.broker_port = static_cast<uint16_t>(port);
+        current_config_.source = ConnectionConfig::Source::OTA;
+    }
+
+    if (store.has(StoreKeys::kConfigVersion)) {
+        current_config_.version = static_cast<uint32_t>(store.loadOr<int>(StoreKeys::kConfigVersion, 0));
+        current_version_ = current_config_.version;
+    }
+
+    std::cout << "[MQTT] OTA params loaded from framework-store (source: "
+              << (current_config_.source == ConnectionConfig::Source::OTA ? "OTA" : "FACTORY")
+              << ", version: " << current_version_ << ")" << std::endl;
     return true;
 }
 
 bool ConfigManager::applyConfig(const ConnectionConfig& config,
-                               ConnectionConfig::Source source) {
+                                ConnectionConfig::Source source) {
     ChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -43,7 +101,23 @@ bool ConfigManager::applyConfig(const ConnectionConfig& config,
             return false;
         }
 
-        current_config_ = config;
+        // OTA source: write updatable params to framework-store (Design §5)
+        if (source == ConnectionConfig::Source::OTA && store_ && store_->isReady()) {
+            try {
+                store_->save<std::string>(StoreKeys::kBrokerHost, config.broker_host);
+                store_->save<int>(StoreKeys::kBrokerPort, static_cast<int>(config.broker_port));
+                store_->save<int>(StoreKeys::kConfigVersion, static_cast<int>(config.version));
+            } catch (const hwyz::store::StoreException& e) {
+                std::cerr << "[MQTT] Store write failed: " << e.what() << std::endl;
+                return false;
+            }
+        }
+
+        // Update in-memory config (updatable fields only for OTA)
+        current_config_.broker_host = config.broker_host;
+        current_config_.broker_port = config.broker_port;
+        current_config_.source = source;
+        current_config_.version = config.version;
         current_version_ = config.version;
         cb = change_callback_;
     }
@@ -87,82 +161,41 @@ void ConfigManager::setChangeCallback(ChangeCallback callback) {
     change_callback_ = callback;
 }
 
-bool ConfigManager::saveToFile(const std::string& filepath) const {
+void ConfigManager::setStore(std::shared_ptr<hwyz::store::Store> store) {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    json j;
-    j["broker_host"] = current_config_.broker_host;
-    j["broker_port"] = current_config_.broker_port;
-    j["client_id"] = current_config_.client_id;
-    j["keepalive"] = current_config_.keepalive;
-    j["clean_start"] = current_config_.clean_start;
-    j["session_expiry"] = current_config_.session_expiry;
-    j["root_ca_ref"] = current_config_.root_ca_ref;
-    j["tls_cert_ref"] = current_config_.tls_cert_ref;
-    j["tls_key_ref"] = current_config_.tls_key_ref;
-    j["key_source"] = (current_config_.key_source == KeySource::HSM) ? "hsm" : "file";
-    if (!current_config_.username.empty()) j["username"] = current_config_.username;
-    if (!current_config_.password.empty()) j["password"] = current_config_.password;
-
-    std::ofstream ofs(filepath);
-    if (!ofs.is_open()) {
-        std::cerr << "Failed to open config file for writing: " << filepath << std::endl;
-        return false;
-    }
-
-    ofs << j.dump(4) << std::endl;
-    return true;
+    store_ = store;
 }
 
-bool ConfigManager::loadFromFile(const std::string& filepath) {
+std::shared_ptr<const hwyz::config::ImmutableConfigView> ConfigManager::getSnapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    return config_snapshot_;
+}
 
-    std::ifstream ifs(filepath);
-    if (!ifs.is_open()) {
-        std::cerr << "Config file not found: " << filepath << std::endl;
-        return false;
-    }
-
-    json j;
-    try {
-        ifs >> j;
-    } catch (const json::parse_error& e) {
-        std::cerr << "Failed to parse config file: " << e.what() << std::endl;
-        return false;
-    }
-
-    ConnectionConfig config;
-    if (j.contains("broker_host")) config.broker_host = j["broker_host"].get<std::string>();
-    if (j.contains("broker_port")) config.broker_port = j["broker_port"].get<uint16_t>();
-    if (j.contains("client_id")) config.client_id = j["client_id"].get<std::string>();
-    if (j.contains("keepalive")) config.keepalive = j["keepalive"].get<uint16_t>();
-    if (j.contains("clean_start")) config.clean_start = j["clean_start"].get<bool>();
-    if (j.contains("session_expiry")) config.session_expiry = j["session_expiry"].get<uint32_t>();
-    if (j.contains("root_ca_ref")) config.root_ca_ref = j["root_ca_ref"].get<std::string>();
-    if (j.contains("tls_cert_ref")) config.tls_cert_ref = j["tls_cert_ref"].get<std::string>();
-    if (j.contains("tls_key_ref")) config.tls_key_ref = j["tls_key_ref"].get<std::string>();
-    if (j.contains("key_source")) {
-        std::string ks = j["key_source"].get<std::string>();
-        config.key_source = (ks == "hsm") ? KeySource::HSM : KeySource::FILE;
-    }
-    if (j.contains("username")) config.username = j["username"].get<std::string>();
-    if (j.contains("password")) config.password = j["password"].get<std::string>();
-
-    if (!validateConfig(config)) {
-        std::cerr << "Invalid config from file: " << filepath << std::endl;
-        return false;
-    }
-
-    current_config_ = config;
-    current_version_++;
-    std::cout << "Loaded config from: " << filepath << std::endl;
-    return true;
+OfflineQueueConfig ConfigManager::getOfflineQueueConfig() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return offline_queue_config_;
 }
 
 void ConfigManager::notifyChange() {
     if (change_callback_) {
         change_callback_();
     }
+}
+
+OfflineQueueConfig ConfigManager::readOfflineQueueConfig() const {
+    OfflineQueueConfig config;
+    if (!config_snapshot_) {
+        return config;
+    }
+
+    auto queue_section = config_snapshot_->getSection("mqtt.offline_queue");
+    if (queue_section) {
+        config.path = queue_section->getString("path", config.path);
+        config.max_size = static_cast<size_t>(queue_section->getInt("max_size", static_cast<int>(config.max_size)));
+        config.drop_policy = queue_section->getString("drop_policy", config.drop_policy);
+    }
+
+    return config;
 }
 
 } // namespace mqtt

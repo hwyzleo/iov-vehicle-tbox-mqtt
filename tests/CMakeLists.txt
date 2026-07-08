@@ -16,6 +16,16 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
+# Framework library (framework-config + framework-store)
+set(FRAMEWORK_DIR ${CMAKE_SOURCE_DIR}/../iov-vehicle-tbox-framework)
+if(EXISTS ${FRAMEWORK_DIR}/include)
+    set(FRAMEWORK_INCLUDE_DIR ${FRAMEWORK_DIR}/include)
+endif()
+find_library(FRAMEWORK_LIB hwyz PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
+if(NOT FRAMEWORK_LIB)
+    message(FATAL_ERROR "Framework library not found in ${FRAMEWORK_DIR}/build")
+endif()
+
 # Unit tests
 add_executable(test_connection_state_machine
     unit/test_connection_state_machine.cpp
@@ -24,9 +34,10 @@ add_executable(test_connection_state_machine
 target_include_directories(test_connection_state_machine PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
-target_link_libraries(test_connection_state_machine GTest::gtest_main pthread)
+target_link_libraries(test_connection_state_machine GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
 add_executable(test_sec_cert_interface
     unit/test_sec_cert_interface.cpp
@@ -59,9 +70,10 @@ add_executable(test_offline_cache_queue
 target_include_directories(test_offline_cache_queue PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
-target_link_libraries(test_offline_cache_queue GTest::gtest_main pthread)
+target_link_libraries(test_offline_cache_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
 add_executable(test_route_bridge
     unit/test_route_bridge.cpp
@@ -81,9 +93,10 @@ add_executable(test_config_manager
 target_include_directories(test_config_manager PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
-target_link_libraries(test_config_manager GTest::gtest_main nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_config_manager GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
 add_executable(test_internal_bus_interface
     unit/test_internal_bus_interface.cpp
@@ -102,10 +115,11 @@ add_executable(test_mqtt_service_integration
 target_include_directories(test_mqtt_service_integration PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 target_link_directories(test_mqtt_service_integration PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
-target_link_libraries(test_mqtt_service_integration mqtt_service_lib GTest::gtest_main ${MOSQUITTO_LIBRARIES} pthread)
+target_link_libraries(test_mqtt_service_integration mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
 
 # Integration tests
 add_executable(test_end_to_end
@@ -114,10 +128,11 @@ add_executable(test_end_to_end
 target_include_directories(test_end_to_end PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 target_link_directories(test_end_to_end PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
-target_link_libraries(test_end_to_end mqtt_service_lib GTest::gtest_main ${MOSQUITTO_LIBRARIES} pthread)
+target_link_libraries(test_end_to_end mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
 
 # Add tests
 add_test(NAME ConnectionStateMachineTest COMMAND test_connection_state_machine)

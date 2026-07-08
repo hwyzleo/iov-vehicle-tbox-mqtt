@@ -75,6 +75,7 @@ docs/superpowers
 mqtt_config.json
 mqtt_config.hsm.example
 mqtt_config.json.example
+mqtt.yaml
 
 # IDE
 .idea/
@@ -82,3 +83,7 @@ mqtt_config.json.example
 *.swp
 *.swo
 *~
+
+*.crt
+*.csr
+*.der

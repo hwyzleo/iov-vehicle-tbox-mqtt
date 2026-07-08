@@ -2,21 +2,71 @@
 #include "mqtt_service.h"
 #include "sec_cert_interface.h"
 #include "internal_bus_interface.h"
+#include "config.h"
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 
 using namespace tbox::mqtt;
+
+namespace {
+std::string createE2EConfigDir() {
+    auto tmp_dir = std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_config";
+    auto conf_d = tmp_dir / "conf.d";
+    std::filesystem::create_directories(conf_d);
+
+    {
+        std::ofstream ofs(tmp_dir / "common.yaml");
+        ofs << "store:\n"
+            << "  root: /tmp/tbox_mqtt_e2e_store\n"
+            << "log:\n"
+            << "  level: info\n";
+    }
+
+    {
+        std::ofstream ofs(conf_d / "mqtt.yaml");
+        ofs << "mqtt:\n"
+            << "  broker_host: localhost\n"
+            << "  broker_port: 1883\n"
+            << "  client_id: VIN123SN456\n"
+            << "  keepalive: 60\n"
+            << "  clean_start: false\n"
+            << "  session_expiry: 3600\n"
+            << "  root_ca_ref: /path/to/ca.crt\n"
+            << "  tls_cert_ref: /path/to/client.crt\n"
+            << "  tls_key_ref: /path/to/client.key\n"
+            << "  key_source: file\n";
+    }
+
+    return tmp_dir.string();
+}
+
+std::string createE2EStoreDir() {
+    auto dir = std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_store";
+    std::filesystem::create_directories(dir);
+    return dir.string();
+}
+
+void cleanupE2EDirs() {
+    std::filesystem::remove_all(std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_config");
+    std::filesystem::remove_all(std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_store");
+}
+} // anonymous namespace
 
 class EndToEndTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        config_dir = createE2EConfigDir();
+        store_dir = createE2EStoreDir();
+
         service = std::make_unique<MqttService>();
         sec = std::make_shared<SecCertInterface>();
         bus = std::make_shared<InternalBusInterface>();
 
         sec->simulateCertificateReady();
 
-        service->initialize(sec, bus);
+        service->initialize(sec, bus, config_dir, store_dir);
         service->start();
 
         // Wait for connection
@@ -25,8 +75,11 @@ protected:
 
     void TearDown() override {
         service->stop();
+        cleanupE2EDirs();
     }
 
+    std::string config_dir;
+    std::string store_dir;
     std::unique_ptr<MqttService> service;
     std::shared_ptr<SecCertInterface> sec;
     std::shared_ptr<InternalBusInterface> bus;

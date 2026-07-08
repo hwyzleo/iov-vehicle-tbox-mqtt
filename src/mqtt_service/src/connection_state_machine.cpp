@@ -1,5 +1,6 @@
 #include "connection_state_machine.h"
 #include <algorithm>
+#include <iostream>
 
 namespace tbox {
 namespace mqtt {
@@ -13,13 +14,37 @@ void ConnectionStateMachine::setStateChangeCallback(StateChangeCallback callback
     callback_ = callback;
 }
 
+void ConnectionStateMachine::setStore(std::shared_ptr<hwyz::store::Store> store) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_ = store;
+}
+
 void ConnectionStateMachine::start() {
     StateChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        cb = transitionTo(ConnectionState::CERT_WAIT);
+
+        // Restore previous state from framework-store before starting
+        restoreState();
+
+        // If restored state was CONNECTED, downgrade to RECONNECTING
+        // (cannot resume a live TCP/TLS connection across restart)
+        if (state_info_.state == ConnectionState::CONNECTED) {
+            state_info_.state = ConnectionState::RECONNECTING;
+            state_info_.last_error = "Restored from store, downgrading CONNECTED to RECONNECTING";
+            persistState();
+        }
+
+        // Transition to CERT_WAIT to begin connection flow
+        if (state_info_.state == ConnectionState::INIT ||
+            state_info_.state == ConnectionState::OFFLINE) {
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        } else {
+            // Already in a non-initial state from restore; notify callback
+            cb = callback_;
+        }
     }
-    if (cb) cb(ConnectionState::CERT_WAIT);
+    if (cb) cb(state_info_.state);
 }
 
 ConnectionState ConnectionStateMachine::getCurrentState() const {
@@ -128,6 +153,7 @@ void ConnectionStateMachine::onDisconnect() {
 
 ConnectionStateMachine::StateChangeCallback ConnectionStateMachine::transitionTo(ConnectionState new_state) {
     state_info_.state = new_state;
+    persistState();
     return callback_;
 }
 
@@ -141,6 +167,43 @@ void ConnectionStateMachine::calculateNextRetry() {
     delay += std::chrono::milliseconds(jitter);
 
     state_info_.next_retry_at = std::chrono::steady_clock::now() + delay;
+}
+
+void ConnectionStateMachine::persistState() {
+    if (!store_ || !store_->isReady()) {
+        return;
+    }
+
+    try {
+        store_->save<int>(StoreKeys::kConnState, static_cast<int>(state_info_.state));
+        store_->save<std::string>(StoreKeys::kConnLastError, state_info_.last_error);
+        store_->save<int>(StoreKeys::kConnRetryCount, static_cast<int>(state_info_.retry_count));
+    } catch (const hwyz::store::StoreException& e) {
+        std::cerr << "[MQTT] State persist failed: " << e.what() << std::endl;
+    }
+}
+
+void ConnectionStateMachine::restoreState() {
+    if (!store_ || !store_->isReady()) {
+        return;
+    }
+
+    try {
+        int state_int = store_->loadOr<int>(StoreKeys::kConnState,
+                                             static_cast<int>(ConnectionState::INIT));
+        state_info_.state = static_cast<ConnectionState>(state_int);
+        state_info_.last_error = store_->loadOr<std::string>(StoreKeys::kConnLastError, "");
+        state_info_.retry_count = static_cast<uint32_t>(
+            store_->loadOr<int>(StoreKeys::kConnRetryCount, 0));
+
+        if (state_info_.state != ConnectionState::INIT) {
+            std::cout << "[MQTT] Restored state from store: "
+                      << static_cast<int>(state_info_.state)
+                      << ", retry_count=" << state_info_.retry_count << std::endl;
+        }
+    } catch (const hwyz::store::StoreException& e) {
+        std::cerr << "[MQTT] State restore failed: " << e.what() << std::endl;
+    }
 }
 
 } // namespace mqtt

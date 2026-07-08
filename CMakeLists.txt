@@ -15,13 +15,23 @@ pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 # SQLite for offline cache
 find_package(SQLite3 REQUIRED)
 
-# JSON library (for config)
-find_package(nlohmann_json REQUIRED)
+# Framework library (framework-config + framework-store)
+set(FRAMEWORK_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework)
+if(EXISTS ${FRAMEWORK_DIR}/include)
+    set(FRAMEWORK_INCLUDE_DIR ${FRAMEWORK_DIR}/include)
+endif()
+find_library(FRAMEWORK_LIB hwyz PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
+if(NOT FRAMEWORK_LIB)
+    message(FATAL_ERROR "Framework library not found in ${FRAMEWORK_DIR}/build. "
+                        "Please build framework first: cmake -B ${FRAMEWORK_DIR}/build && cmake --build ${FRAMEWORK_DIR}/build")
+endif()
 
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
+    ${FRAMEWORK_INCLUDE_DIR}
+    ${MOSQUITTO_INCLUDE_DIRS}
 )
 
 # Source files
@@ -45,8 +55,8 @@ target_link_libraries(mqtt_service_lib
     OpenSSL::Crypto
     ${MOSQUITTO_LIBRARIES}
     SQLite::SQLite3
-    nlohmann_json::nlohmann_json
     protobuf::libprotobuf
+    ${FRAMEWORK_LIB}
 )
 
 # Main executable

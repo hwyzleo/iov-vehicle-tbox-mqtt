@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "config.h"
 #include <queue>
 #include <map>
 #include <mutex>
@@ -21,10 +22,15 @@ struct MessageComparator {
 };
 
 // Offline cache queue (Design §2, §3)
+// Queue persistence is self-developed by MQTT (business data, not via framework-store).
+// Config params (path, max_size, drop_policy) sourced from framework-config.
 class OfflineCacheQueue {
 public:
     explicit OfflineCacheQueue(size_t max_size);
     ~OfflineCacheQueue();
+
+    // Configure queue parameters from framework-config snapshot (Design §5)
+    void configureFromSnapshot(const hwyz::config::ImmutableConfigView& snapshot);
 
     // Enqueue message for offline delivery
     bool enqueue(const OutboundMessage& message);
@@ -60,11 +66,15 @@ public:
     };
     QueueStats getStats() const;
 
+    // Get current config
+    OfflineQueueConfig getConfig() const;
+
 private:
     void dropOldestMessage();
     void dropLowestPriorityMessage();
 
     size_t max_size_;
+    OfflineQueueConfig config_;
     std::priority_queue<OutboundMessage,
                        std::vector<OutboundMessage>,
                        MessageComparator> queue_;

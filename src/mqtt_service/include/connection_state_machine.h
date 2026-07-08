@@ -1,10 +1,12 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "store.h"
 #include <functional>
 #include <chrono>
 #include <mutex>
 #include <random>
+#include <memory>
 
 namespace tbox {
 namespace mqtt {
@@ -21,6 +23,9 @@ public:
     ConnectionStateInfo getStateInfo() const;
     void setMaxRetries(uint32_t max_retries);
 
+    // Set framework-store for state persistence (Design §5)
+    void setStore(std::shared_ptr<hwyz::store::Store> store);
+
     void onCertificateReady();
     void onConnectionSuccess();
     void onConnectionFailure(const std::string& error);
@@ -31,6 +36,8 @@ public:
 private:
     StateChangeCallback transitionTo(ConnectionState new_state);
     void calculateNextRetry();
+    void persistState();
+    void restoreState();
 
     mutable std::mutex mutex_;
     ConnectionStateInfo state_info_;
@@ -39,6 +46,7 @@ private:
     std::chrono::milliseconds base_retry_delay_{1000};
     std::chrono::milliseconds max_retry_delay_{30000};
     std::mt19937 rng_{std::random_device{}()};
+    std::shared_ptr<hwyz::store::Store> store_;
 };
 
 } // namespace mqtt

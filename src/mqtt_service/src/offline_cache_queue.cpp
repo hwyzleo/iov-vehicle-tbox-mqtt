@@ -11,6 +11,22 @@ OfflineCacheQueue::OfflineCacheQueue(size_t max_size)
 OfflineCacheQueue::~OfflineCacheQueue() {
 }
 
+void OfflineCacheQueue::configureFromSnapshot(const hwyz::config::ImmutableConfigView& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto queue_section = snapshot.getSection("mqtt.offline_queue");
+    if (queue_section) {
+        config_.path = queue_section->getString("path", config_.path);
+        config_.max_size = static_cast<size_t>(queue_section->getInt("max_size", static_cast<int>(config_.max_size)));
+        config_.drop_policy = queue_section->getString("drop_policy", config_.drop_policy);
+    }
+
+    // Update max_size if changed
+    if (config_.max_size > 0) {
+        max_size_ = config_.max_size;
+    }
+}
+
 bool OfflineCacheQueue::enqueue(const OutboundMessage& message) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -123,6 +139,11 @@ OfflineCacheQueue::QueueStats OfflineCacheQueue::getStats() const {
     }
 
     return stats;
+}
+
+OfflineQueueConfig OfflineCacheQueue::getConfig() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_;
 }
 
 void OfflineCacheQueue::dropOldestMessage() {

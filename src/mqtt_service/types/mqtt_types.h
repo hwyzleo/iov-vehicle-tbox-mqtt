@@ -49,9 +49,15 @@ enum class KeySource : uint8_t {
 };
 
 // Connection configuration (Design §3)
+// Static items (root_ca_ref, client_id, keepalive, clean_start, session_expiry,
+// tls_cert_ref, tls_key_ref, key_source) are loaded via framework-config (read-only).
+// Updatable items (broker_host, broker_port) are persisted via framework-store
+// and can be overwritten by OTA cloud delivery.
 struct ConnectionConfig {
+    // --- Updatable via framework-store (source=OTA) ---
     std::string broker_host;
     uint16_t broker_port = 8883;
+    // --- Static via framework-config (read-only) ---
     std::string root_ca_ref;
     std::string client_id;  // VIN + SN
     uint16_t keepalive = 60;
@@ -137,6 +143,23 @@ struct ConnectionStateResult {
     std::string last_error;
     uint32_t retry_count = 0;
 };
+
+// Offline cache queue configuration (sourced from framework-config, Design §3)
+struct OfflineQueueConfig {
+    std::string path = "/var/lib/tbox/mqtt/queue";
+    size_t max_size = 1000;
+    std::string drop_policy = "drop_oldest";  // "drop_oldest" or "drop_lowest_priority"
+};
+
+// framework-store key constants (Design §5)
+namespace StoreKeys {
+    constexpr const char* kBrokerHost     = "mqtt.broker_host";
+    constexpr const char* kBrokerPort     = "mqtt.broker_port";
+    constexpr const char* kConnState      = "mqtt.conn_state";
+    constexpr const char* kConnLastError  = "mqtt.conn_last_error";
+    constexpr const char* kConnRetryCount = "mqtt.conn_retry_count";
+    constexpr const char* kConfigVersion  = "mqtt.config_version";
+} // namespace StoreKeys
 
 } // namespace mqtt
 } // namespace tbox

@@ -24,13 +24,44 @@ MqttService::~MqttService() {
 }
 
 bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
-                            std::shared_ptr<InternalBusInterface> bus_interface) {
+                             std::shared_ptr<InternalBusInterface> bus_interface,
+                             const std::string& config_root,
+                             const std::string& store_root) {
     if (!sec_interface || !bus_interface) {
         return false;
     }
 
     sec_interface_ = sec_interface;
     bus_interface_ = bus_interface;
+
+    // Open framework-store for runtime state and OTA-updatable params (Design §5)
+    store_ = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_root));
+    if (!store_->isReady()) {
+        std::cerr << "[MQTT] Failed to open framework-store at: " << store_root << std::endl;
+        return false;
+    }
+    std::cout << "[MQTT] framework-store opened at: " << store_root << std::endl;
+
+    // Load static config from framework-config (Design §5)
+    if (!config_manager_->loadFromFramework(config_root)) {
+        std::cerr << "[MQTT] Failed to load config from framework-config" << std::endl;
+        return false;
+    }
+
+    // Set store and load OTA-updatable params from framework-store
+    config_manager_->setStore(store_);
+    config_manager_->loadFromStore(*store_);
+
+    // Set store for state machine persistence
+    state_machine_->setStore(store_);
+
+    // Configure offline cache queue from framework-config snapshot
+    auto queue_config = config_manager_->getOfflineQueueConfig();
+    cache_queue_ = std::make_unique<OfflineCacheQueue>(queue_config.max_size);
+    std::cout << "[MQTT] Offline queue configured: max_size=" << queue_config.max_size
+              << ", path=" << queue_config.path
+              << ", drop_policy=" << queue_config.drop_policy << std::endl;
 
     state_machine_->setStateChangeCallback(
         [this](ConnectionState new_state) {
@@ -96,9 +127,9 @@ void MqttService::stop() {
 }
 
 PublishResult MqttService::publish(const std::string& topic,
-                                  const std::vector<uint8_t>& payload,
-                                  QoS qos,
-                                  Priority priority) {
+                                   const std::vector<uint8_t>& payload,
+                                   QoS qos,
+                                   Priority priority) {
     PublishResult result;
 
     if (state_machine_->getCurrentState() != ConnectionState::CONNECTED) {
@@ -124,8 +155,8 @@ PublishResult MqttService::publish(const std::string& topic,
 }
 
 SubscribeResult MqttService::subscribe(const std::string& topic,
-                                      QoS qos,
-                                      const std::string& target_service) {
+                                       QoS qos,
+                                       const std::string& target_service) {
     SubscribeResult result;
 
     RouteEntry entry;
@@ -149,8 +180,8 @@ SubscribeResult MqttService::subscribe(const std::string& topic,
 }
 
 bool MqttService::registerRoute(const std::string& internal_addr,
-                               const std::string& mqtt_topic,
-                               RouteEntry::Direction direction) {
+                                const std::string& mqtt_topic,
+                                RouteEntry::Direction direction) {
     RouteEntry entry;
     entry.internal_addr = internal_addr;
     entry.mqtt_topic = mqtt_topic;
@@ -170,7 +201,7 @@ ConnectionStateResult MqttService::getConnectionState() const {
 }
 
 bool MqttService::applyConfig(const ConnectionConfig& config,
-                             ConnectionConfig::Source source) {
+                              ConnectionConfig::Source source) {
     return config_manager_->applyConfig(config, source);
 }
 
@@ -198,7 +229,7 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
 }
 
 void MqttService::onMessageReceived(const std::string& topic,
-                                   const std::vector<uint8_t>& payload) {
+                                    const std::vector<uint8_t>& payload) {
     auto route = route_bridge_->findRouteByMqttTopic(topic);
     if (!route.has_value()) {
         return;
@@ -208,7 +239,7 @@ void MqttService::onMessageReceived(const std::string& topic,
 }
 
 void MqttService::onInternalMessage(const std::string& internal_addr,
-                                   const std::vector<uint8_t>& payload) {
+                                    const std::vector<uint8_t>& payload) {
     auto route = route_bridge_->findRouteByInternalAddr(internal_addr);
     if (!route.has_value()) {
         return;

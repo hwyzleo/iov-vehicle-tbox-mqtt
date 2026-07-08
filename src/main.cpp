@@ -1,14 +1,13 @@
 #include "mqtt_service.h"
 #include "sec_cert_interface.h"
 #include "internal_bus_interface.h"
-#include "config_manager.h"
+#include "config.h"
 #include <iostream>
 #include <signal.h>
 #include <memory>
 #include <thread>
 #include <chrono>
 #include <atomic>
-#include <filesystem>
 
 using namespace tbox::mqtt;
 
@@ -20,11 +19,34 @@ void signal_handler(int signal) {
 }
 
 int main(int argc, char* argv[]) {
-    // Setup signal handler
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     std::cout << "Starting TBOX MQTT Service..." << std::endl;
+
+    // Load configuration via framework-config (Design §5)
+    std::string config_root = "/etc/tbox/";
+    if (argc > 1) config_root = argv[1];
+
+    auto& fw_config = hwyz::config::ConfigManager::instance();
+    auto err = fw_config.load("mqtt", config_root);
+    if (err != hwyz::config::ConfigError::kOk) {
+        auto info = fw_config.getLastError();
+        std::cerr << "Config load failed: " << info.message
+                  << " (path: " << info.path << ")" << std::endl;
+        return 1;
+    }
+
+    auto snapshot = fw_config.getSnapshot();
+    if (!snapshot) {
+        std::cerr << "Failed to get config snapshot" << std::endl;
+        return 1;
+    }
+
+    // Read store root path from store.root (Design §5)
+    std::string store_root = snapshot->getString("store.root", "/var/lib/tbox");
+    std::cout << "Config loaded from: " << config_root << std::endl;
+    std::cout << "Store root: " << store_root << std::endl;
 
     // Create dependencies
     auto sec = std::make_shared<SecCertInterface>();
@@ -34,51 +56,19 @@ int main(int argc, char* argv[]) {
     sec->simulateCertificateReady();
 #endif
 
-    // Create and initialize service
+    // Create and initialize service with framework paths
     g_service = std::make_unique<MqttService>();
 
-    if (!g_service->initialize(sec, bus)) {
+    if (!g_service->initialize(sec, bus, config_root, store_root)) {
         std::cerr << "Failed to initialize MQTT service" << std::endl;
-        return 1;
-    }
-
-    // Load configuration from file or use defaults
-    ConnectionConfig config;
-    const std::string config_path = "./mqtt_config.json";
-
-    if (std::filesystem::exists(config_path)) {
-        ConfigManager config_manager;
-        if (config_manager.loadFromFile(config_path)) {
-            config = config_manager.getConfig();
-            std::cout << "Using config from: " << config_path << std::endl;
-        } else {
-            std::cerr << "Failed to load config from " << config_path
-                      << ", using defaults" << std::endl;
-            config.broker_host = "localhost";
-            config.broker_port = 1883;
-            config.client_id = "VIN123SN456";
-        }
-    } else {
-        std::cout << "Config file not found: " << config_path
-                  << ", using defaults" << std::endl;
-        config.broker_host = "localhost";
-        config.broker_port = 1883;
-        config.client_id = "VIN123SN456";
-    }
-
-    config.source = ConnectionConfig::Source::FACTORY;
-    config.version = 1;
-
-    if (!g_service->applyConfig(config, ConnectionConfig::Source::FACTORY)) {
-        std::cerr << "Failed to apply configuration" << std::endl;
         return 1;
     }
 
     // Register routes
     g_service->registerRoute("service_diag", "vehicle/diag/status",
-                            RouteEntry::Direction::UP);
+                             RouteEntry::Direction::UP);
     g_service->registerRoute("service_control", "vehicle/control/cmd",
-                            RouteEntry::Direction::DOWN);
+                             RouteEntry::Direction::DOWN);
 
     // Start service
     if (!g_service->start()) {
@@ -94,7 +84,6 @@ int main(int argc, char* argv[]) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
-        // Monitor connection state - only log on transitions
         auto state = g_service->getConnectionState();
         if (first_iteration || state.state != last_logged_state) {
             std::cout << "Connection state: " << static_cast<int>(state.state)
