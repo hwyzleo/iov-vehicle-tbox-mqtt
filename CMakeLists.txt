@@ -12,6 +12,9 @@ find_package(Protobuf REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
+# yaml-cpp (framework dependency)
+find_package(yaml-cpp REQUIRED)
+
 # SQLite for offline cache
 find_package(SQLite3 REQUIRED)
 
@@ -67,6 +70,7 @@ target_link_libraries(mqtt_service_lib
     SQLite::SQLite3
     protobuf::libprotobuf
     ${FRAMEWORK_LIB}
+    yaml-cpp::yaml-cpp
 )
 
 # Main executable
