@@ -1,9 +1,11 @@
 #include "mqtt_client_manager.h"
+#include "mqtt_log_adapter.h"
+#include "mqtt_context.h"
 #include <mosquitto.h>
-#include <iostream>
 #include <openssl/conf.h>
 #include <openssl/err.h>
 #include <openssl/provider.h>
+#include <chrono>
 
 namespace tbox {
 namespace mqtt {
@@ -48,7 +50,6 @@ static void on_subscribe_wrapper(struct mosquitto* mosq, void* userdata,
 
 MqttClientManager::MqttClientManager() : mosq_(nullptr) {
     mosquitto_lib_init();
-    // Client ID will be set during initialize()
 }
 
 MqttClientManager::~MqttClientManager() {
@@ -80,26 +81,37 @@ bool MqttClientManager::initialize(const std::string& broker_host,
     auto cert_result = sec_interface.getCertHandle();
     if (!cert_result.valid) return false;
 
-    // Note: In real implementation, we'd configure TLS with PKCS#11
-    // For testing, we'll skip TLS configuration if CA file doesn't exist
-    // In production, this would be required
     int rc = mosquitto_tls_set(mosq_,
-                              ca_file_path.c_str(),          // root CA
-                              nullptr,                        // CA path
-                              cert_file_path.empty() ? nullptr : cert_file_path.c_str(),  // client cert
-                              key_file_path.empty() ? nullptr : key_file_path.c_str(),    // client key
-                              nullptr);                       // password callback
+                              ca_file_path.c_str(),
+                              nullptr,
+                              cert_file_path.empty() ? nullptr : cert_file_path.c_str(),
+                              key_file_path.empty() ? nullptr : key_file_path.c_str(),
+                              nullptr);
 
     return rc == MOSQ_ERR_SUCCESS;
 }
 
 bool MqttClientManager::connect(const ConnectionConfig& config) {
+    auto start_time = std::chrono::steady_clock::now();
+
     // Initialize mosquitto instance if not done yet
     if (!mosq_) {
-        std::cout << "[MQTT] Creating mosquitto instance, client_id: " << config.client_id << std::endl;
+        MqttLogAdapter::connection().debug(
+            "mqtt.client.creating",
+            "创建 mosquitto 实例",
+            {{"client_id_hash", tbox::fw::log::FieldValue::makeString(clientIdHash(config.client_id))}}
+        );
         mosq_ = mosquitto_new(config.client_id.c_str(), true, this);
         if (!mosq_) {
-            std::cerr << "[MQTT] Failed to create mosquitto instance" << std::endl;
+            MqttLogAdapter::connection().error(
+                "mqtt.connection.failed",
+                "mosquitto 实例创建失败",
+                {
+                    {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+                    {"reason_code", tbox::fw::log::FieldValue::makeString("mosq_new_failed")},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1002")}
+                }
+            );
             return false;
         }
 
@@ -108,29 +120,29 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         mosquitto_message_callback_set(mosq_, on_message_wrapper);
         mosquitto_publish_callback_set(mosq_, on_publish_wrapper);
         mosquitto_subscribe_callback_set(mosq_, on_subscribe_wrapper);
-        std::cout << "[MQTT] Mosquitto instance created" << std::endl;
     }
 
     // Configure TLS if CA certificate is specified
     if (!config.root_ca_ref.empty()) {
-        std::cout << "[MQTT] Configuring TLS..." << std::endl;
-        std::cout << "[MQTT]   CA:        " << config.root_ca_ref << std::endl;
-        if (!config.tls_cert_ref.empty())
-            std::cout << "[MQTT]   Cert:      " << config.tls_cert_ref << std::endl;
+        // Note: key_source and tls_key_ref are logged without exposing the actual key path value
+        // as they may contain PKCS#11 URIs or file paths (CR-003 §5)
+        std::string key_source_str = (config.key_source == KeySource::HSM) ? "HSM" : "FILE";
+
+        MqttLogAdapter::tls().info(
+            "mqtt.tls.configuring",
+            "配置 TLS",
+            {
+                {"key_source", tbox::fw::log::FieldValue::makeString(key_source_str)},
+                {"has_ca", tbox::fw::log::FieldValue::makeBool(!config.root_ca_ref.empty())},
+                {"has_cert", tbox::fw::log::FieldValue::makeBool(!config.tls_cert_ref.empty())}
+            }
+        );
 
         const char* key_path = nullptr;
 
         if (config.key_source == KeySource::HSM) {
-            std::cout << "[MQTT]   Key:       " << config.tls_key_ref << " (PKCS#11)" << std::endl;
-            std::cout << "[MQTT]   Key source: HSM" << std::endl;
-
-            // Configure OpenSSL to use PKCS#11 engine for HSM key operations
-            // tls_key_ref should be a PKCS#11 URI (e.g. "pkcs11:object=device-key;type=private")
-            // Requires OpenSSL pkcs11 engine/provider installed on the system
             key_path = config.tls_key_ref.c_str();
         } else {
-            std::cout << "[MQTT]   Key:       " << config.tls_key_ref << " (file)" << std::endl;
-            std::cout << "[MQTT]   Key source: FILE" << std::endl;
             key_path = config.tls_key_ref.empty() ? nullptr : config.tls_key_ref.c_str();
         }
 
@@ -141,29 +153,44 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
                                   key_path,
                                   nullptr);
         if (rc != MOSQ_ERR_SUCCESS) {
-            std::cerr << "[MQTT] TLS configuration failed: " << mosquitto_strerror(rc) << std::endl;
+            // mqtt.tls.handshake_failed event (CR-003 §4, MQTT-1001)
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time);
+            MqttLogAdapter::tls().error(
+                "mqtt.tls.handshake_failed",
+                "TLS 配置失败",
+                {
+                    {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+                    {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))},
+                    {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+                }
+            );
             return false;
         }
 
         // For HSM mode, enable PKCS#11 URI as key reference in OpenSSL 3.x
         if (config.key_source == KeySource::HSM) {
-            // OpenSSL 3.x: load the pkcs11 provider if available
-            // This allows OpenSSL to understand pkcs11: URIs as key references
             OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
             OSSL_PROVIDER* pkcs11 = OSSL_PROVIDER_load(nullptr, "pkcs11");
             if (pkcs11) {
-                std::cout << "[MQTT] OpenSSL pkcs11 provider loaded" << std::endl;
+                MqttLogAdapter::tls().info(
+                    "mqtt.tls.pkcs11_loaded",
+                    "OpenSSL pkcs11 provider 已加载"
+                );
             } else {
-                std::cout << "[MQTT] Warning: OpenSSL pkcs11 provider not found, "
-                          << "HSM may not work. Install pkcs11-provider." << std::endl;
+                MqttLogAdapter::tls().warn(
+                    "mqtt.tls.pkcs11_missing",
+                    "OpenSSL pkcs11 provider 未找到，HSM 可能无法工作"
+                );
             }
-            // legacy provider is optional, ignore if not available
             (void)legacy;
         }
-
-        std::cout << "[MQTT] TLS configured" << std::endl;
     } else {
-        std::cout << "[MQTT] TLS disabled (no CA certificate)" << std::endl;
+        MqttLogAdapter::tls().warn(
+            "mqtt.tls.disabled",
+            "TLS 未启用（无 CA 证书）"
+        );
     }
 
     // Set username from client certificate CN for broker authentication
@@ -171,9 +198,11 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         int rc = mosquitto_username_pw_set(mosq_, config.username.c_str(),
                                            config.password.empty() ? nullptr : config.password.c_str());
         if (rc != MOSQ_ERR_SUCCESS) {
-            std::cerr << "[MQTT] Failed to set username: " << mosquitto_strerror(rc) << std::endl;
-        } else {
-            std::cout << "[MQTT] Username set: " << config.username << std::endl;
+            MqttLogAdapter::connection().warn(
+                "mqtt.auth.username_set_failed",
+                "用户名设置失败",
+                {{"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))}}
+            );
         }
     }
 
@@ -187,8 +216,15 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
                           lwt_config_.retain);
     }
 
-    std::cout << "[MQTT] Connecting to " << config.broker_host << ":" << config.broker_port
-              << " (keepalive: " << config.keepalive << "s)" << std::endl;
+    MqttLogAdapter::connection().info(
+        "mqtt.connection.connecting",
+        "正在连接 Broker",
+        {
+            {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+            {"broker_port", tbox::fw::log::FieldValue::makeInt(config.broker_port)},
+            {"keepalive_s", tbox::fw::log::FieldValue::makeInt(config.keepalive)}
+        }
+    );
 
     int rc = mosquitto_connect(mosq_,
                               config.broker_host.c_str(),
@@ -196,15 +232,24 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
                               config.keepalive);
 
     if (rc == MOSQ_ERR_SUCCESS) {
-        std::cout << "[MQTT] Connection initiated" << std::endl;
-        // Start network loop
         mosquitto_loop_start(mosq_);
-        // Set connected flag immediately (in real scenario, on_connect callback would do this)
         connected_ = true;
         return true;
     }
 
-    std::cerr << "[MQTT] Connection failed: " << mosquitto_strerror(rc) << std::endl;
+    // mqtt.connection.failed event (CR-003 §4, MQTT-1002)
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time);
+    MqttLogAdapter::connection().error(
+        "mqtt.connection.failed",
+        "连接 Broker 失败",
+        {
+            {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+            {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))},
+            {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+            {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1002")}
+        }
+    );
     return false;
 }
 
@@ -220,10 +265,30 @@ PublishResult MqttClientManager::publish(const std::string& topic,
                                         const std::vector<uint8_t>& payload,
                                         QoS qos) {
     PublishResult result;
+    auto start_time = std::chrono::steady_clock::now();
 
     if (!mosq_ || !connected_) {
         result.accepted = false;
         result.error = ErrorCode::MQTT_1002;
+        return result;
+    }
+
+    // Topic validation (CR-003 §4: mqtt.publish.rejected MQTT-1004)
+    if (topic.empty()) {
+        MqttLogAdapter::publish().warn(
+            "mqtt.publish.rejected",
+            "topic 非法，拒绝发布",
+            {
+                {"topic_template", tbox::fw::log::FieldValue::makeString("empty")},
+                {"qos", tbox::fw::log::FieldValue::makeString(qosToString(qos))},
+                {"payload_size", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(payload.size()))},
+                {"validation_reason", tbox::fw::log::FieldValue::makeString("empty_topic")},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1004")}
+            }
+        );
+        result.accepted = false;
+        result.error = ErrorCode::MQTT_1004;
         return result;
     }
 
@@ -238,9 +303,37 @@ PublishResult MqttClientManager::publish(const std::string& topic,
 
     if (rc == MOSQ_ERR_SUCCESS) {
         result.accepted = true;
+        // mqtt.publish.acknowledged event (CR-003 §4, DEBUG level)
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::publish().debug(
+            "mqtt.publish.acknowledged",
+            "QoS1 PUBACK 成功",
+            {
+                {"msg_id_hash", tbox::fw::log::FieldValue::makeString(
+                    msgIdHash("mid_" + std::to_string(mid)))},
+                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+                {"qos", tbox::fw::log::FieldValue::makeString(qosToString(qos))},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())}
+            }
+        );
     } else {
         result.accepted = false;
         result.error = ErrorCode::MQTT_1005;
+        // mqtt.publish.failed event (CR-003 §4, MQTT-1005)
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::publish().error(
+            "mqtt.publish.failed",
+            "发布超时或重试耗尽",
+            {
+                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+                {"qos", tbox::fw::log::FieldValue::makeString(qosToString(qos))},
+                {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1005")}
+            }
+        );
     }
 
     return result;
@@ -248,6 +341,7 @@ PublishResult MqttClientManager::publish(const std::string& topic,
 
 SubscribeResult MqttClientManager::subscribe(const std::string& topic, QoS qos) {
     SubscribeResult result;
+    auto start_time = std::chrono::steady_clock::now();
 
     if (!mosq_ || !connected_) {
         result.status = false;
@@ -265,6 +359,20 @@ SubscribeResult MqttClientManager::subscribe(const std::string& topic, QoS qos) 
     } else {
         result.status = false;
         result.error = ErrorCode::MQTT_1008;
+        // mqtt.subscription.failed event (CR-003 §4, MQTT-1008)
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.failed",
+            "订阅请求失败",
+            {
+                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+                {"qos", tbox::fw::log::FieldValue::makeString(qosToString(qos))},
+                {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1008")}
+            }
+        );
     }
 
     return result;
@@ -299,9 +407,25 @@ void MqttClientManager::setLwtConfig(const LwtConfig& lwt_config) {
 void MqttClientManager::on_connect(int rc) {
     connected_ = (rc == 0);
     if (connected_) {
-        std::cout << "[MQTT] Connected to broker" << std::endl;
+        // mqtt.connection.established event (CR-003 §4)
+        MqttLogAdapter::connection().info(
+            "mqtt.connection.established",
+            "MQTT CONNECT/CONNACK 成功",
+            {
+                {"session_present", tbox::fw::log::FieldValue::makeBool(rc == 0)}
+            }
+        );
     } else {
-        std::cerr << "[MQTT] Connection rejected: " << mosquitto_connack_string(rc) << std::endl;
+        // mqtt.connection.failed event (CR-003 §4, MQTT-1002)
+        MqttLogAdapter::connection().error(
+            "mqtt.connection.failed",
+            "Broker 拒绝连接",
+            {
+                {"reason_code", tbox::fw::log::FieldValue::makeString(
+                    std::to_string(rc))},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1002")}
+            }
+        );
     }
     if (connection_callback_) {
         connection_callback_(connected_);
@@ -310,11 +434,16 @@ void MqttClientManager::on_connect(int rc) {
 
 void MqttClientManager::on_disconnect(int rc) {
     connected_ = false;
-    if (rc == 0) {
-        std::cout << "[MQTT] Disconnected cleanly" << std::endl;
-    } else {
-        std::cerr << "[MQTT] Unexpected disconnect: " << mosquitto_strerror(rc) << std::endl;
-    }
+    // mqtt.connection.disconnected event (CR-003 §4, MQTT-1003)
+    MqttLogAdapter::connection().warn(
+        "mqtt.connection.disconnected",
+        "连接异常断开",
+        {
+            {"reason_code", tbox::fw::log::FieldValue::makeString(
+                rc == 0 ? "clean" : std::to_string(rc))},
+            {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1003")}
+        }
+    );
     if (connection_callback_) {
         connection_callback_(false);
     }
@@ -331,11 +460,17 @@ void MqttClientManager::on_message(const struct mosquitto_message* message) {
 }
 
 void MqttClientManager::on_publish(int mid) {
-    // Message published successfully
+    // PUBACK callback - already logged in publish() for immediate ack
+    // This callback confirms the publish was received by broker
 }
 
 void MqttClientManager::on_subscribe(int mid, int qos_count, const int* granted_qos) {
-    // Subscription confirmed
+    // Subscription confirmed by broker
+    MqttLogAdapter::subscribe().debug(
+        "mqtt.subscribe.acknowledged",
+        "订阅确认",
+        {{"mid", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(mid))}}
+    );
 }
 
 } // namespace mqtt

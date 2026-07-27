@@ -20,10 +20,18 @@ set(FRAMEWORK_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework)
 if(EXISTS ${FRAMEWORK_DIR}/include)
     set(FRAMEWORK_INCLUDE_DIR ${FRAMEWORK_DIR}/include)
 endif()
-find_library(FRAMEWORK_LIB hwyz PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
+find_library(FRAMEWORK_LIB tbox-framework PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
 if(NOT FRAMEWORK_LIB)
     message(FATAL_ERROR "Framework library not found in ${FRAMEWORK_DIR}/build. "
                         "Please build framework first: cmake -B ${FRAMEWORK_DIR}/build && cmake --build ${FRAMEWORK_DIR}/build")
+endif()
+
+# Find yaml-cpp (required by framework-config headers transitively)
+find_package(yaml-cpp QUIET)
+if(YAML_CPP_INCLUDE_DIRS)
+    include_directories(${YAML_CPP_INCLUDE_DIRS})
+elseif(EXISTS "/opt/homebrew/include/yaml-cpp/yaml.h")
+    include_directories(SYSTEM /opt/homebrew/include)
 endif()
 
 # Include directories
@@ -37,6 +45,8 @@ include_directories(
 # Source files
 set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/mqtt_service.cpp
+    src/mqtt_service/src/mqtt_log_adapter.cpp
+    src/mqtt_service/src/mqtt_context.cpp
     src/mqtt_service/src/connection_state_machine.cpp
     src/mqtt_service/src/mqtt_client_manager.cpp
     src/mqtt_service/src/offline_cache_queue.cpp
@@ -61,6 +71,7 @@ target_link_libraries(mqtt_service_lib
 
 # Main executable
 add_executable(tbox_mqtt_service src/main.cpp)
+set_target_properties(tbox_mqtt_service PROPERTIES OUTPUT_NAME tbox_mqtt)
 target_link_libraries(tbox_mqtt_service mqtt_service_lib)
 
 # Testing

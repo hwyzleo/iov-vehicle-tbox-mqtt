@@ -1,6 +1,7 @@
 #include "connection_state_machine.h"
+#include "mqtt_log_adapter.h"
+#include "mqtt_context.h"
 #include <algorithm>
-#include <iostream>
 
 namespace tbox {
 namespace mqtt {
@@ -207,7 +208,15 @@ void ConnectionStateMachine::persistState() {
         store_->save<std::string>(StoreKeys::kConnLastError, state_info_.last_error);
         store_->save<int>(StoreKeys::kConnRetryCount, static_cast<int>(state_info_.retry_count));
     } catch (const hwyz::store::StoreException& e) {
-        std::cerr << "[MQTT] State persist failed: " << e.what() << std::endl;
+        MqttLogAdapter::connection().warn(
+            "mqtt.store.persist_failed",
+            "连接状态持久化失败",
+            {
+                {"state", tbox::fw::log::FieldValue::makeString(
+                    connectionStateToString(state_info_.state))},
+                {"reason", tbox::fw::log::FieldValue::makeString(e.what())}
+            }
+        );
     }
 }
 
@@ -225,12 +234,23 @@ void ConnectionStateMachine::restoreState() {
             store_->loadOr<int>(StoreKeys::kConnRetryCount, 0));
 
         if (state_info_.state != ConnectionState::INIT) {
-            std::cout << "[MQTT] Restored state from store: "
-                      << static_cast<int>(state_info_.state)
-                      << ", retry_count=" << state_info_.retry_count << std::endl;
+            MqttLogAdapter::connection().info(
+                "mqtt.store.state_restored",
+                "从 framework-store 恢复连接状态",
+                {
+                    {"state", tbox::fw::log::FieldValue::makeString(
+                        connectionStateToString(state_info_.state))},
+                    {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(state_info_.retry_count))}
+                }
+            );
         }
     } catch (const hwyz::store::StoreException& e) {
-        std::cerr << "[MQTT] State restore failed: " << e.what() << std::endl;
+        MqttLogAdapter::connection().warn(
+            "mqtt.store.restore_failed",
+            "连接状态恢复失败",
+            {{"reason", tbox::fw::log::FieldValue::makeString(e.what())}}
+        );
     }
 }
 

@@ -1,5 +1,6 @@
 #include "sec_cert_interface.h"
-#include <iostream>
+#include "mqtt_log_adapter.h"
+#include "mqtt_context.h"
 #include <fstream>
 #include <filesystem>
 #include <openssl/x509.h>
@@ -101,7 +102,14 @@ bool SecCertInterface::loadCertificates(const std::string& root_ca_ref,
     }
 
     certificate_ready_ = true;
-    std::cout << "[MQTT] Certificates loaded successfully from config paths" << std::endl;
+    MqttLogAdapter::tls().info(
+        "mqtt.tls.certificates_loaded",
+        "证书加载成功",
+        {
+            {"key_source", tbox::fw::log::FieldValue::makeString(
+                key_source == KeySource::HSM ? "HSM" : "FILE")}
+        }
+    );
     return true;
 }
 

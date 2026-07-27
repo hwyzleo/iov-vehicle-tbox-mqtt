@@ -1,5 +1,6 @@
 #include "config_manager.h"
-#include <iostream>
+#include "mqtt_log_adapter.h"
+#include "mqtt_context.h"
 
 namespace tbox {
 namespace mqtt {
@@ -17,13 +18,23 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
     auto err = fw_config.load("mqtt", config_root);
     if (err != hwyz::config::ConfigError::kOk) {
         auto info = fw_config.getLastError();
-        std::cerr << "[MQTT] Config load failed: " << info.message << std::endl;
+        MqttLogAdapter::ipc().error(
+            "mqtt.config.load_failed",
+            "framework-config 加载失败",
+            {
+                {"config_root", tbox::fw::log::FieldValue::makeString(config_root)},
+                {"reason", tbox::fw::log::FieldValue::makeString(info.message)}
+            }
+        );
         return false;
     }
 
     config_snapshot_ = fw_config.getSnapshot();
     if (!config_snapshot_) {
-        std::cerr << "[MQTT] Config snapshot is null" << std::endl;
+        MqttLogAdapter::ipc().error(
+            "mqtt.config.snapshot_null",
+            "配置快照为空"
+        );
         return false;
     }
 
@@ -51,7 +62,16 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
     // Read offline queue config
     offline_queue_config_ = readOfflineQueueConfig();
 
-    std::cout << "[MQTT] Config loaded from framework-config (root: " << config_root << ")" << std::endl;
+    MqttLogAdapter::ipc().info(
+        "mqtt.config.loaded",
+        "配置已从 framework-config 加载",
+        {
+            {"config_root", tbox::fw::log::FieldValue::makeString(config_root)},
+            {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(current_config_.broker_host))},
+            {"queue_max_size", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(offline_queue_config_.max_size))}
+        }
+    );
     return true;
 }
 
@@ -59,7 +79,10 @@ bool ConfigManager::loadFromStore(hwyz::store::Store& store) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!store.isReady()) {
-        std::cerr << "[MQTT] Store not ready, skipping store load" << std::endl;
+        MqttLogAdapter::ipc().warn(
+            "mqtt.store.not_ready",
+            "framework-store 未就绪，跳过 store 加载"
+        );
         return false;
     }
 
@@ -80,9 +103,16 @@ bool ConfigManager::loadFromStore(hwyz::store::Store& store) {
         current_version_ = current_config_.version;
     }
 
-    std::cout << "[MQTT] OTA params loaded from framework-store (source: "
-              << (current_config_.source == ConnectionConfig::Source::OTA ? "OTA" : "FACTORY")
-              << ", version: " << current_version_ << ")" << std::endl;
+    MqttLogAdapter::ipc().info(
+        "mqtt.store.loaded",
+        "OTA 参数已从 framework-store 加载",
+        {
+            {"source", tbox::fw::log::FieldValue::makeString(
+                current_config_.source == ConnectionConfig::Source::OTA ? "OTA" : "FACTORY")},
+            {"version", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(current_version_))}
+        }
+    );
     return true;
 }
 
@@ -108,7 +138,11 @@ bool ConfigManager::applyConfig(const ConnectionConfig& config,
                 store_->save<int>(StoreKeys::kBrokerPort, static_cast<int>(config.broker_port));
                 store_->save<int>(StoreKeys::kConfigVersion, static_cast<int>(config.version));
             } catch (const hwyz::store::StoreException& e) {
-                std::cerr << "[MQTT] Store write failed: " << e.what() << std::endl;
+                MqttLogAdapter::ipc().error(
+                    "mqtt.store.write_failed",
+                    "framework-store 写入失败",
+                    {{"reason", tbox::fw::log::FieldValue::makeString(e.what())}}
+                );
                 return false;
             }
         }

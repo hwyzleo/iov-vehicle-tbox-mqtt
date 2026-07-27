@@ -1,4 +1,6 @@
 #include "offline_cache_queue.h"
+#include "mqtt_log_adapter.h"
+#include "mqtt_context.h"
 #include <algorithm>
 
 namespace tbox {
@@ -157,6 +159,28 @@ void OfflineCacheQueue::dropOldestMessage() {
         // Check if message still exists in map
         auto it = message_map_.find(oldest_msg.msg_id);
         if (it != message_map_.end()) {
+            // mqtt.offline_queue.message_dropped event (CR-003 §4, MQTT-1006)
+            MqttLogAdapter::offline_queue().warn(
+                "mqtt.offline_queue.message_dropped",
+                "离线缓存达到上限，丢弃最旧消息",
+                {
+                    {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(oldest_msg.msg_id))},
+                    {"priority", tbox::fw::log::FieldValue::makeString(
+                        [&]() -> std::string {
+                            switch (oldest_msg.priority) {
+                                case Priority::LOW: return "LOW";
+                                case Priority::NORMAL: return "NORMAL";
+                                case Priority::HIGH: return "HIGH";
+                                case Priority::CRITICAL: return "CRITICAL";
+                                default: return "UNKNOWN";
+                            }
+                        }())},
+                    {"queue_depth", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_.size()))},
+                    {"queue_capacity", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(max_size_))},
+                    {"drop_policy", tbox::fw::log::FieldValue::makeString("drop_oldest")},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1006")}
+                }
+            );
             message_map_.erase(it);
             return;
         }
@@ -179,6 +203,32 @@ void OfflineCacheQueue::dropLowestPriorityMessage() {
     }
 
     if (!lowest_priority_id.empty()) {
+        // mqtt.offline_queue.message_dropped event (CR-003 §4, MQTT-1006)
+        auto it = message_map_.find(lowest_priority_id);
+        if (it != message_map_.end()) {
+            MqttLogAdapter::offline_queue().warn(
+                "mqtt.offline_queue.message_dropped",
+                "离线缓存达到上限，丢弃最低优先级消息",
+                {
+                    {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(it->second.msg_id))},
+                    {"priority", tbox::fw::log::FieldValue::makeString(
+                        [&]() -> std::string {
+                            switch (it->second.priority) {
+                                case Priority::LOW: return "LOW";
+                                case Priority::NORMAL: return "NORMAL";
+                                case Priority::HIGH: return "HIGH";
+                                case Priority::CRITICAL: return "CRITICAL";
+                                default: return "UNKNOWN";
+                            }
+                        }())},
+                    {"queue_depth", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_.size()))},
+                    {"queue_capacity", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(max_size_))},
+                    {"drop_policy", tbox::fw::log::FieldValue::makeString("drop_lowest_priority")},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1006")}
+                }
+            );
+        }
+
         message_map_.erase(lowest_priority_id);
         // Rebuild queue (simplified approach)
         std::vector<OutboundMessage> messages;
