@@ -2,7 +2,6 @@
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include "sec_cert_interface.h"
-#include "internal_bus_interface.h"
 #include "config.h"
 #include "log_types.h"
 #include <iostream>
@@ -28,7 +27,8 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    // Load configuration via framework-config (Design §5, CR-003 §2)
+    // Load configuration via framework-config (Design §5, CR-003 §2, CR-004 §4)
+    // 启动顺序: Config::load("mqtt") -> Logger::init -> Store::open -> ...
     std::string config_root = "/etc/tbox/";
     if (argc > 1) config_root = argv[1];
 
@@ -50,14 +50,12 @@ int main(int argc, char* argv[]) {
     // Read store root path from store.root (Design §5)
     std::string store_root = snapshot->getString("common.store.root", "/var/lib/tbox");
 
-    // Initialize framework-log (CR-003 §2)
-    // 启动顺序: Config::load -> 读取 common.log.* / mqtt.log.* -> Logger::init
+    // Initialize framework-log (CR-003 §2, CR-004 §4)
     tbox::fw::log::LogConfig log_config;
     log_config.level = tbox::fw::log::LogLevel::kInfo;
     log_config.console_config.enabled = true;
     log_config.format = "standard";
 
-    // 从 common.log.* 读取日志级别 (CR-003 §2)
     std::string log_level_str = snapshot->getString("common.log.level", "info");
     if (log_level_str == "trace") log_config.level = tbox::fw::log::LogLevel::kTrace;
     else if (log_level_str == "debug") log_config.level = tbox::fw::log::LogLevel::kDebug;
@@ -65,11 +63,9 @@ int main(int argc, char* argv[]) {
     else if (log_level_str == "warn") log_config.level = tbox::fw::log::LogLevel::kWarn;
     else if (log_level_str == "error") log_config.level = tbox::fw::log::LogLevel::kError;
 
-    // 从 common.log.* 读取文件 sink 配置
     std::string log_file = snapshot->getString("common.log.file", "");
     if (!log_file.empty()) {
         log_config.file_config.enabled = true;
-        // Extract directory as root, filename handled by framework
         auto last_slash = log_file.find_last_of('/');
         if (last_slash != std::string::npos) {
             log_config.file_config.root = log_file.substr(0, last_slash);
@@ -80,7 +76,6 @@ int main(int argc, char* argv[]) {
             snapshot->getInt("common.log.max_files", 5));
     }
 
-    // 从 mqtt.log.* 读取模块级别覆盖 (CR-003 §2)
     auto mqtt_log_section = snapshot->getSection("mqtt.log");
     if (mqtt_log_section) {
         std::string mqtt_level = mqtt_log_section->getString("level", "");
@@ -93,14 +88,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Logger::init("mqtt", logConfig) (CR-003 §2)
     auto log_result = MqttLogAdapter::init("mqtt", log_config);
     if (log_result.error != tbox::fw::log::LogError::kOk) {
-        // 降级: 非严格模式继续，日志初始化失败不得阻断服务 (CR-003 §2, §6)
         std::cerr << "[MQTT] framework-log init degraded: " << log_result.error_message << std::endl;
     }
 
-    // Logger 初始化成功事件 (CR-003 §4)
     MqttLogAdapter::service().info(
         "mqtt.service.log_initialized",
         "MQTT 日志系统初始化",
@@ -121,18 +113,18 @@ int main(int argc, char* argv[]) {
         }
     );
 
-    // Create dependencies
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    // CR-004 §4 生命周期: 初始化离线队列与 tbox::sec_client
+    std::string sec_socket_path = snapshot->getString("sec.socket_path", "/tmp/tbox-sec.sock");
+    auto sec = std::make_shared<SecCertInterface>(sec_socket_path);
 
 #ifdef SIMULATE_CERT
     sec->simulateCertificateReady();
 #endif
 
-    // Create and initialize service with framework paths
+    // CR-004 §4: 构造 MqttService 并初始化
     g_service = std::make_unique<MqttService>();
 
-    if (!g_service->initialize(sec, bus, config_root, store_root)) {
+    if (!g_service->initialize(sec, config_root, store_root)) {
         MqttLogAdapter::service().error(
             "mqtt.service.init_failed",
             "Failed to initialize MQTT service"
@@ -140,13 +132,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Register routes
+    // Register routes (CR-004 §3)
     g_service->registerRoute("service_diag", "vehicle/diag/status",
                              RouteEntry::Direction::UP);
     g_service->registerRoute("service_control", "vehicle/control/cmd",
                              RouteEntry::Direction::DOWN);
 
-    // Start service
+    // Start service (state machine + certificate flow)
     if (!g_service->start()) {
         MqttLogAdapter::service().error(
             "mqtt.service.start_failed",
@@ -155,9 +147,28 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // CR-004 §4: 构造 IpcConfig(common.ipc.* + mqtt.ipc.*) -> 注册 MqttIpcDispatcher
+    // -> ipc::Server::start
+    MqttIpcConfig ipc_config;
+    ipc_config.socket_path = snapshot->getString("mqtt.ipc.socket_path", "/tmp/tbox-mqtt.sock");
+    ipc_config.dispatch_queue_size = static_cast<uint32_t>(
+        snapshot->getInt("mqtt.ipc.dispatch_queue_size", 1024));
+    ipc_config.subscriber_queue_size = static_cast<uint32_t>(
+        snapshot->getInt("mqtt.ipc.subscriber_queue_size", 128));
+    ipc_config.slow_subscriber_policy =
+        snapshot->getString("mqtt.ipc.slow_subscriber_policy", "disconnect");
+
+    if (!g_service->startIpcServer(ipc_config)) {
+        MqttLogAdapter::service().error(
+            "mqtt.service.ipc_start_failed",
+            "Failed to start IPC server"
+        );
+        return 1;
+    }
+
     MqttLogAdapter::service().info(
         "mqtt.service.started",
-        "TBOX MQTT Service started"
+        "TBOX MQTT Service started (framework-ipc bus)"
     );
 
     // Main loop
@@ -184,6 +195,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // CR-004 §4: 停止时先拒绝新请求 -> 停 IPC Server -> 等 client 线程
+    // -> 停 Broker 网络循环 -> flush 离线队列/store/log
     MqttLogAdapter::service().info(
         "mqtt.service.shutting_down",
         "TBOX MQTT Service shutting down"

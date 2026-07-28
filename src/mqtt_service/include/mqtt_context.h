@@ -11,7 +11,7 @@
 
 #include "log.h"
 #include "log_types.h"
-#include "mqtt_types.h"
+#include "tbox/mqtt/types.h"  // ConnectionState, QoS, ErrorCode + helpers
 #include <string>
 #include <string_view>
 
@@ -76,50 +76,6 @@ std::string clientIdHash(const std::string& client_id);
  * 输出格式: "m_<8位hex>"
  */
 std::string msgIdHash(const std::string& msg_id);
-
-/**
- * 将 QoS 枚举转为可读字符串
- */
-inline std::string qosToString(QoS qos) {
-    switch (qos) {
-        case QoS::AT_MOST_ONCE:  return "0";
-        case QoS::AT_LEAST_ONCE: return "1";
-        case QoS::EXACTLY_ONCE:  return "2";
-        default: return "?";
-    }
-}
-
-/**
- * 将 ConnectionState 枚举转为可读字符串
- */
-inline std::string connectionStateToString(ConnectionState state) {
-    switch (state) {
-        case ConnectionState::INIT:         return "INIT";
-        case ConnectionState::CERT_WAIT:    return "CERT_WAIT";
-        case ConnectionState::CONNECTING:   return "CONNECTING";
-        case ConnectionState::CONNECTED:    return "CONNECTED";
-        case ConnectionState::RECONNECTING: return "RECONNECTING";
-        case ConnectionState::OFFLINE:      return "OFFLINE";
-        default: return "UNKNOWN";
-    }
-}
-
-/**
- * 将 ErrorCode 枚举转为错误码字符串 (CR-003 §6)
- */
-inline std::string errorCodeToString(ErrorCode code) {
-    switch (code) {
-        case ErrorCode::MQTT_1001: return "MQTT-1001";
-        case ErrorCode::MQTT_1002: return "MQTT-1002";
-        case ErrorCode::MQTT_1003: return "MQTT-1003";
-        case ErrorCode::MQTT_1004: return "MQTT-1004";
-        case ErrorCode::MQTT_1005: return "MQTT-1005";
-        case ErrorCode::MQTT_1006: return "MQTT-1006";
-        case ErrorCode::MQTT_1007: return "MQTT-1007";
-        case ErrorCode::MQTT_1008: return "MQTT-1008";
-        default: return "MQTT-UNKNOWN";
-    }
-}
 
 } // namespace mqtt
 } // namespace tbox

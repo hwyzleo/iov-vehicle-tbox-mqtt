@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include "mqtt_service.h"
 #include "sec_cert_interface.h"
-#include "internal_bus_interface.h"
 #include "config.h"
 #include <filesystem>
 #include <fstream>
@@ -62,11 +61,10 @@ TEST(MqttServiceIntegrationTest, ServiceInitialization) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
     sec->simulateCertificateReady();
 
-    EXPECT_TRUE(service.initialize(sec, bus, config_dir, store_dir));
+    EXPECT_TRUE(service.initialize(sec, config_dir, store_dir));
 
     cleanupTempDirs();
 }
@@ -76,11 +74,10 @@ TEST(MqttServiceIntegrationTest, ServiceStartStop) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
     sec->simulateCertificateReady();
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
     EXPECT_TRUE(service.start());
 
     service.stop();
@@ -93,11 +90,10 @@ TEST(MqttServiceIntegrationTest, PublishMessage) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
     sec->simulateCertificateReady();
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
     service.start();
 
     std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
@@ -114,11 +110,10 @@ TEST(MqttServiceIntegrationTest, SubscribeToTopic) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
     sec->simulateCertificateReady();
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
     service.start();
 
     auto result = service.subscribe("test/topic", QoS::AT_LEAST_ONCE, "service_diag");
@@ -134,10 +129,9 @@ TEST(MqttServiceIntegrationTest, RegisterRoute) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
 
     EXPECT_TRUE(service.registerRoute("service_diag", "vehicle/diag/status",
                                       RouteEntry::Direction::UP));
@@ -150,10 +144,9 @@ TEST(MqttServiceIntegrationTest, GetConnectionState) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
 
     auto state = service.getConnectionState();
     EXPECT_EQ(state.state, ConnectionState::INIT);
@@ -166,10 +159,9 @@ TEST(MqttServiceIntegrationTest, ApplyFactoryConfiguration) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
 
     ConnectionConfig config;
     config.broker_host = "test.mqtt.com";
@@ -186,10 +178,9 @@ TEST(MqttServiceIntegrationTest, ApplyOtaConfiguration) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>();
-    auto bus = std::make_shared<InternalBusInterface>();
+    auto sec = std::make_shared<SecCertInterface>("");
 
-    service.initialize(sec, bus, config_dir, store_dir);
+    service.initialize(sec, config_dir, store_dir);
 
     ConnectionConfig config;
     config.broker_host = "ota.mqtt.com";

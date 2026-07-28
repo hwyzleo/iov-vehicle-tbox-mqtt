@@ -1,25 +1,34 @@
 #pragma once
 
+// TBOX-MQTT daemon 内部类型 (设计 §3)
+//
+// 公共 DTO/枚举（QoS/Priority/ConnectionState/RouteEntry/PublishEnvelope/PublishResult/
+// ConnectionStateResult/ErrorCode 等）已上移到 include/tbox/mqtt/{types.h,errors.h}，
+// 由 daemon 与 client SDK 共享。本头仅保留 daemon 内部实现类型。
+
+#include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
-#include <chrono>
-#include <optional>
-#include <cstdint>
+
+#include "tbox/mqtt/types.h"
+#include "tbox/mqtt/errors.h"
 
 namespace tbox {
 namespace mqtt {
 
-// Connection states (Design §4.1)
-enum class ConnectionState {
-    INIT,
-    CERT_WAIT,
-    CONNECTING,
-    CONNECTED,
-    RECONNECTING,
-    OFFLINE
+// ============================================================
+// daemon 内部枚举 (设计 §3)
+// ============================================================
+
+/// 密钥来源类型
+enum class KeySource : uint8_t {
+    FILE,   // 私钥来自文件（开发）
+    HSM     // 私钥在 HSM 中经 PKCS#11（量产）
 };
 
-// Message delivery states
+/// 消息投递状态
 enum class MessageState {
     PENDING,
     INFLIGHT,
@@ -27,52 +36,32 @@ enum class MessageState {
     DROPPED
 };
 
-// QoS levels
-enum class QoS : uint8_t {
-    AT_MOST_ONCE = 0,
-    AT_LEAST_ONCE = 1,
-    EXACTLY_ONCE = 2
-};
+// ============================================================
+// daemon 内部配置/状态 (设计 §3)
+// ============================================================
 
-// Message priority for offline cache
-enum class Priority : uint8_t {
-    LOW = 0,
-    NORMAL = 1,
-    HIGH = 2,
-    CRITICAL = 3
-};
-
-// Key source type
-enum class KeySource : uint8_t {
-    FILE,   // Private key from file (development)
-    HSM     // Private key in HSM via PKCS#11 (production)
-};
-
-// Connection configuration (Design §3)
-// Static items (root_ca_ref, client_id, keepalive, clean_start, session_expiry,
-// tls_cert_ref, tls_key_ref, key_source) are loaded via framework-config (read-only).
-// Updatable items (broker_host, broker_port) are persisted via framework-store
-// and can be overwritten by OTA cloud delivery.
+/// 连接配置 (设计 §3)
+/// 静态项经 framework-config（只读）；可更新项（broker_host/broker_port）经 framework-store。
 struct ConnectionConfig {
-    // --- Updatable via framework-store (source=OTA) ---
+    // --- 可经 framework-store 更新 (source=OTA) ---
     std::string broker_host;
     uint16_t broker_port = 8883;
-    // --- Static via framework-config (read-only) ---
+    // --- 静态经 framework-config (只读) ---
     std::string root_ca_ref;
     std::string client_id;  // VIN + SN
     uint16_t keepalive = 60;
     bool clean_start = false;
     uint32_t session_expiry = 3600;
-    std::string tls_cert_ref;   // Certificate file path
-    std::string tls_key_ref;    // File path or PKCS#11 URI
+    std::string tls_cert_ref;   // 证书文件路径 / SEC 句柄引用
+    std::string tls_key_ref;    // 文件路径或 PKCS#11 URI
     KeySource key_source = KeySource::FILE;
-    std::string username;       // MQTT username (e.g. from cert CN)
-    std::string password;       // MQTT password (optional)
+    std::string username;
+    std::string password;
     enum class Source : uint8_t { FACTORY, OTA } source = Source::FACTORY;
     uint32_t version = 0;
 };
 
-// Connection state tracking (Design §3)
+/// 连接状态跟踪 (设计 §3，运行时可变，经 framework-store 持久化)
 struct ConnectionStateInfo {
     ConnectionState state = ConnectionState::INIT;
     std::string last_error;
@@ -80,7 +69,7 @@ struct ConnectionStateInfo {
     std::chrono::steady_clock::time_point next_retry_at;
 };
 
-// Outbound message (Design §3)
+/// 离线缓存队列元素 (设计 §3，MQTT 自身业务数据，自研持久化)
 struct OutboundMessage {
     std::string msg_id;
     std::string topic;
@@ -92,66 +81,38 @@ struct OutboundMessage {
     MessageState state = MessageState::PENDING;
 };
 
-// Subscription (Design §3)
-struct Subscription {
-    std::string topic;
-    QoS qos;
-    std::string target_service;
-};
-
-// Route entry (Design §3)
-struct RouteEntry {
-    std::string internal_addr;
-    std::string mqtt_topic;
-    enum class Direction : uint8_t { UP, DOWN } direction = Direction::UP;
-    QoS qos = QoS::AT_MOST_ONCE;
-};
-
-// LWT configuration (Design §3)
+/// LWT 配置 (设计 §3)
 struct LwtConfig {
     std::string topic;
-    std::vector<uint8_t> payload;  // offline status
+    std::vector<uint8_t> payload;  // offline 状态
     QoS qos = QoS::AT_LEAST_ONCE;
     bool retain = false;
 };
 
-// Error codes (Requirements §6)
-enum class ErrorCode {
-    MQTT_1001 = 1001,  // Certificate/key unavailable or mTLS handshake failed
-    MQTT_1002 = 1002,  // Network unavailable / connection failed
-    MQTT_1003 = 1003,  // Connection disconnected (trigger reconnect)
-    MQTT_1004 = 1004,  // Invalid topic/message format
-    MQTT_1005 = 1005,  // Publish timeout / unconfirmed (QoS retries exhausted)
-    MQTT_1006 = 1006,  // Offline cache full (message dropped)
-    MQTT_1007 = 1007,  // Downstream message cannot route / no subscriber
-    MQTT_1008 = 1008   // Subscribe failed
-};
-
-// API result types
-struct PublishResult {
-    bool accepted = false;
-    std::optional<ErrorCode> error;
-};
-
+/// 订阅结果（daemon 内部，MqttClientManager::subscribe 返回）
 struct SubscribeResult {
     bool status = false;
     std::optional<ErrorCode> error;
 };
 
-struct ConnectionStateResult {
-    ConnectionState state = ConnectionState::INIT;
-    std::string last_error;
-    uint32_t retry_count = 0;
-};
-
-// Offline cache queue configuration (sourced from framework-config, Design §3)
+/// 离线缓存队列配置（取自 framework-config，设计 §3）
 struct OfflineQueueConfig {
     std::string path = "/var/lib/tbox/mqtt/queue";
     size_t max_size = 1000;
     std::string drop_policy = "drop_oldest";  // "drop_oldest" or "drop_lowest_priority"
 };
 
-// framework-store key constants (Design §5)
+/// IPC 配置（取自 common.ipc.* + mqtt.ipc.*，CR-004 §8）
+struct MqttIpcConfig {
+    std::string socket_path = "/tmp/tbox-mqtt.sock";
+    uint32_t dispatch_queue_size = 1024;
+    uint32_t subscriber_queue_size = 128;
+    std::string slow_subscriber_policy = "disconnect";  // disconnect/drop/backpressure
+};
+
+// ============================================================
+// framework-store key 常量 (设计 §5)
+// ============================================================
 namespace StoreKeys {
     constexpr const char* kBrokerHost     = "mqtt.broker_host";
     constexpr const char* kBrokerPort     = "mqtt.broker_port";

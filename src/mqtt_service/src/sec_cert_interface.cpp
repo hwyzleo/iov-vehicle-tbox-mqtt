@@ -9,7 +9,13 @@
 namespace tbox {
 namespace mqtt {
 
-SecCertInterface::SecCertInterface() = default;
+SecCertInterface::SecCertInterface(const std::string& sec_socket_path)
+    : sec_socket_path_(sec_socket_path) {
+    // CR-004 §1: 链接 tbox::sec_client 获取证书/私钥句柄
+    if (!sec_socket_path_.empty()) {
+        sec_client_ = std::make_unique<tbox::sec::SecClient>(sec_socket_path_);
+    }
+}
 
 SecCertInterface::~SecCertInterface() = default;
 
@@ -29,7 +35,33 @@ CertHandleResult SecCertInterface::getCertHandle() const {
 }
 
 bool SecCertInterface::isCertificateReady() const {
-    return certificate_ready_;
+    // 测试模拟模式：直接返回本地标志
+    if (simulated_) {
+        return certificate_ready_;
+    }
+
+    // CR-004 §1: 经 tbox::sec_client 判定证书就绪状态
+    // SEC provision state == CERT_INSTALLED 表示设备证书已安装可用
+    if (!sec_client_) {
+        return certificate_ready_;
+    }
+
+    if (!sec_client_->is_connected()) {
+        // SEC daemon 未连接时无法判定，保持当前状态
+        return certificate_ready_;
+    }
+
+    auto status = sec_client_->get_provision_status();
+    bool sec_ready = (status.state == "CERT_INSTALLED");
+
+    if (sec_ready && !certificate_ready_) {
+        // SEC 报告证书就绪，同步本地标志
+        MqttLogAdapter::tls().info(
+            "mqtt.certificate.ready",
+            "SEC 报告证书已安装（CERT_INSTALLED）"
+        );
+    }
+    return sec_ready || certificate_ready_;
 }
 
 std::vector<uint8_t> SecCertInterface::getCertificateChain() const {
@@ -98,6 +130,7 @@ bool SecCertInterface::loadCertificates(const std::string& root_ca_ref,
             last_error_ = "tls_key_ref is not a valid PKCS#11 URI: " + tls_key_ref;
             return false;
         }
+        // 私钥不出件：仅持有 PKCS#11 句柄引用，不持有私钥明文 (CR-004 §1, 设计 §5)
         key_handle_ = reinterpret_cast<void*>(0x5678);
     }
 
@@ -118,6 +151,7 @@ std::string SecCertInterface::getLastError() const {
 }
 
 void SecCertInterface::simulateCertificateReady() {
+    simulated_ = true;
     certificate_ready_ = true;
     cert_chain_ = {0x30, 0x82, 0x01, 0x22};  // Example cert header
     key_handle_ = reinterpret_cast<void*>(0x1234);  // Example handle

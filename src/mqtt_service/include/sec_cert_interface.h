@@ -1,9 +1,11 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "tbox/sec/client.h"
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 namespace tbox {
 namespace mqtt {
@@ -16,16 +18,22 @@ struct CertHandleResult {
     std::string error;
 };
 
-// SEC certificate interface (Design §5)
+// SEC certificate interface (Design §5, CR-004 §1, §8)
+//
+// CR-004: MQTT 获取证书/私钥句柄只使用 tbox::sec_client。
+// 证书就绪状态经 tbox::sec::SecClient::get_provision_status() 判定
+// （state == CERT_INSTALLED 表示证书已安装可用）。
+// 私钥不出件：本接口只持有 key_handle 引用，不持有私钥明文。
 class SecCertInterface {
 public:
-    SecCertInterface();
+    /// @param sec_socket_path SEC daemon IPC socket 路径（空则不查询 SEC，仅用本地标志）
+    explicit SecCertInterface(const std::string& sec_socket_path = "/tmp/tbox-sec.sock");
     ~SecCertInterface();
 
     // Get certificate handle for mTLS (Design §5)
     CertHandleResult getCertHandle() const;
 
-    // Check if certificate is ready
+    // Check if certificate is ready (CR-004 §1: 经 tbox::sec_client 判定)
     bool isCertificateReady() const;
 
     // Get certificate chain
@@ -41,11 +49,14 @@ public:
     // Get last error message from loadCertificates
     std::string getLastError() const;
 
-    // Simulate certificate ready (for testing)
+    // Simulate certificate ready (for testing, bypasses SEC client)
     void simulateCertificateReady();
 
 private:
+    std::string sec_socket_path_;
+    std::unique_ptr<tbox::sec::SecClient> sec_client_;
     bool certificate_ready_ = false;
+    bool simulated_ = false;
     std::vector<uint8_t> cert_chain_;
     void* key_handle_ = nullptr;
     std::string last_error_;

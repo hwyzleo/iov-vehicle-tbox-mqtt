@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include "mqtt_service.h"
 #include "sec_cert_interface.h"
-#include "internal_bus_interface.h"
 #include "config.h"
 #include <thread>
 #include <chrono>
@@ -61,12 +60,11 @@ protected:
         store_dir = createE2EStoreDir();
 
         service = std::make_unique<MqttService>();
-        sec = std::make_shared<SecCertInterface>();
-        bus = std::make_shared<InternalBusInterface>();
+        sec = std::make_shared<SecCertInterface>("");
 
         sec->simulateCertificateReady();
 
-        service->initialize(sec, bus, config_dir, store_dir);
+        service->initialize(sec, config_dir, store_dir);
         service->start();
 
         // Wait for connection
@@ -82,7 +80,6 @@ protected:
     std::string store_dir;
     std::unique_ptr<MqttService> service;
     std::shared_ptr<SecCertInterface> sec;
-    std::shared_ptr<InternalBusInterface> bus;
 };
 
 TEST_F(EndToEndTest, PublishAndSubscribe) {

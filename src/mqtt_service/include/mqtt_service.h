@@ -1,7 +1,12 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "tbox/mqtt/types.h"
+#include "tbox/mqtt/ipc_protocol.h"
+#include "mqtt_ipc_dispatcher.h"
+#include "mqtt_dispatch_queue.h"
 #include "store.h"
+#include "ipc.h"
 #include <functional>
 #include <memory>
 
@@ -15,59 +20,81 @@ class OfflineCacheQueue;
 class RouteBridge;
 class ConfigManager;
 class SecCertInterface;
-class InternalBusInterface;
 
-// Main MQTT service interface (Design §5)
-class MqttService {
+/// Main MQTT service (设计 §5, CR-004 §2)
+///
+/// 拥有 Broker 连接、QoS/PUBACK、离线队列和路由业务状态；
+/// 通过 framework-ipc Server 对外提供 publish/subscribe/route/state 接口。
+class MqttService : public MqttIpcDispatcher::ServiceHandler {
 public:
     MqttService();
     ~MqttService();
 
-    // Initialize service with dependencies and framework paths (Design §5)
+    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4)
     bool initialize(std::shared_ptr<SecCertInterface> sec_interface,
-                    std::shared_ptr<InternalBusInterface> bus_interface,
                     const std::string& config_root,
                     const std::string& store_root);
 
-    // Start service
+    // Start service (state machine + certificate flow)
     bool start();
 
-    // Stop service
+    // Stop service (CR-004 §4: 先拒新请求 -> 停 IPC -> 等 client 线程 -> 停 Broker -> flush)
     void stop();
 
-    // API: Publish message (Design §5)
+    // ---- IPC Server (CR-004 §2, §4) ----
+    // 启动 framework-ipc Server + Dispatcher + DispatchQueue
+    bool startIpcServer(const MqttIpcConfig& ipc_config);
+    void stopIpcServer();
+
+    // ---- 直接 API（daemon 内部/测试用，CR-004 §5）----
+    // publish（envelope 版，msg_id 必填，CR-004 §5.1）
+    PublishResult publishEnvelope(const PublishEnvelope& env);
+
+    // publish（便捷版，自动生成 msg_id）
     PublishResult publish(const std::string& topic,
                           const std::vector<uint8_t>& payload,
                           QoS qos,
                           Priority priority = Priority::NORMAL);
 
-    // API: Subscribe to topic (Design §5)
+    // subscribe（直接登记下行路由）
     SubscribeResult subscribe(const std::string& topic,
                               QoS qos,
                               const std::string& target_service);
 
-    // API: Register route (Design §5)
+    // registerRoute（维护 internal_addr <-> topic，同 key 覆盖）
     bool registerRoute(const std::string& internal_addr,
                        const std::string& mqtt_topic,
                        RouteEntry::Direction direction);
 
-    // API: Get connection state (Design §5)
+    // getConnectionState
     ConnectionStateResult getConnectionState() const;
 
-    // API: Apply configuration (Design §5)
+    // applyConfig（source=OTA 写 store 覆盖）
     bool applyConfig(const ConnectionConfig& config,
                      ConnectionConfig::Source source);
+
+    // ---- MqttIpcDispatcher::ServiceHandler 实现 (CR-004 §3) ----
+    std::pair<int32_t, bool> onPublish(const PublishEnvelope& env) override;
+    std::pair<int32_t, bool> onSubscribe(const Route& route, int client_fd) override;
+    std::pair<int32_t, bool> onSubscribeEventChannel(int client_fd) override;
+    std::pair<int32_t, bool> onUnsubscribe(int client_fd) override;
+    std::pair<int32_t, bool> onRegisterRoute(const RouteEntry& entry) override;
+    std::string onGetConnectionState() override;
 
 private:
     // Connection state changed callback
     void onConnectionStateChanged(ConnectionState new_state);
 
-    // Message received from cloud
+    // Message received from cloud (下行, CR-004 §6)
     void onMessageReceived(const std::string& topic,
                            const std::vector<uint8_t>& payload);
 
-    // Internal message from bus
-    void onInternalMessage(const std::string& internal_addr,
+    // 构建下行事件 payload JSON（topic + payload_base64）
+    std::string buildDownlinkEventPayload(const std::string& topic,
+                                          const std::vector<uint8_t>& payload) const;
+
+    // 向已订阅 client_fd 推送下行事件
+    void pushDownlinkEvent(const std::string& topic,
                            const std::vector<uint8_t>& payload);
 
     std::unique_ptr<ConnectionStateMachine> state_machine_;
@@ -76,8 +103,14 @@ private:
     std::unique_ptr<RouteBridge> route_bridge_;
     std::unique_ptr<ConfigManager> config_manager_;
     std::shared_ptr<SecCertInterface> sec_interface_;
-    std::shared_ptr<InternalBusInterface> bus_interface_;
     std::shared_ptr<hwyz::store::Store> store_;
+
+    // IPC (CR-004 §2)
+    std::unique_ptr<::tbox::fw::ipc::Server> ipc_server_;
+    std::unique_ptr<MqttIpcDispatcher> ipc_dispatcher_;
+    std::unique_ptr<MqttDispatchQueue> dispatch_queue_;
+    MqttIpcConfig ipc_config_;
+    bool ipc_reject_new_ = false;  // 停止时拒绝新请求 (CR-004 §4)
 };
 
 } // namespace mqtt

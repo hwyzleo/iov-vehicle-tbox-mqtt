@@ -5,12 +5,28 @@
 #include "route_bridge.h"
 #include "config_manager.h"
 #include "sec_cert_interface.h"
-#include "internal_bus_interface.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
+#include "utils.h"
+#include <nlohmann/json.hpp>
+#include <chrono>
 
 namespace tbox {
 namespace mqtt {
+
+namespace {
+
+std::string generateMsgId() {
+    return "msg_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
+std::string b64_encode(const std::vector<uint8_t>& data) {
+    return ::hwyz::Utils::base64_encode(
+        std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+}
+
+} // anonymous namespace
 
 MqttService::MqttService()
     : state_machine_(std::make_unique<ConnectionStateMachine>()),
@@ -25,15 +41,13 @@ MqttService::~MqttService() {
 }
 
 bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
-                             std::shared_ptr<InternalBusInterface> bus_interface,
                              const std::string& config_root,
                              const std::string& store_root) {
-    if (!sec_interface || !bus_interface) {
+    if (!sec_interface) {
         return false;
     }
 
     sec_interface_ = sec_interface;
-    bus_interface_ = bus_interface;
 
     // Open framework-store for runtime state and OTA-updatable params (Design §5)
     store_ = std::make_shared<hwyz::store::Store>(
@@ -118,7 +132,7 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
 }
 
 bool MqttService::start() {
-    if (!sec_interface_ || !bus_interface_) {
+    if (!sec_interface_) {
         return false;
     }
 
@@ -150,29 +164,124 @@ bool MqttService::start() {
 }
 
 void MqttService::stop() {
+    // CR-004 §4: 先拒绝新 publish/route 请求
+    ipc_reject_new_ = true;
+
+    stopIpcServer();
     state_machine_->stop();
     client_manager_->disconnect();
 }
 
-PublishResult MqttService::publish(const std::string& topic,
-                                   const std::vector<uint8_t>& payload,
-                                   QoS qos,
-                                   Priority priority) {
+// ============================================================
+// IPC Server (CR-004 §2, §4)
+// ============================================================
+
+bool MqttService::startIpcServer(const MqttIpcConfig& ipc_config) {
+    if (ipc_server_) {
+        return true;  // already started
+    }
+
+    ipc_config_ = ipc_config;
+    ipc_reject_new_ = false;
+
+    // Create dispatcher (this implements ServiceHandler)
+    ipc_dispatcher_ = std::make_unique<MqttIpcDispatcher>(this);
+
+    // Create dispatch queue: decouple Broker callback from push_event (CR-004 §4, §6)
+    auto* server_ptr_placeholder = this;
+    dispatch_queue_ = std::make_unique<MqttDispatchQueue>(
+        ipc_config.dispatch_queue_size,
+        [server_ptr_placeholder](const std::string& topic, const std::vector<uint8_t>& payload) {
+            server_ptr_placeholder->pushDownlinkEvent(topic, payload);
+        });
+    dispatch_queue_->start();
+
+    // Create framework-ipc Server
+    ::tbox::fw::ipc::IpcConfig fw_ipc_config;
+    fw_ipc_config.max_frame_bytes = 10485760;
+    fw_ipc_config.receive_timeout_ms = 60000;
+    fw_ipc_config.connect_timeout_ms = 3000;
+    fw_ipc_config.listen_backlog = 5;
+    ipc_server_ = std::make_unique<::tbox::fw::ipc::Server>(
+        ipc_config.socket_path, fw_ipc_config);
+
+    // Register RequestHandler (adapt to dispatcher)
+    auto* dispatcher_ptr = ipc_dispatcher_.get();
+    auto request_handler = [dispatcher_ptr](uint32_t method_id,
+                                            std::string_view params_json,
+                                            int client_fd) -> std::string {
+        return dispatcher_ptr->dispatch(method_id, params_json, client_fd);
+    };
+
+    // disconnect handler: clean per-fd subscriptions (CR-004 §4)
+    auto* dispatcher_for_dc = ipc_dispatcher_.get();
+    auto disconnect_handler = [dispatcher_for_dc](int client_fd) {
+        dispatcher_for_dc->onClientDisconnected(client_fd);
+        MqttLogAdapter::ipc().debug(
+            "mqtt.ipc.client_disconnected",
+            "Client disconnected (framework)",
+            {tbox::fw::log::Field("peer", tbox::fw::log::FieldValue::makeInt(client_fd))}
+        );
+    };
+
+    if (!ipc_server_->start(std::move(request_handler), std::move(disconnect_handler))) {
+        ipc_server_.reset();
+        ipc_dispatcher_.reset();
+        dispatch_queue_->stop();
+        dispatch_queue_.reset();
+        return false;
+    }
+
+    MqttLogAdapter::ipc().info(
+        "mqtt.ipc.server_started",
+        "IPC server started (framework-ipc)",
+        {{"socket_path", tbox::fw::log::FieldValue::makeString(ipc_config.socket_path)},
+         {"dispatch_queue_size", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(ipc_config.dispatch_queue_size))},
+         {"subscriber_queue_size", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(ipc_config.subscriber_queue_size))},
+         {"slow_subscriber_policy", tbox::fw::log::FieldValue::makeString(
+             ipc_config.slow_subscriber_policy)}}
+    );
+    return true;
+}
+
+void MqttService::stopIpcServer() {
+    if (ipc_server_) {
+        ipc_server_->stop();
+        ipc_server_.reset();
+    }
+    if (dispatch_queue_) {
+        dispatch_queue_->stop();
+        dispatch_queue_.reset();
+    }
+    if (ipc_dispatcher_) {
+        ipc_dispatcher_.reset();
+    }
+    MqttLogAdapter::ipc().info(
+        "mqtt.ipc.server_stopped",
+        "IPC server stopped (framework-ipc)"
+    );
+}
+
+// ============================================================
+// 直接 API (CR-004 §5)
+// ============================================================
+
+PublishResult MqttService::publishEnvelope(const PublishEnvelope& env) {
     PublishResult result;
 
-    // Topic validation (CR-003 §4: mqtt.publish.rejected MQTT-1004)
-    if (topic.empty()) {
+    // msg_id 必填 (CR-004 §5.1)
+    if (env.msg_id.empty() || env.topic.empty()) {
         MqttLogAdapter::publish().warn(
             "mqtt.publish.rejected",
-            "topic 为空，拒绝发布",
-            {
-                {"topic_template", tbox::fw::log::FieldValue::makeString("empty")},
-                {"qos", tbox::fw::log::FieldValue::makeString(qosToString(qos))},
-                {"payload_size", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(payload.size()))},
-                {"validation_reason", tbox::fw::log::FieldValue::makeString("empty_topic")},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1004")}
-            }
+            "msg_id 或 topic 为空，拒绝发布",
+            {{"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(env.msg_id))},
+             {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(env.topic))},
+             {"qos", tbox::fw::log::FieldValue::makeString(qosToString(env.qos))},
+             {"payload_bytes", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(env.payload.size()))},
+             {"validation_reason", tbox::fw::log::FieldValue::makeString("empty_msg_id_or_topic")},
+             {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1004")}}
         );
         result.accepted = false;
         result.error = ErrorCode::MQTT_1004;
@@ -181,27 +290,27 @@ PublishResult MqttService::publish(const std::string& topic,
 
     if (state_machine_->getCurrentState() != ConnectionState::CONNECTED) {
         OutboundMessage msg;
-        msg.msg_id = "msg_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-        msg.topic = topic;
-        msg.qos = qos;
-        msg.payload = payload;
-        msg.priority = priority;
+        msg.msg_id = env.msg_id;
+        msg.topic = env.topic;
+        msg.qos = env.qos;
+        msg.payload = env.payload;
+        msg.priority = env.priority;
         msg.created_at = std::chrono::steady_clock::now();
         msg.state = MessageState::PENDING;
 
         if (cache_queue_->enqueue(msg)) {
+            // accepted: 离线时成功写入离线队列 (CR-004 §5.2)
             result.accepted = true;
         } else {
-            // mqtt.offline_queue.message_dropped event (CR-003 §4, MQTT-1006)
             auto queue_config = config_manager_->getOfflineQueueConfig();
             MqttLogAdapter::offline_queue().warn(
                 "mqtt.offline_queue.message_dropped",
                 "离线缓存达到上限，消息被丢弃",
                 {
-                    {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(msg.msg_id))},
+                    {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(env.msg_id))},
                     {"priority", tbox::fw::log::FieldValue::makeString(
                         [&]() -> std::string {
-                            switch (priority) {
+                            switch (env.priority) {
                                 case Priority::LOW: return "LOW";
                                 case Priority::NORMAL: return "NORMAL";
                                 case Priority::HIGH: return "HIGH";
@@ -223,7 +332,24 @@ PublishResult MqttService::publish(const std::string& topic,
         return result;
     }
 
-    return client_manager_->publish(topic, payload, qos);
+    // 在线：accepted 仅表示 daemon 已接管进入发送队列，不等于 PUBACK (CR-004 §5.2)
+    auto client_result = client_manager_->publish(env.topic, env.payload, env.qos);
+    result.accepted = client_result.accepted;
+    result.error = client_result.error;
+    return result;
+}
+
+PublishResult MqttService::publish(const std::string& topic,
+                                   const std::vector<uint8_t>& payload,
+                                   QoS qos,
+                                   Priority priority) {
+    PublishEnvelope env;
+    env.msg_id = generateMsgId();
+    env.topic = topic;
+    env.qos = qos;
+    env.priority = priority;
+    env.payload = payload;
+    return publishEnvelope(env);
 }
 
 SubscribeResult MqttService::subscribe(const std::string& topic,
@@ -238,7 +364,6 @@ SubscribeResult MqttService::subscribe(const std::string& topic,
     entry.qos = qos;
 
     if (!route_bridge_->registerRoute(entry)) {
-        // mqtt.subscription.failed event (CR-003 §4, MQTT-1008)
         MqttLogAdapter::subscribe().error(
             "mqtt.subscription.failed",
             "订阅路由注册失败",
@@ -288,6 +413,157 @@ bool MqttService::applyConfig(const ConnectionConfig& config,
     return config_manager_->applyConfig(config, source);
 }
 
+// ============================================================
+// MqttIpcDispatcher::ServiceHandler 实现 (CR-004 §3)
+// ============================================================
+
+std::pair<int32_t, bool> MqttService::onPublish(const PublishEnvelope& env) {
+    if (ipc_reject_new_) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1002), false};
+    }
+    auto result = publishEnvelope(env);
+    int32_t status = result.error.has_value()
+        ? static_cast<int32_t>(result.error.value())
+        : 0;
+    return {status, result.accepted};
+}
+
+std::pair<int32_t, bool> MqttService::onSubscribe(const Route& route, int client_fd) {
+    if (ipc_reject_new_) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1002), false};
+    }
+
+    // 登记 route (DOWN 方向，CR-004 §6)
+    RouteEntry entry;
+    entry.internal_addr = route.topic;  // 订阅侧 route 的内部地址默认为 topic
+    entry.mqtt_topic = route.topic;
+    entry.direction = RouteEntry::Direction::DOWN;
+    entry.qos = route.qos;
+    route_bridge_->registerRoute(entry);
+
+    // 连接在线时向 Broker 订阅
+    if (state_machine_->getCurrentState() == ConnectionState::CONNECTED) {
+        client_manager_->subscribe(route.topic, route.qos);
+    }
+
+    // 注：framework 事件订阅由 onSubscribeEventChannel 负责（独立连接）
+    return {0, true};
+}
+
+std::pair<int32_t, bool> MqttService::onSubscribeEventChannel(int client_fd) {
+    // 登记 framework 事件订阅：client_fd 接收 DOWNLINK_MESSAGE 事件 (CR-004 §6)
+    bool ok = false;
+    if (ipc_server_) {
+        ok = ipc_server_->add_subscription(
+            client_fd, static_cast<uint32_t>(ipc::EventType::DOWNLINK_MESSAGE));
+    }
+    if (!ok) {
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.failed",
+            "framework 事件订阅登记失败",
+            {tbox::fw::log::Field("error_code", tbox::fw::log::FieldValue::makeString("MQTT-1008"))}
+        );
+        return {static_cast<int32_t>(ErrorCode::MQTT_1008), false};
+    }
+    return {0, true};
+}
+
+std::pair<int32_t, bool> MqttService::onUnsubscribe(int client_fd) {
+    if (ipc_server_) {
+        ipc_server_->remove_subscription(
+            client_fd, static_cast<uint32_t>(ipc::EventType::DOWNLINK_MESSAGE));
+    }
+    // per-fd 订阅清理由 dispatcher::onClientDisconnected 负责；不自动删除持久 RouteEntry (CR-004 §4)
+    return {0, true};
+}
+
+std::pair<int32_t, bool> MqttService::onRegisterRoute(const RouteEntry& entry) {
+    if (ipc_reject_new_) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1002), false};
+    }
+    // 同 route key 覆盖 (CR-004 §7.1): 先移除再登记
+    route_bridge_->removeRoute(entry.internal_addr);
+    bool ok = route_bridge_->registerRoute(entry);
+    if (!ok) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004), false};
+    }
+
+    // DOWN 路由：连接在线时向 Broker 订阅
+    if (entry.direction == RouteEntry::Direction::DOWN &&
+        state_machine_->getCurrentState() == ConnectionState::CONNECTED) {
+        client_manager_->subscribe(entry.mqtt_topic, entry.qos);
+    }
+    return {0, true};
+}
+
+std::string MqttService::onGetConnectionState() {
+    auto state_info = state_machine_->getStateInfo();
+    nlohmann::json j;
+    j["state"] = connectionStateToString(state_info.state);
+    j["last_error"] = state_info.last_error;
+    j["retry_count"] = state_info.retry_count;
+    return j.dump();
+}
+
+// ============================================================
+// 下行分发 (CR-004 §6)
+// ============================================================
+
+std::string MqttService::buildDownlinkEventPayload(const std::string& topic,
+                                                   const std::vector<uint8_t>& payload) const {
+    nlohmann::json j;
+    j["topic"] = topic;
+    j["payload_base64"] = b64_encode(payload);
+    return j.dump();
+}
+
+void MqttService::pushDownlinkEvent(const std::string& topic,
+                                    const std::vector<uint8_t>& payload) {
+    if (!ipc_server_) {
+        return;
+    }
+    std::string payload_json = buildDownlinkEventPayload(topic, payload);
+    // MQTT 网络 callback 不直接阻塞：由 dispatch queue worker 线程调用 push_event (CR-004 §4)
+    ipc_server_->push_event(static_cast<uint32_t>(ipc::EventType::DOWNLINK_MESSAGE),
+                            payload_json);
+}
+
+void MqttService::onMessageReceived(const std::string& topic,
+                                    const std::vector<uint8_t>& payload) {
+    // 下行消息进入时生成 request_id (CR-003 §3)
+    std::string request_id = generateRequestId();
+    auto scope = makeContextScope("", request_id);
+
+    auto route = route_bridge_->findRouteByMqttTopic(topic);
+    if (!route.has_value()) {
+        // mqtt.downlink.route_failed event (CR-003 §4, MQTT-1007)
+        MqttLogAdapter::router().warn(
+            "mqtt.downlink.route_failed",
+            "下行消息无法路由或无订阅者",
+            {
+                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+                {"payload_size", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(payload.size()))},
+                {"reason", tbox::fw::log::FieldValue::makeString("no_route")},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1007")}
+            }
+        );
+        return;
+    }
+
+    // 投递至有界 dispatch queue（非阻塞，不阻塞 Broker callback, CR-004 §4/§6）
+    if (dispatch_queue_) {
+        dispatch_queue_->enqueue(topic, payload);
+    } else if (ipc_server_) {
+        // 无 dispatch queue 时直接推送（兼容无 IPC 配置场景）
+        pushDownlinkEvent(topic, payload);
+    }
+}
+
+// ============================================================
+// 连接状态变更 (CR-003 §4)
+// ============================================================
+
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
     if (new_state == ConnectionState::CONNECTING) {
         auto config = config_manager_->getConfig();
@@ -301,7 +577,6 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             }
         );
         if (!client_manager_->connect(config)) {
-            // mqtt.connection.failed event (CR-003 §4, MQTT-1002)
             auto state_info = state_machine_->getStateInfo();
             MqttLogAdapter::connection().error(
                 "mqtt.connection.failed",
@@ -317,7 +592,6 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             state_machine_->onConnectionFailure("Failed to initiate MQTT connection");
         }
     } else if (new_state == ConnectionState::CONNECTED) {
-        // mqtt.connection.established event (CR-003 §4)
         auto config = config_manager_->getConfig();
         MqttLogAdapter::connection().info(
             "mqtt.connection.established",
@@ -356,7 +630,6 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             client_manager_->subscribe(route.mqtt_topic, route.qos);
         }
     } else if (new_state == ConnectionState::RECONNECTING) {
-        // mqtt.connection.disconnected event (CR-003 §4, MQTT-1003)
         auto state_info = state_machine_->getStateInfo();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
             state_info.next_retry_at - std::chrono::steady_clock::now());
@@ -385,52 +658,14 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             }
         );
     }
-}
 
-void MqttService::onMessageReceived(const std::string& topic,
-                                    const std::vector<uint8_t>& payload) {
-    // 下行消息进入时生成 request_id (CR-003 §3)
-    std::string request_id = generateRequestId();
-    auto scope = makeContextScope("", request_id);
-
-    auto route = route_bridge_->findRouteByMqttTopic(topic);
-    if (!route.has_value()) {
-        // mqtt.downlink.route_failed event (CR-003 §4, MQTT-1007)
-        MqttLogAdapter::router().warn(
-            "mqtt.downlink.route_failed",
-            "下行消息无法路由或无订阅者",
-            {
-                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
-                {"payload_size", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(payload.size()))},
-                {"reason", tbox::fw::log::FieldValue::makeString("no_route")},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1007")}
-            }
-        );
-        return;
+    // 推送连接状态变更事件给订阅者 (CR-004 §6)
+    if (ipc_server_ && dispatch_queue_) {
+        nlohmann::json j;
+        j["state"] = connectionStateToString(new_state);
+        ipc_server_->push_event(
+            static_cast<uint32_t>(ipc::EventType::CONNECTION_STATE_CHANGED), j.dump());
     }
-
-    bus_interface_->sendMessage(route->internal_addr, payload);
-}
-
-void MqttService::onInternalMessage(const std::string& internal_addr,
-                                    const std::vector<uint8_t>& payload) {
-    auto route = route_bridge_->findRouteByInternalAddr(internal_addr);
-    if (!route.has_value()) {
-        MqttLogAdapter::router().warn(
-            "mqtt.uplink.route_failed",
-            "上行消息无路由映射",
-            {
-                {"internal_addr", tbox::fw::log::FieldValue::makeString(internal_addr)},
-                {"payload_size", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(payload.size()))},
-                {"reason", tbox::fw::log::FieldValue::makeString("no_route")}
-            }
-        );
-        return;
-    }
-
-    publish(route->mqtt_topic, payload, route->qos);
 }
 
 } // namespace mqtt
