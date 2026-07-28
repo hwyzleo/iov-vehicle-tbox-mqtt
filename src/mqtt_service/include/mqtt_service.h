@@ -19,7 +19,8 @@ class MqttClientManager;
 class OfflineCacheQueue;
 class RouteBridge;
 class ConfigManager;
-class SecCertInterface;
+class CredentialManager;
+class SecTlsKeyAdapter;
 
 /// Main MQTT service (设计 §5, CR-004 §2)
 ///
@@ -30,8 +31,9 @@ public:
     MqttService();
     ~MqttService();
 
-    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4)
-    bool initialize(std::shared_ptr<SecCertInterface> sec_interface,
+    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4, CR-005 §4.2)
+    // CR-005: 使用 CredentialManager 替代 SecCertInterface
+    bool initialize(std::shared_ptr<CredentialManager> cred_mgr,
                     const std::string& config_root,
                     const std::string& store_root);
 
@@ -102,7 +104,8 @@ private:
     std::unique_ptr<OfflineCacheQueue> cache_queue_;
     std::unique_ptr<RouteBridge> route_bridge_;
     std::unique_ptr<ConfigManager> config_manager_;
-    std::shared_ptr<SecCertInterface> sec_interface_;
+    std::shared_ptr<CredentialManager> cred_mgr_;
+    std::unique_ptr<SecTlsKeyAdapter> tls_adapter_;
     std::shared_ptr<hwyz::store::Store> store_;
 
     // IPC (CR-004 §2)

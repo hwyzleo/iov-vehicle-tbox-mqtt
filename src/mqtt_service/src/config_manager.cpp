@@ -38,17 +38,40 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
         return false;
     }
 
-    // Read static config fields from framework-config snapshot
-    current_config_.root_ca_ref = config_snapshot_->getString("mqtt.root_ca_ref", "");
+    // CR-005 §8: 废弃字段检测 (fail-closed)
+    // 量产环境发现废弃字段时 fail-closed；迁移测试环境可给出明确错误
+    if (config_snapshot_->has("mqtt.root_ca_ref") ||
+        config_snapshot_->has("mqtt.tls_cert_ref") ||
+        config_snapshot_->has("mqtt.tls_key_ref") ||
+        config_snapshot_->has("mqtt.key_source") ||
+        config_snapshot_->has("mqtt.root_ca_path") ||
+        config_snapshot_->has("mqtt.client_cert_path") ||
+        config_snapshot_->has("mqtt.private_key_path")) {
+        MqttLogAdapter::ipc().error(
+            "mqtt.config.deprecated_field",
+            "配置包含已废弃的本地凭据字段（root_ca_ref/tls_cert_ref/tls_key_ref/key_source 等），"
+            "CR-005 已移除本地凭据配置，请使用 SEC TLS Credential Provider",
+            {{"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}}
+        );
+        return false;
+    }
+
+    // Read static config fields from framework-config snapshot (CR-005 §3.1, §8)
+    current_config_.credential_profile = config_snapshot_->getString("mqtt.tls.credential_profile", "mqtt");
     current_config_.client_id = config_snapshot_->getString("mqtt.client_id", "");
     current_config_.keepalive = static_cast<uint16_t>(config_snapshot_->getInt("mqtt.keepalive", 60));
     current_config_.clean_start = config_snapshot_->getBool("mqtt.clean_start", false);
     current_config_.session_expiry = static_cast<uint32_t>(config_snapshot_->getInt("mqtt.session_expiry", 3600));
-    current_config_.tls_cert_ref = config_snapshot_->getString("mqtt.tls_cert_ref", "");
-    current_config_.tls_key_ref = config_snapshot_->getString("mqtt.tls_key_ref", "");
 
-    std::string ks = config_snapshot_->getString("mqtt.key_source", "file");
-    current_config_.key_source = (ks == "hsm") ? KeySource::HSM : KeySource::FILE;
+    // CR-005 §3.1: TLS 版本范围
+    std::string min_tls = config_snapshot_->getString("mqtt.tls.min_version", "1.2");
+    std::string max_tls = config_snapshot_->getString("mqtt.tls.max_version", "1.3");
+    current_config_.min_tls_version = (min_tls == "1.3") ? TlsVersion::TLS_1_3 : TlsVersion::TLS_1_2;
+    current_config_.max_tls_version = (max_tls == "1.2") ? TlsVersion::TLS_1_2 : TlsVersion::TLS_1_3;
+
+    // CR-005 §3.1: 握手超时
+    current_config_.handshake_timeout = Duration(
+        config_snapshot_->getInt("mqtt.tls.handshake_timeout_ms", 10000));
 
     current_config_.username = config_snapshot_->getString("mqtt.username", "");
 
@@ -180,6 +203,11 @@ bool ConfigManager::validateConfig(const ConnectionConfig& config) const {
     }
 
     if (config.client_id.empty()) {
+        return false;
+    }
+
+    // CR-005 §3.1: credential_profile 必填
+    if (config.credential_profile.empty()) {
         return false;
     }
 

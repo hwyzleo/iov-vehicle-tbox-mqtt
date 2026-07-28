@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "mqtt_service.h"
-#include "sec_cert_interface.h"
+#include "credential_manager.h"
 #include "config.h"
 #include <thread>
 #include <chrono>
@@ -32,10 +32,11 @@ std::string createE2EConfigDir() {
             << "  keepalive: 60\n"
             << "  clean_start: false\n"
             << "  session_expiry: 3600\n"
-            << "  root_ca_ref: /path/to/ca.crt\n"
-            << "  tls_cert_ref: /path/to/client.crt\n"
-            << "  tls_key_ref: /path/to/client.key\n"
-            << "  key_source: file\n";
+            << "  tls:\n"
+            << "    credential_profile: mqtt\n"
+            << "    min_version: \"1.2\"\n"
+            << "    max_version: \"1.3\"\n"
+            << "    handshake_timeout_ms: 10000\n";
     }
 
     return tmp_dir.string();
@@ -60,11 +61,11 @@ protected:
         store_dir = createE2EStoreDir();
 
         service = std::make_unique<MqttService>();
-        sec = std::make_shared<SecCertInterface>("");
+        cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
-        sec->simulateCertificateReady();
+        cred_mgr->simulateReady();
 
-        service->initialize(sec, config_dir, store_dir);
+        service->initialize(cred_mgr, config_dir, store_dir);
         service->start();
 
         // Wait for connection
@@ -79,7 +80,7 @@ protected:
     std::string config_dir;
     std::string store_dir;
     std::unique_ptr<MqttService> service;
-    std::shared_ptr<SecCertInterface> sec;
+    std::shared_ptr<CredentialManager> cred_mgr;
 };
 
 TEST_F(EndToEndTest, PublishAndSubscribe) {
@@ -148,6 +149,7 @@ TEST_F(EndToEndTest, ConfigurationUpdate) {
     new_config.broker_host = "new.mqtt.com";
     new_config.broker_port = 8883;
     new_config.client_id = "VIN123SN456";
+    new_config.credential_profile = "mqtt";
     new_config.version = 2;
 
     EXPECT_TRUE(service->applyConfig(new_config, ConnectionConfig::Source::OTA));

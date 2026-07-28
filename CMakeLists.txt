@@ -69,7 +69,8 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/offline_cache_queue.cpp
     src/mqtt_service/src/route_bridge.cpp
     src/mqtt_service/src/config_manager.cpp
-    src/mqtt_service/src/sec_cert_interface.cpp
+    src/mqtt_service/src/credential_manager.cpp
+    src/mqtt_service/src/sec_tls_key_adapter.cpp
     src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
     src/mqtt_service/src/mqtt_retry_policy.cpp
     src/mqtt_service/src/mqtt_dispatch_queue.cpp

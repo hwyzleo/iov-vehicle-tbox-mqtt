@@ -1,7 +1,6 @@
 #pragma once
 
 #include "mqtt_types.h"
-#include "sec_cert_interface.h"
 #include <functional>
 #include <memory>
 
@@ -11,7 +10,12 @@ struct mosquitto_message;
 namespace tbox {
 namespace mqtt {
 
-// MQTT client manager (Design §2)
+// Forward declarations (CR-005)
+class CredentialManager;
+class SecTlsKeyAdapter;
+
+// MQTT client manager (Design §2, CR-005 §5)
+// TLS 凭据全部经 CredentialManager/SecTlsKeyAdapter 从 SEC 获取，不再使用文件路径。
 class MqttClientManager {
 public:
     using MessageCallback = std::function<void(const std::string& topic,
@@ -21,14 +25,9 @@ public:
     MqttClientManager();
     ~MqttClientManager();
 
-    // Initialize client with SEC interface
-    bool initialize(const std::string& broker_host,
-                   uint16_t broker_port,
-                   const std::string& client_id,
-                   const SecCertInterface& sec_interface,
-                    const std::string& ca_file_path,
-                    const std::string& cert_file_path = "",
-                    const std::string& key_file_path = "");
+    // Initialize client with SEC credential manager and TLS adapter (CR-005 §5)
+    bool initialize(CredentialManager& cred_mgr,
+                    SecTlsKeyAdapter& tls_adapter);
 
     // Connect to broker
     bool connect(const ConnectionConfig& config);
@@ -72,6 +71,10 @@ private:
     MessageCallback message_callback_;
     ConnectionCallback connection_callback_;
     LwtConfig lwt_config_;
+
+    // SEC credential & TLS adapter (CR-005 §5)
+    CredentialManager* cred_mgr_ = nullptr;
+    SecTlsKeyAdapter* tls_adapter_ = nullptr;
 };
 
 } // namespace mqtt

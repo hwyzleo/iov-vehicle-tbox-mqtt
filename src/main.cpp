@@ -1,7 +1,7 @@
 #include "mqtt_service.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
-#include "sec_cert_interface.h"
+#include "credential_manager.h"
 #include "config.h"
 #include "log_types.h"
 #include <iostream>
@@ -113,18 +113,19 @@ int main(int argc, char* argv[]) {
         }
     );
 
-    // CR-004 §4 生命周期: 初始化离线队列与 tbox::sec_client
+    // CR-005 §4.2: 初始化 tbox::sec_client (CredentialManager)
     std::string sec_socket_path = snapshot->getString("sec.socket_path", "/tmp/tbox-sec.sock");
-    auto sec = std::make_shared<SecCertInterface>(sec_socket_path);
+    std::string credential_profile = snapshot->getString("mqtt.tls.credential_profile", "mqtt");
+    auto cred_mgr = std::make_shared<CredentialManager>(sec_socket_path, credential_profile);
 
 #ifdef SIMULATE_CERT
-    sec->simulateCertificateReady();
+    cred_mgr->simulateReady();
 #endif
 
     // CR-004 §4: 构造 MqttService 并初始化
     g_service = std::make_unique<MqttService>();
 
-    if (!g_service->initialize(sec, config_root, store_root)) {
+    if (!g_service->initialize(cred_mgr, config_root, store_root)) {
         MqttLogAdapter::service().error(
             "mqtt.service.init_failed",
             "Failed to initialize MQTT service"

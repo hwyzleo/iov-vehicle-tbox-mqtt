@@ -62,19 +62,43 @@ add_executable(test_connection_state_machine
 target_include_directories(test_connection_state_machine PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_connection_state_machine GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
-add_executable(test_sec_cert_interface
-    unit/test_sec_cert_interface.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_cert_interface.cpp
+add_executable(test_credential_manager
+    unit/test_credential_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/credential_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
-target_include_directories(test_sec_cert_interface PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_sec_cert_interface GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} OpenSSL::SSL OpenSSL::Crypto pthread)
+target_include_directories(test_credential_manager PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_credential_manager GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} OpenSSL::SSL OpenSSL::Crypto pthread)
+
+# SEC TLS Key Adapter (CR-005 §5, §10)
+add_executable(test_sec_tls_key_adapter
+    unit/test_sec_tls_key_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_tls_key_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/credential_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_sec_tls_key_adapter PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_sec_tls_key_adapter GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} OpenSSL::SSL OpenSSL::Crypto pthread)
+
+# Credential lifecycle (CR-005 §7, §10)
+add_executable(test_credential_lifecycle
+    unit/test_credential_lifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/credential_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_tls_key_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/connection_state_machine.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_credential_lifecycle PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_credential_lifecycle GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} OpenSSL::SSL OpenSSL::Crypto pthread)
 
 add_executable(test_mqtt_client_manager
     unit/test_mqtt_client_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_client_manager.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_cert_interface.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/credential_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/sec_tls_key_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
@@ -193,7 +217,9 @@ target_link_libraries(test_mqtt_ipc_fault_injection mqtt_service_lib tbox_mqtt_c
 
 # Add tests
 add_test(NAME ConnectionStateMachineTest COMMAND test_connection_state_machine)
-add_test(NAME SecCertInterfaceTest COMMAND test_sec_cert_interface)
+add_test(NAME CredentialManagerTest COMMAND test_credential_manager)
+add_test(NAME SecTlsKeyAdapterTest COMMAND test_sec_tls_key_adapter)
+add_test(NAME CredentialLifecycleTest COMMAND test_credential_lifecycle)
 add_test(NAME MqttClientManagerTest COMMAND test_mqtt_client_manager)
 add_test(NAME OfflineCacheQueueTest COMMAND test_offline_cache_queue)
 add_test(NAME RouteBridgeTest COMMAND test_route_bridge)

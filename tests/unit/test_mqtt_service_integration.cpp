@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "mqtt_service.h"
-#include "sec_cert_interface.h"
+#include "credential_manager.h"
 #include "config.h"
 #include <filesystem>
 #include <fstream>
@@ -32,10 +32,11 @@ std::string createTempConfigDir() {
             << "  keepalive: 60\n"
             << "  clean_start: false\n"
             << "  session_expiry: 3600\n"
-            << "  root_ca_ref: /path/to/ca.crt\n"
-            << "  tls_cert_ref: /path/to/client.crt\n"
-            << "  tls_key_ref: /path/to/client.key\n"
-            << "  key_source: file\n"
+            << "  tls:\n"
+            << "    credential_profile: mqtt\n"
+            << "    min_version: \"1.2\"\n"
+            << "    max_version: \"1.3\"\n"
+            << "    handshake_timeout_ms: 10000\n"
             << "  offline_queue:\n"
             << "    max_size: 100\n"
             << "    drop_policy: drop_oldest\n";
@@ -61,10 +62,10 @@ TEST(MqttServiceIntegrationTest, ServiceInitialization) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
-    sec->simulateCertificateReady();
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    cred_mgr->simulateReady();
 
-    EXPECT_TRUE(service.initialize(sec, config_dir, store_dir));
+    EXPECT_TRUE(service.initialize(cred_mgr, config_dir, store_dir));
 
     cleanupTempDirs();
 }
@@ -74,10 +75,10 @@ TEST(MqttServiceIntegrationTest, ServiceStartStop) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
-    sec->simulateCertificateReady();
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    cred_mgr->simulateReady();
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
     EXPECT_TRUE(service.start());
 
     service.stop();
@@ -90,10 +91,10 @@ TEST(MqttServiceIntegrationTest, PublishMessage) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
-    sec->simulateCertificateReady();
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    cred_mgr->simulateReady();
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
     service.start();
 
     std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
@@ -110,10 +111,10 @@ TEST(MqttServiceIntegrationTest, SubscribeToTopic) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
-    sec->simulateCertificateReady();
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    cred_mgr->simulateReady();
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
     service.start();
 
     auto result = service.subscribe("test/topic", QoS::AT_LEAST_ONCE, "service_diag");
@@ -129,9 +130,9 @@ TEST(MqttServiceIntegrationTest, RegisterRoute) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
 
     EXPECT_TRUE(service.registerRoute("service_diag", "vehicle/diag/status",
                                       RouteEntry::Direction::UP));
@@ -144,9 +145,9 @@ TEST(MqttServiceIntegrationTest, GetConnectionState) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
 
     auto state = service.getConnectionState();
     EXPECT_EQ(state.state, ConnectionState::INIT);
@@ -159,14 +160,15 @@ TEST(MqttServiceIntegrationTest, ApplyFactoryConfiguration) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
 
     ConnectionConfig config;
     config.broker_host = "test.mqtt.com";
     config.broker_port = 8883;
     config.client_id = "TEST_INTEGRATION";
+    config.credential_profile = "mqtt";
 
     EXPECT_TRUE(service.applyConfig(config, ConnectionConfig::Source::FACTORY));
 
@@ -178,14 +180,15 @@ TEST(MqttServiceIntegrationTest, ApplyOtaConfiguration) {
     std::string store_dir = createTempStoreDir();
 
     MqttService service;
-    auto sec = std::make_shared<SecCertInterface>("");
+    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
-    service.initialize(sec, config_dir, store_dir);
+    service.initialize(cred_mgr, config_dir, store_dir);
 
     ConnectionConfig config;
     config.broker_host = "ota.mqtt.com";
     config.broker_port = 8883;
     config.client_id = "TEST_INTEGRATION";
+    config.credential_profile = "mqtt";
     config.source = ConnectionConfig::Source::OTA;
     config.version = 1;
 

@@ -1,10 +1,10 @@
 #include "mqtt_client_manager.h"
+#include "credential_manager.h"
+#include "sec_tls_key_adapter.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include <mosquitto.h>
-#include <openssl/conf.h>
-#include <openssl/err.h>
-#include <openssl/provider.h>
+#include <openssl/ssl.h>
 #include <chrono>
 
 namespace tbox {
@@ -59,36 +59,12 @@ MqttClientManager::~MqttClientManager() {
     mosquitto_lib_cleanup();
 }
 
-bool MqttClientManager::initialize(const std::string& broker_host,
-                                  uint16_t broker_port,
-                                  const std::string& client_id,
-                                  const SecCertInterface& sec_interface,
-                                  const std::string& ca_file_path,
-                                  const std::string& cert_file_path,
-                                  const std::string& key_file_path) {
-    // Create mosquitto instance with client ID
-    mosq_ = mosquitto_new(client_id.c_str(), true, this);
-    if (!mosq_) return false;
-
-    // Set callbacks
-    mosquitto_connect_callback_set(mosq_, on_connect_wrapper);
-    mosquitto_disconnect_callback_set(mosq_, on_disconnect_wrapper);
-    mosquitto_message_callback_set(mosq_, on_message_wrapper);
-    mosquitto_publish_callback_set(mosq_, on_publish_wrapper);
-    mosquitto_subscribe_callback_set(mosq_, on_subscribe_wrapper);
-
-    // Configure TLS with SEC certificate handles
-    auto cert_result = sec_interface.getCertHandle();
-    if (!cert_result.valid) return false;
-
-    int rc = mosquitto_tls_set(mosq_,
-                              ca_file_path.c_str(),
-                              nullptr,
-                              cert_file_path.empty() ? nullptr : cert_file_path.c_str(),
-                              key_file_path.empty() ? nullptr : key_file_path.c_str(),
-                              nullptr);
-
-    return rc == MOSQ_ERR_SUCCESS;
+bool MqttClientManager::initialize(CredentialManager& cred_mgr,
+                                   SecTlsKeyAdapter& tls_adapter) {
+    // CR-005 §5: TLS 凭据全部经 CredentialManager/SecTlsKeyAdapter 从 SEC 获取
+    cred_mgr_ = &cred_mgr;
+    tls_adapter_ = &tls_adapter;
+    return true;
 }
 
 bool MqttClientManager::connect(const ConnectionConfig& config) {
@@ -122,75 +98,77 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         mosquitto_subscribe_callback_set(mosq_, on_subscribe_wrapper);
     }
 
-    // Configure TLS if CA certificate is specified
-    if (!config.root_ca_ref.empty()) {
-        // Note: key_source and tls_key_ref are logged without exposing the actual key path value
-        // as they may contain PKCS#11 URIs or file paths (CR-003 §5)
-        std::string key_source_str = (config.key_source == KeySource::HSM) ? "HSM" : "FILE";
-
-        MqttLogAdapter::tls().info(
-            "mqtt.tls.configuring",
-            "配置 TLS",
+    // Configure TLS via SEC credential (CR-005 §5)
+    // TLS 凭据全部从 SEC 获取，不再使用文件路径
+    if (!cred_mgr_ || !tls_adapter_) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::tls().error(
+            "mqtt.tls.handshake_failed",
+            "CredentialManager 或 SecTlsKeyAdapter 未初始化",
             {
-                {"key_source", tbox::fw::log::FieldValue::makeString(key_source_str)},
-                {"has_ca", tbox::fw::log::FieldValue::makeBool(!config.root_ca_ref.empty())},
-                {"has_cert", tbox::fw::log::FieldValue::makeBool(!config.tls_cert_ref.empty())}
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
             }
         );
+        return false;
+    }
 
-        const char* key_path = nullptr;
-
-        if (config.key_source == KeySource::HSM) {
-            key_path = config.tls_key_ref.c_str();
-        } else {
-            key_path = config.tls_key_ref.empty() ? nullptr : config.tls_key_ref.c_str();
-        }
-
-        int rc = mosquitto_tls_set(mosq_,
-                                  config.root_ca_ref.c_str(),
-                                  nullptr,
-                                  config.tls_cert_ref.empty() ? nullptr : config.tls_cert_ref.c_str(),
-                                  key_path,
-                                  nullptr);
-        if (rc != MOSQ_ERR_SUCCESS) {
-            // mqtt.tls.handshake_failed event (CR-003 §4, MQTT-1001)
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time);
-            MqttLogAdapter::tls().error(
-                "mqtt.tls.handshake_failed",
-                "TLS 配置失败",
-                {
-                    {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
-                    {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(rc))},
-                    {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
-                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
-                }
-            );
-            return false;
-        }
-
-        // For HSM mode, enable PKCS#11 URI as key reference in OpenSSL 3.x
-        if (config.key_source == KeySource::HSM) {
-            OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
-            OSSL_PROVIDER* pkcs11 = OSSL_PROVIDER_load(nullptr, "pkcs11");
-            if (pkcs11) {
-                MqttLogAdapter::tls().info(
-                    "mqtt.tls.pkcs11_loaded",
-                    "OpenSSL pkcs11 provider 已加载"
-                );
-            } else {
-                MqttLogAdapter::tls().warn(
-                    "mqtt.tls.pkcs11_missing",
-                    "OpenSSL pkcs11 provider 未找到，HSM 可能无法工作"
-                );
-            }
-            (void)legacy;
-        }
-    } else {
+    // Get current credential snapshot (thread-safe, CR-005 §7)
+    ActiveTlsCredential credential = cred_mgr_->getSnapshot();
+    if (!credential.ready) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
         MqttLogAdapter::tls().warn(
-            "mqtt.tls.disabled",
-            "TLS 未启用（无 CA 证书）"
+            "mqtt.certificate.waiting",
+            "SEC 凭据未就绪，无法发起 TLS 连接",
+            {
+                {"profile", tbox::fw::log::FieldValue::makeString(config.credential_profile)},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+            }
         );
+        return false;
+    }
+
+    // Build SSL_CTX from SEC credential (CR-005 §5.1)
+    // root CA bundle -> X509_STORE, client cert chain -> SSL_CTX, private key -> ECDSA_METHOD
+    SSL_CTX* ssl_ctx = tls_adapter_->buildTlsContext(
+        credential, *cred_mgr_, config.min_tls_version, config.max_tls_version);
+    if (!ssl_ctx) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::tls().error(
+            "mqtt.tls.handshake_failed",
+            "SSL_CTX 构建失败",
+            {
+                {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+                {"reason", tbox::fw::log::FieldValue::makeString(tls_adapter_->getLastError())},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+            }
+        );
+        return false;
+    }
+
+    // Inject SSL_CTX into mosquitto (CR-005 §5)
+    // MOSQ_OPT_SSL_CTX_WITH_DEFAULTS = 0: we configure everything ourselves
+    mosquitto_int_option(mosq_, MOSQ_OPT_SSL_CTX_WITH_DEFAULTS, 0);
+    int tls_rc = mosquitto_void_option(mosq_, MOSQ_OPT_SSL_CTX, ssl_ctx);
+    if (tls_rc != MOSQ_ERR_SUCCESS) {
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time);
+        MqttLogAdapter::tls().error(
+            "mqtt.tls.handshake_failed",
+            "SSL_CTX 注入 mosquitto 失败",
+            {
+                {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
+                {"reason_code", tbox::fw::log::FieldValue::makeString(mosquitto_strerror(tls_rc))},
+                {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+            }
+        );
+        return false;
     }
 
     // Set username from client certificate CN for broker authentication

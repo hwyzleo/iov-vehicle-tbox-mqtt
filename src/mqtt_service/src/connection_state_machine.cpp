@@ -51,6 +51,8 @@ void ConnectionStateMachine::start() {
 
         if (state_info_.state == ConnectionState::INIT ||
             state_info_.state == ConnectionState::OFFLINE) {
+            credential_poll_count_ = 0;
+            calculateNextCredentialPoll();
             cb = transitionTo(ConnectionState::CERT_WAIT);
         } else {
             cb = callback_;
@@ -94,6 +96,7 @@ void ConnectionStateMachine::onCertificateReady() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_info_.state == ConnectionState::CERT_WAIT) {
+            credential_poll_count_ = 0;  // CR-005 §6: 重置退避计数
             cb = transitionTo(ConnectionState::CONNECTING);
         }
     }
@@ -104,6 +107,7 @@ void ConnectionStateMachine::onConnectionSuccess() {
     StateChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // CR-005 §7: 检查 connection generation，阻止旧 callback 重入 CONNECTED
         if (state_info_.state == ConnectionState::CONNECTING) {
             state_info_.retry_count = 0;
             cb = transitionTo(ConnectionState::CONNECTED);
@@ -180,6 +184,91 @@ void ConnectionStateMachine::onDisconnect() {
     if (cb) cb(ConnectionState::RECONNECTING);
 }
 
+// ============================================================
+// CR-005 §6: 凭据事件
+// ============================================================
+
+void ConnectionStateMachine::setCredentialPollConfig(const CredentialPollConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    credential_poll_config_ = config;
+}
+
+void ConnectionStateMachine::onCredentialInvalid(const std::string& reason) {
+    // CR-005 §6: CONNECTING -> CERT_WAIT (SEC-1011~1014 / credential invalid)
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTING) {
+            state_info_.last_error = reason;
+            credential_poll_count_ = 0;
+            calculateNextCredentialPoll();
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        }
+    }
+    timer_cv_.notify_all();
+    if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+void ConnectionStateMachine::onCredentialChanged() {
+    // CR-005 §6: CONNECTED -> CERT_WAIT (credential changed / revoked / SEC restart)
+    // CR-005 §7: 先标记 connection generation 失效，再断开
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CONNECTING) {
+            connection_generation_++;  // 标记失效，阻止旧 callback 重入 CONNECTED
+            state_info_.last_error = "Credential changed/restarted";
+            credential_poll_count_ = 0;
+            calculateNextCredentialPoll();
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        }
+    }
+    timer_cv_.notify_all();
+    if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+void ConnectionStateMachine::onCredentialStateChanged() {
+    // CR-005 §6: RECONNECTING -> CERT_WAIT (credential state changed)
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::RECONNECTING) {
+            credential_poll_count_ = 0;
+            calculateNextCredentialPoll();
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        }
+    }
+    timer_cv_.notify_all();
+    if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+void ConnectionStateMachine::onCredentialPollTimeout() {
+    // CR-005 §6: CERT_WAIT 退避超时，递增计数并重新计算退避
+    // 实际的 SEC 查询由 MqttService 经 state change callback 触发
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CERT_WAIT) {
+            credential_poll_count_++;
+            calculateNextCredentialPoll();
+            // 通知上层重新检查凭据状态（同状态回调）
+            cb = callback_;
+        }
+    }
+    if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+uint64_t ConnectionStateMachine::getConnectionGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connection_generation_;
+}
+
+void ConnectionStateMachine::invalidateConnectionGeneration() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    connection_generation_++;
+}
+
 ConnectionStateMachine::StateChangeCallback ConnectionStateMachine::transitionTo(ConnectionState new_state) {
     state_info_.state = new_state;
     persistState();
@@ -196,6 +285,23 @@ void ConnectionStateMachine::calculateNextRetry() {
     delay += std::chrono::milliseconds(jitter);
 
     state_info_.next_retry_at = std::chrono::steady_clock::now() + delay;
+}
+
+// CR-005 §6: CERT_WAIT 独立退避（不与 Broker 网络重连计数混用）
+void ConnectionStateMachine::calculateNextCredentialPoll() {
+    // 指数退避：initial_backoff * 2^min(count, 6) capped at max_backoff
+    auto delay = credential_poll_config_.initial_backoff *
+                 (1 << std::min(credential_poll_count_, 6u));
+    delay = std::min(delay, credential_poll_config_.max_backoff);
+
+    auto jitter_ms = delay.count() / 10;
+    if (jitter_ms > 0) {
+        std::uniform_int_distribution<int64_t> dist(-jitter_ms, jitter_ms);
+        auto jitter = dist(rng_);
+        delay += std::chrono::milliseconds(jitter);
+    }
+
+    next_credential_poll_at_ = std::chrono::steady_clock::now() + delay;
 }
 
 void ConnectionStateMachine::persistState() {
@@ -272,11 +378,27 @@ void ConnectionStateMachine::timerLoop() {
             lock.unlock();
             onRetryTimeout();
             lock.lock();
+        } else if (state_info_.state == ConnectionState::CERT_WAIT) {
+            // CR-005 §6: CERT_WAIT 独立退避定时器
+            auto wake_time = next_credential_poll_at_;
+            bool predicate_changed = timer_cv_.wait_until(lock, wake_time, [this] {
+                return !timer_running_ ||
+                       state_info_.state != ConnectionState::CERT_WAIT;
+            });
+
+            if (!timer_running_) break;
+            if (predicate_changed) continue; // State changed externally, re-evaluate
+
+            // Timeout expired and state is still CERT_WAIT -> trigger credential poll.
+            lock.unlock();
+            onCredentialPollTimeout();
+            lock.lock();
         } else {
-            // Not in RECONNECTING; sleep until state changes or we stop
+            // Not in RECONNECTING or CERT_WAIT; sleep until state changes or we stop
             timer_cv_.wait(lock, [this] {
                 return !timer_running_ ||
-                       state_info_.state == ConnectionState::RECONNECTING;
+                       state_info_.state == ConnectionState::RECONNECTING ||
+                       state_info_.state == ConnectionState::CERT_WAIT;
             });
         }
     }

@@ -4,7 +4,8 @@
 #include "offline_cache_queue.h"
 #include "route_bridge.h"
 #include "config_manager.h"
-#include "sec_cert_interface.h"
+#include "credential_manager.h"
+#include "sec_tls_key_adapter.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include "utils.h"
@@ -33,21 +34,22 @@ MqttService::MqttService()
       client_manager_(std::make_unique<MqttClientManager>()),
       cache_queue_(std::make_unique<OfflineCacheQueue>(1000)),
       route_bridge_(std::make_unique<RouteBridge>()),
-      config_manager_(std::make_unique<ConfigManager>()) {
+      config_manager_(std::make_unique<ConfigManager>()),
+      tls_adapter_(std::make_unique<SecTlsKeyAdapter>()) {
 }
 
 MqttService::~MqttService() {
     stop();
 }
 
-bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
+bool MqttService::initialize(std::shared_ptr<CredentialManager> cred_mgr,
                              const std::string& config_root,
                              const std::string& store_root) {
-    if (!sec_interface) {
+    if (!cred_mgr) {
         return false;
     }
 
-    sec_interface_ = sec_interface;
+    cred_mgr_ = cred_mgr;
 
     // Open framework-store for runtime state and OTA-updatable params (Design §5)
     store_ = std::make_shared<hwyz::store::Store>(
@@ -73,27 +75,47 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
     // Set store for state machine persistence
     state_machine_->setStore(store_);
 
-    // Load certificates from configured paths (unless already ready, e.g. via simulateCertificateReady in tests)
-    if (!sec_interface_->isCertificateReady()) {
-        auto config = config_manager_->getConfig();
-        if (!sec_interface_->loadCertificates(config.root_ca_ref,
-                                               config.tls_cert_ref,
-                                               config.tls_key_ref,
-                                               config.key_source)) {
-            MqttLogAdapter::tls().error(
-                "mqtt.tls.handshake_failed",
-                "证书加载失败",
-                {
-                    {"reason_code", tbox::fw::log::FieldValue::makeString("cert_load_failed")},
-                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
-                }
-            );
-        }
-    }
-
-    // Configure offline cache queue from framework-config snapshot
+    // CR-005 §4.2: 初始化离线队列
     auto queue_config = config_manager_->getOfflineQueueConfig();
     cache_queue_ = std::make_unique<OfflineCacheQueue>(queue_config.max_size);
+
+    // CR-005 §4.2: 初始化 tbox::sec_client
+    cred_mgr_->initialize();
+
+    // CR-005 §6: 设置 CERT_WAIT 退避配置（从 framework-config 读取）
+    CredentialPollConfig poll_config;
+    auto snapshot = config_manager_->getSnapshot();
+    if (snapshot) {
+        auto tls_section = snapshot->getSection("mqtt.tls");
+        if (tls_section) {
+            auto poll_section = tls_section->getSection("credential_poll");
+            if (poll_section) {
+                poll_config.initial_backoff = Duration(
+                    poll_section->getInt("initial_backoff_ms", 1000));
+                poll_config.max_backoff = Duration(
+                    poll_section->getInt("max_backoff_ms", 60000));
+            }
+        }
+    }
+    state_machine_->setCredentialPollConfig(poll_config);
+
+    // CR-005 §4.2: 建立 credential change subscription (在首次获取前)
+    // CR-005 §7: payload 仅用于触发，不直接替换凭据；MQTT 必须重新调用 getTlsCredential()
+    cred_mgr_->subscribeTlsCredentialChanged([this]() {
+        // CR-005 §7 cleanup 顺序: 标记 generation 失效 -> 清理旧 TLS context -> 状态机转 CERT_WAIT
+        cred_mgr_->invalidateCredential();
+        tls_adapter_->destroyContext();
+        client_manager_->disconnect();
+        state_machine_->onCredentialChanged();
+    });
+
+    // CR-005 §4.2: 获取初始凭据 (getTlsCredential)
+    // SEC 不可用或 NOT_READY 时保持 CERT_WAIT (CR-005 §4.2)
+    ActiveTlsCredential credential;
+    cred_mgr_->getTlsCredential(credential);
+
+    // CR-005 §5: 初始化 MqttClientManager (注入 CredentialManager + SecTlsKeyAdapter)
+    client_manager_->initialize(*cred_mgr_, *tls_adapter_);
 
     state_machine_->setStateChangeCallback(
         [this](ConnectionState new_state) {
@@ -132,24 +154,25 @@ bool MqttService::initialize(std::shared_ptr<SecCertInterface> sec_interface,
 }
 
 bool MqttService::start() {
-    if (!sec_interface_) {
+    if (!cred_mgr_) {
         return false;
     }
 
     state_machine_->start();
 
-    if (sec_interface_->isCertificateReady()) {
+    // CR-005 §4.2: 启动 Broker connection state machine
+    if (cred_mgr_->isCredentialReady()) {
         MqttLogAdapter::connection().info(
             "mqtt.certificate.ready",
-            "证书就绪，进入连接流程"
+            "SEC 凭据就绪，进入连接流程"
         );
         state_machine_->onCertificateReady();
     } else {
-        // mqtt.certificate.waiting event (CR-003 §4)
+        // mqtt.certificate.waiting event (CR-003 §4, CR-005 §9)
         auto state_info = state_machine_->getStateInfo();
         MqttLogAdapter::connection().info(
             "mqtt.certificate.waiting",
-            "SEC 证书尚未就绪，连接保持等待",
+            "SEC 凭据尚未就绪，连接保持等待",
             {
                 {"state", tbox::fw::log::FieldValue::makeString(
                     connectionStateToString(state_info.state))},
@@ -170,6 +193,9 @@ void MqttService::stop() {
     stopIpcServer();
     state_machine_->stop();
     client_manager_->disconnect();
+    // CR-005 §7: 清理 TLS context 和凭据缓冲
+    tls_adapter_->destroyContext();
+    cred_mgr_->cleanupCredential();
 }
 
 // ============================================================
@@ -565,7 +591,28 @@ void MqttService::onMessageReceived(const std::string& topic,
 // ============================================================
 
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
-    if (new_state == ConnectionState::CONNECTING) {
+    // CR-005 §6: CERT_WAIT 状态检查凭据（初始进入或退避超时轮询）
+    if (new_state == ConnectionState::CERT_WAIT) {
+        ActiveTlsCredential credential;
+        if (cred_mgr_->getTlsCredential(credential) && credential.ready) {
+            MqttLogAdapter::connection().info(
+                "mqtt.certificate.ready",
+                "SEC 凭据就绪，进入连接流程"
+            );
+            state_machine_->onCertificateReady();
+        } else {
+            auto state_info = state_machine_->getStateInfo();
+            MqttLogAdapter::connection().info(
+                "mqtt.certificate.waiting",
+                "SEC 凭据尚未就绪，保持 CERT_WAIT 退避查询",
+                {
+                    {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(state_info.retry_count))},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+                }
+            );
+        }
+    } else if (new_state == ConnectionState::CONNECTING) {
         auto config = config_manager_->getConfig();
         MqttLogAdapter::connection().info(
             "mqtt.connection.connecting",

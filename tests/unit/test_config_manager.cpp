@@ -37,10 +37,11 @@ std::string createTempConfigDir(const std::string& broker_host = "test.mqtt.com"
             << "  keepalive: 30\n"
             << "  clean_start: true\n"
             << "  session_expiry: 7200\n"
-            << "  root_ca_ref: /path/to/ca.crt\n"
-            << "  tls_cert_ref: /path/to/client.crt\n"
-            << "  tls_key_ref: /path/to/client.key\n"
-            << "  key_source: file\n"
+            << "  tls:\n"
+            << "    credential_profile: mqtt\n"
+            << "    min_version: \"1.2\"\n"
+            << "    max_version: \"1.3\"\n"
+            << "    handshake_timeout_ms: 10000\n"
             << "  offline_queue:\n"
             << "    path: /tmp/tbox_mqtt_test_queue\n"
             << "    max_size: 500\n"
@@ -78,10 +79,11 @@ TEST(ConfigManagerTest, LoadFromFrameworkConfig) {
     EXPECT_EQ(cfg.keepalive, 30);
     EXPECT_TRUE(cfg.clean_start);
     EXPECT_EQ(cfg.session_expiry, 7200);
-    EXPECT_EQ(cfg.root_ca_ref, "/path/to/ca.crt");
-    EXPECT_EQ(cfg.tls_cert_ref, "/path/to/client.crt");
-    EXPECT_EQ(cfg.tls_key_ref, "/path/to/client.key");
-    EXPECT_EQ(cfg.key_source, KeySource::FILE);
+    // CR-005: 新配置字段
+    EXPECT_EQ(cfg.credential_profile, "mqtt");
+    EXPECT_EQ(cfg.min_tls_version, TlsVersion::TLS_1_2);
+    EXPECT_EQ(cfg.max_tls_version, TlsVersion::TLS_1_3);
+    EXPECT_EQ(cfg.handshake_timeout.count(), 10000);
 
     cleanupTempConfigDir(config_dir);
 }
@@ -114,6 +116,7 @@ TEST(ConfigManagerTest, ApplyFactoryConfig) {
     factory_config.broker_host = "factory.mqtt.com";
     factory_config.broker_port = 8883;
     factory_config.client_id = "TEST123";
+    factory_config.credential_profile = "mqtt";
     factory_config.source = ConnectionConfig::Source::FACTORY;
     factory_config.version = 1;
 
@@ -140,6 +143,7 @@ TEST(ConfigManagerTest, ApplyOtaConfigWithStore) {
     ota_config.broker_host = "ota.mqtt.com";
     ota_config.broker_port = 8883;
     ota_config.client_id = "TEST123";
+    ota_config.credential_profile = "mqtt";
     ota_config.source = ConnectionConfig::Source::OTA;
     ota_config.version = 2;
 
@@ -171,6 +175,7 @@ TEST(ConfigManagerTest, LoadFromStoreAfterOTA) {
         ota_config.broker_host = "ota-loaded.mqtt.com";
         ota_config.broker_port = 9999;
         ota_config.client_id = "TEST123";
+        ota_config.credential_profile = "mqtt";
         ota_config.source = ConnectionConfig::Source::OTA;
         ota_config.version = 5;
 
@@ -220,6 +225,7 @@ TEST(ConfigManagerTest, ConfigChangeCallback) {
     ConnectionConfig new_config;
     new_config.broker_host = "new.mqtt.com";
     new_config.client_id = "TEST123";
+    new_config.credential_profile = "mqtt";
     config.applyConfig(new_config, ConnectionConfig::Source::FACTORY);
 
     EXPECT_TRUE(callback_called);
@@ -243,6 +249,7 @@ TEST(ConfigManagerTest, OtaConfigVersionCheck) {
     v2_config.broker_host = "v2.mqtt.com";
     v2_config.broker_port = 8883;
     v2_config.client_id = "TEST123";
+    v2_config.credential_profile = "mqtt";
     v2_config.version = 2;
     ASSERT_TRUE(config.applyConfig(v2_config, ConnectionConfig::Source::OTA));
 
@@ -251,6 +258,7 @@ TEST(ConfigManagerTest, OtaConfigVersionCheck) {
     v1_config.broker_host = "v1.mqtt.com";
     v1_config.broker_port = 1883;
     v1_config.client_id = "TEST123";
+    v1_config.credential_profile = "mqtt";
     v1_config.version = 1;
     EXPECT_FALSE(config.applyConfig(v1_config, ConnectionConfig::Source::OTA));
 

@@ -14,19 +14,23 @@
 
 #include "tbox/mqtt/types.h"
 #include "tbox/mqtt/errors.h"
+#include "tbox/sec/types.h"
 
 namespace tbox {
 namespace mqtt {
 
 // ============================================================
-// daemon 内部枚举 (设计 §3)
+// daemon 内部枚举 (设计 §3, CR-005 §3)
 // ============================================================
 
-/// 密钥来源类型
-enum class KeySource : uint8_t {
-    FILE,   // 私钥来自文件（开发）
-    HSM     // 私钥在 HSM 中经 PKCS#11（量产）
+/// TLS 版本 (CR-005 §3.1)
+enum class TlsVersion : uint8_t {
+    TLS_1_2 = 0,
+    TLS_1_3 = 1
 };
+
+/// 持续时间类型 (CR-005 §3.1)
+using Duration = std::chrono::milliseconds;
 
 /// 消息投递状态
 enum class MessageState {
@@ -40,25 +44,49 @@ enum class MessageState {
 // daemon 内部配置/状态 (设计 §3)
 // ============================================================
 
-/// 连接配置 (设计 §3)
+/// 连接配置 (设计 §3, CR-005 §3.1)
 /// 静态项经 framework-config（只读）；可更新项（broker_host/broker_port）经 framework-store。
+/// 凭据相关字段已移除：root_ca_ref/tls_cert_ref/tls_key_ref/key_source 不再存在，
+/// TLS 凭据全部经 tbox::sec_client 获取 (CR-005 §1)。
 struct ConnectionConfig {
     // --- 可经 framework-store 更新 (source=OTA) ---
     std::string broker_host;
     uint16_t broker_port = 8883;
     // --- 静态经 framework-config (只读) ---
-    std::string root_ca_ref;
-    std::string client_id;  // VIN + SN
+    std::string credential_profile;  // fixed: mqtt (CR-005 §3.1)
+    std::string client_id;           // hsm_uid (VIN + SN)
+    TlsVersion min_tls_version = TlsVersion::TLS_1_2;
+    TlsVersion max_tls_version = TlsVersion::TLS_1_3;
+    Duration handshake_timeout{10000};  // ms (CR-005 §3.1)
     uint16_t keepalive = 60;
     bool clean_start = false;
     uint32_t session_expiry = 3600;
-    std::string tls_cert_ref;   // 证书文件路径 / SEC 句柄引用
-    std::string tls_key_ref;    // 文件路径或 PKCS#11 URI
-    KeySource key_source = KeySource::FILE;
-    std::string username;
-    std::string password;
+    std::string username;   // 可选，默认 mTLS 认证
+    std::string password;   // 可选，默认 mTLS 认证
     enum class Source : uint8_t { FACTORY, OTA } source = Source::FACTORY;
     uint32_t version = 0;
+};
+
+/// 运行时 TLS 凭据 (CR-005 §3.2)
+/// 仅存在于 MQTT 进程内存，不进入 framework-store、离线队列或文件系统。
+/// private_key_ref 生命周期不超过当前 SEC boot epoch 和 credential version。
+struct ActiveTlsCredential {
+    std::string credential_id;
+    uint64_t version = 0;
+    tbox::sec::TlsCredentialStatus status = tbox::sec::TlsCredentialStatus::NOT_READY;
+    std::vector<uint8_t> root_ca_bundle;       // DER bundle (一个或多个受信根/中间 CA)
+    std::vector<uint8_t> client_cert_chain;    // DER, leaf -> intermediate
+    tbox::sec::OpaqueKeyRef private_key_ref;   // 不透明引用，不得记录/序列化/跨重启复用
+    tbox::sec::KeyAlgorithm key_algorithm = tbox::sec::KeyAlgorithm::UNKNOWN;  // 适配器算法校验 (CR-005 §5.2)
+    int64_t not_before = 0;  // unix epoch 秒
+    int64_t not_after = 0;   // unix epoch 秒
+    bool ready = false;      // status == READY 且 bundle 完整
+};
+
+/// 凭据轮询退避配置 (CR-005 §8)
+struct CredentialPollConfig {
+    Duration initial_backoff{1000};   // ms
+    Duration max_backoff{60000};      // ms
 };
 
 /// 连接状态跟踪 (设计 §3，运行时可变，经 framework-store 持久化)
