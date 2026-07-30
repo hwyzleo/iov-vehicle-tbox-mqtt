@@ -56,6 +56,17 @@ public:
     /// 允许一次传输重试。
     ConnectionState getConnectionState();
 
+    // ---- CR-007 §4: 订阅快照与 Cloud Readiness ----
+    /// 原子提交完整订阅快照。ACCEPTED 仅表示 MQTT daemon 已接受本地投影，
+    /// 不等于 Broker SUBACK 或 Cloud Ready。
+    ReplaceSnapshotResult replaceSubscriptionSnapshot(const OwnerSubscriptionSnapshot& snapshot);
+
+    /// 查询指定 owner/generation 的接受状态（响应丢失后幂等收敛）
+    SnapshotStatusResult getSubscriptionSnapshotStatus(const std::string& owner, uint64_t generation);
+
+    /// Cloud Ready 诊断查询
+    SubscriptionReadiness getSubscriptionReadiness();
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

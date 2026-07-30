@@ -5,6 +5,12 @@
 #include "tbox/mqtt/ipc_protocol.h"
 #include "mqtt_ipc_dispatcher.h"
 #include "mqtt_dispatch_queue.h"
+#include "owner_snapshot_registry.h"
+#include "effective_subscription_table.h"
+#include "startup_subscription_gate.h"
+#include "applied_subscription_manifest.h"
+#include "broker_subscription_reconciler.h"
+#include "cloud_readiness_gate.h"
 #include "store.h"
 #include "ipc.h"
 #include <functional>
@@ -27,7 +33,7 @@ class ProvisionIdentityManager;
 ///
 /// 拥有 Broker 连接、QoS/PUBACK、离线队列和路由业务状态；
 /// 通过 framework-ipc Server 对外提供 publish/subscribe/route/state 接口。
-class MqttService : public MqttIpcDispatcher::ServiceHandler {
+class MqttService : public MqttIpcDispatcher::ServiceHandler, public BrokerOperations {
 public:
     MqttService();
     ~MqttService();
@@ -85,6 +91,15 @@ public:
     std::pair<int32_t, bool> onUnsubscribe(int client_fd) override;
     std::pair<int32_t, bool> onRegisterRoute(const RouteEntry& entry) override;
     std::string onGetConnectionState() override;
+    // ---- CR-007 §4: 订阅快照与 Cloud Readiness ----
+    ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot& snapshot) override;
+    SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+        const std::string& owner, uint64_t generation) override;
+    SubscriptionReadiness onGetSubscriptionReadiness() override;
+    // ---- BrokerOperations (CR-007 §8, reconciler 调用) ----
+    bool brokerSubscribe(const std::string& topic, uint8_t qos) override;
+    bool brokerUnsubscribe(const std::string& topic) override;
 
 private:
     // Connection state changed callback
@@ -121,6 +136,25 @@ private:
 
     // CR-006 §7: 连接构造时捕获的身份 generation，CONNACK 后核对
     uint64_t connect_identity_generation_ = 0;
+
+    // ---- CR-007 §2 订阅快照与 Cloud Readiness 组件 ----
+    std::unique_ptr<OwnerSnapshotRegistry> snapshot_registry_;
+    std::unique_ptr<EffectiveSubscriptionTable> effective_table_;
+    std::unique_ptr<StartupSubscriptionGate> subscription_gate_;
+    std::unique_ptr<BrokerSubscriptionReconciler> reconciler_;
+    std::unique_ptr<AppliedSubscriptionManifestStore> manifest_store_;
+    std::unique_ptr<CloudReadinessGate> cloud_ready_gate_;
+    SubscriptionConfig subscription_config_;
+    bool ipc_started_ = false;  // CR-007 §6: IPC Server 先于首次 CONNECT
+
+    // CR-007 辅助
+    void onSnapshotAccepted(const std::string& owner, bool registration_complete);
+    void reconcileSubscriptions();
+    void evaluateCloudReadiness();
+    void publishCloudReadyEvent(bool ready, uint32_t mandatory_active,
+                                uint32_t mandatory_total, const std::string& reason);
+    void refreshUpstreamRoutes();
+    void checkStartupGate();
 };
 
 } // namespace mqtt

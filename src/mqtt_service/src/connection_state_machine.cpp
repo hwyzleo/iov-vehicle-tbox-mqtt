@@ -44,7 +44,11 @@ void ConnectionStateMachine::start() {
         if (state_info_.state == ConnectionState::CONNECTED ||
             state_info_.state == ConnectionState::CONNECTING ||
             state_info_.state == ConnectionState::RECONNECTING ||
-            state_info_.state == ConnectionState::CERT_WAIT) {
+            state_info_.state == ConnectionState::CERT_WAIT ||
+            state_info_.state == ConnectionState::SUBSCRIPTION_WAIT ||
+            state_info_.state == ConnectionState::SUBSCRIBING ||
+            state_info_.state == ConnectionState::CLOUD_READY ||
+            state_info_.state == ConnectionState::CONNECTED_DEGRADED) {
             state_info_.state = ConnectionState::PROV_WAIT;
             state_info_.last_error = "Restarted, re-entering PROV_WAIT";
             state_info_.retry_count = 0;
@@ -97,15 +101,16 @@ void ConnectionStateMachine::setMaxRetries(uint32_t max_retries) {
 }
 
 void ConnectionStateMachine::onCertificateReady() {
+    // CR-007 §7: CERT_WAIT -> SUBSCRIPTION_WAIT（等待 required owner 完整快照）
     StateChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_info_.state == ConnectionState::CERT_WAIT) {
             credential_poll_count_ = 0;  // CR-005 §6: 重置退避计数
-            cb = transitionTo(ConnectionState::CONNECTING);
+            cb = transitionTo(ConnectionState::SUBSCRIPTION_WAIT);
         }
     }
-    if (cb) cb(ConnectionState::CONNECTING);
+    if (cb) cb(ConnectionState::SUBSCRIPTION_WAIT);
 }
 
 void ConnectionStateMachine::onConnectionSuccess() {
@@ -180,7 +185,10 @@ void ConnectionStateMachine::onDisconnect() {
     StateChangeCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_info_.state == ConnectionState::CONNECTED) {
+        if (state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::SUBSCRIBING ||
+            state_info_.state == ConnectionState::CLOUD_READY ||
+            state_info_.state == ConnectionState::CONNECTED_DEGRADED) {
             state_info_.last_error = "Connection disconnected";
             state_info_.retry_count++;
             cb = transitionTo(ConnectionState::RECONNECTING);
@@ -347,6 +355,117 @@ void ConnectionStateMachine::onCredentialPollTimeout() {
         }
     }
     if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+// ============================================================
+// CR-007 §7: 订阅门闩与 Cloud Ready 事件
+// ============================================================
+
+void ConnectionStateMachine::onGateSatisfied() {
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::SUBSCRIPTION_WAIT) {
+            degraded_ = false;  // 门闩真正满足，清除降级
+            cb = transitionTo(ConnectionState::CONNECTING);
+        }
+    }
+    if (cb) cb(ConnectionState::CONNECTING);
+}
+
+void ConnectionStateMachine::onGateTimeout() {
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::SUBSCRIPTION_WAIT) {
+            degraded_ = true;  // 门闩超时，不得 Cloud Ready (CR-007 §6)
+            cb = transitionTo(ConnectionState::CONNECTING);
+        }
+    }
+    if (cb) cb(ConnectionState::CONNECTING);
+}
+
+void ConnectionStateMachine::onSubscribing() {
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CONNECTED_DEGRADED) {
+            cb = transitionTo(ConnectionState::SUBSCRIBING);
+        }
+    }
+    if (cb) cb(ConnectionState::SUBSCRIBING);
+}
+
+void ConnectionStateMachine::onSubscriptionsReady() {
+    StateChangeCallback cb;
+    ConnectionState target;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::SUBSCRIBING ||
+            state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CONNECTED_DEGRADED) {
+            // degraded 时不得 Cloud Ready，保持降级 (CR-007 §6)
+            target = degraded_ ? ConnectionState::CONNECTED_DEGRADED
+                               : ConnectionState::CLOUD_READY;
+            cb = transitionTo(target);
+        }
+    }
+    if (cb) cb(target);
+}
+
+void ConnectionStateMachine::onMandatoryFailed(const std::string& reason) {
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::SUBSCRIBING ||
+            state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CLOUD_READY) {
+            state_info_.last_error = reason;
+            cb = transitionTo(ConnectionState::CONNECTED_DEGRADED);
+        }
+    }
+    if (cb) cb(ConnectionState::CONNECTED_DEGRADED);
+}
+
+void ConnectionStateMachine::onCloudReadyLost() {
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CLOUD_READY) {
+            cb = transitionTo(ConnectionState::SUBSCRIBING);
+        }
+    }
+    if (cb) cb(ConnectionState::SUBSCRIBING);
+}
+
+bool ConnectionStateMachine::isDegraded() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return degraded_;
+}
+
+void ConnectionStateMachine::setDegraded(bool d) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    degraded_ = d;
+}
+
+void ConnectionStateMachine::setSubscriptionGateDeadline(
+        std::chrono::steady_clock::time_point deadline) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    subscription_gate_deadline_ = deadline;
+    timer_cv_.notify_all();
+}
+
+void ConnectionStateMachine::onSubscriptionGateTimeout() {
+    // CR-007 §6: 门闩超时，通知上层检查（同状态回调）
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::SUBSCRIPTION_WAIT) {
+            cb = callback_;
+        }
+    }
+    if (cb) cb(ConnectionState::SUBSCRIPTION_WAIT);
 }
 
 uint64_t ConnectionStateMachine::getConnectionGeneration() const {
@@ -521,13 +640,29 @@ void ConnectionStateMachine::timerLoop() {
             lock.unlock();
             onProvisionPollTimeout();
             lock.lock();
+        } else if (state_info_.state == ConnectionState::SUBSCRIPTION_WAIT) {
+            // CR-007 §6: SUBSCRIPTION_WAIT 门闩超时定时器
+            auto wake_time = subscription_gate_deadline_;
+            bool predicate_changed = timer_cv_.wait_until(lock, wake_time, [this] {
+                return !timer_running_ ||
+                       state_info_.state != ConnectionState::SUBSCRIPTION_WAIT;
+            });
+
+            if (!timer_running_) break;
+            if (predicate_changed) continue; // State changed externally (gate satisfied)
+
+            // Timeout expired and state is still SUBSCRIPTION_WAIT -> trigger gate check.
+            lock.unlock();
+            onSubscriptionGateTimeout();
+            lock.lock();
         } else {
             // Not in RECONNECTING or CERT_WAIT; sleep until state changes or we stop
             timer_cv_.wait(lock, [this] {
                 return !timer_running_ ||
                        state_info_.state == ConnectionState::RECONNECTING ||
                        state_info_.state == ConnectionState::CERT_WAIT ||
-                       state_info_.state == ConnectionState::PROV_WAIT;
+                       state_info_.state == ConnectionState::PROV_WAIT ||
+                       state_info_.state == ConnectionState::SUBSCRIPTION_WAIT;
             });
         }
     }

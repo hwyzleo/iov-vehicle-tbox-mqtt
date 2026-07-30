@@ -85,6 +85,16 @@ std::string MqttIpcDispatcher::dispatch(uint32_t method_id,
             case ipc::MethodId::GET_CONNECTION_STATE:
                 result = handleGetConnectionState();
                 break;
+            // CR-007 §4
+            case ipc::MethodId::REPLACE_SUBSCRIPTION_SNAPSHOT:
+                result = handleReplaceSubscriptionSnapshot(params_json);
+                break;
+            case ipc::MethodId::GET_SUBSCRIPTION_SNAPSHOT_STATUS:
+                result = handleGetSubscriptionSnapshotStatus(params_json);
+                break;
+            case ipc::MethodId::GET_SUBSCRIPTION_READINESS:
+                result = handleGetSubscriptionReadiness();
+                break;
             default:
                 MqttLogAdapter::ipc().warn(
                     "mqtt.ipc.unknown_method",
@@ -307,6 +317,92 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetConnectionState() {
         resp["state"] = "UNKNOWN";
         return {0, resp.dump()};
     }
+}
+
+// ============================================================
+// CR-007 §4: 订阅快照与 Cloud Readiness handler
+// ============================================================
+
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleReplaceSubscriptionSnapshot(
+        std::string_view params) {
+    auto j = nlohmann::json::parse(params);
+
+    OwnerSubscriptionSnapshot snapshot;
+    snapshot.owner = j.value("owner", "");
+    snapshot.generation = j.value("generation", 0ULL);
+    snapshot.content_digest = j.value("content_digest", "");
+    snapshot.registration_complete = j.value("registration_complete", false);
+    if (j.contains("items") && j["items"].is_array()) {
+        for (const auto& it : j["items"]) {
+            SubscriptionItem item;
+            item.route_id = it.value("route_id", "");
+            item.topic_template = it.value("topic_template", "");
+            std::string dir = it.value("direction", "UP");
+            snapshotDirectionFromString(dir, item.direction);
+            item.qos = static_cast<uint8_t>(it.value("qos", 1));
+            item.target = it.value("target", "");
+            item.mandatory = it.value("mandatory", false);
+            snapshot.items.push_back(std::move(item));
+        }
+    }
+
+    auto result = service_->onReplaceSubscriptionSnapshot(snapshot);
+
+    // 业务状态码：REJECTED -> MQTT-1010，其余 0
+    int32_t status = (result.status == SnapshotAcceptStatus::REJECTED)
+        ? static_cast<int32_t>(ErrorCode::MQTT_1010) : 0;
+
+    nlohmann::json resp;
+    resp["status"] = snapshotAcceptStatusToString(result.status);
+    resp["accepted_generation"] = result.accepted_generation;
+    resp["rejected_route_ids"] = result.rejected_route_ids;
+    resp["reason_code"] = result.reason_code;
+
+    MqttLogAdapter::subscribe().info(
+        "mqtt.subscription.snapshot.dispatched",
+        "快照提交处理完成",
+        {{"owner", tbox::fw::log::FieldValue::makeString(snapshot.owner)},
+         {"generation", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.generation))},
+         {"status", tbox::fw::log::FieldValue::makeString(snapshotAcceptStatusToString(result.status))},
+         {"item_count", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.items.size()))}}
+    );
+
+    return {status, resp.dump()};
+}
+
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetSubscriptionSnapshotStatus(
+        std::string_view params) {
+    auto j = nlohmann::json::parse(params);
+    std::string owner = j.value("owner", "");
+    uint64_t generation = j.value("generation", 0ULL);
+
+    auto result = service_->onGetSubscriptionSnapshotStatus(owner, generation);
+
+    nlohmann::json resp;
+    resp["status"] = snapshotAcceptStatusToString(result.status);
+    resp["generation"] = result.generation;
+    resp["content_digest"] = result.content_digest;
+    resp["registration_complete"] = result.registration_complete;
+    return {0, resp.dump()};
+}
+
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetSubscriptionReadiness() {
+    auto r = service_->onGetSubscriptionReadiness();
+
+    nlohmann::json resp;
+    resp["cloud_ready"] = r.cloud_ready;
+    resp["subscriptions_ready"] = r.subscriptions_ready;
+    resp["connected"] = r.connected;
+    resp["connection_generation"] = r.connection_generation;
+    nlohmann::json gens = nlohmann::json::object();
+    for (const auto& [owner, gen] : r.owner_generations) {
+        gens[owner] = gen;
+    }
+    resp["owner_generations"] = gens;
+    resp["mandatory_count"] = r.mandatory_count;
+    resp["mandatory_active"] = r.mandatory_active;
+    resp["reason_code"] = r.reason_code;
+    return {0, resp.dump()};
 }
 
 } // namespace mqtt

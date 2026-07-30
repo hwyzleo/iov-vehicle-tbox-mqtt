@@ -49,6 +49,11 @@ public:
     std::string onGetConnectionState() override {
         return R"({"state":"CONNECTED"})";
     }
+    ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot&) override { return ReplaceSnapshotResult{}; }
+    SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+        const std::string&, uint64_t) override { return SnapshotStatusResult{}; }
+    SubscriptionReadiness onGetSubscriptionReadiness() override { return SubscriptionReadiness{}; }
 };
 } // namespace
 

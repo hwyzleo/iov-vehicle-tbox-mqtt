@@ -11,10 +11,18 @@ namespace tbox {
 namespace mqtt {
 
 // Static callback wrappers for mosquitto
-static void on_connect_wrapper(struct mosquitto* mosq, void* userdata, int rc) {
+static void on_connect_with_flags_wrapper(struct mosquitto* mosq, void* userdata,
+                                             int rc, int flags) {
     auto* client = static_cast<MqttClientManager*>(userdata);
     if (client) {
-        client->on_connect(rc);
+        client->on_connect(rc, flags);
+    }
+}
+
+static void on_unsubscribe_wrapper(struct mosquitto* mosq, void* userdata, int mid) {
+    auto* client = static_cast<MqttClientManager*>(userdata);
+    if (client) {
+        client->on_unsubscribe(mid);
     }
 }
 
@@ -91,11 +99,12 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
             return false;
         }
 
-        mosquitto_connect_callback_set(mosq_, on_connect_wrapper);
+        mosquitto_connect_with_flags_callback_set(mosq_, on_connect_with_flags_wrapper);
         mosquitto_disconnect_callback_set(mosq_, on_disconnect_wrapper);
         mosquitto_message_callback_set(mosq_, on_message_wrapper);
         mosquitto_publish_callback_set(mosq_, on_publish_wrapper);
         mosquitto_subscribe_callback_set(mosq_, on_subscribe_wrapper);
+        mosquitto_unsubscribe_callback_set(mosq_, on_unsubscribe_wrapper);
     }
 
     // Configure TLS via SEC credential (CR-005 §5)
@@ -327,13 +336,16 @@ SubscribeResult MqttClientManager::subscribe(const std::string& topic, QoS qos) 
         return result;
     }
 
+    int mid = 0;
     int rc = mosquitto_subscribe(mosq_,
-                                nullptr,
+                                &mid,
                                 topic.c_str(),
                                 static_cast<int>(qos));
 
     if (rc == MOSQ_ERR_SUCCESS) {
         result.status = true;
+        std::lock_guard<std::mutex> lock(ack_mutex_);
+        pending_subscribe_mids_[mid] = topic;
     } else {
         result.status = false;
         result.error = ErrorCode::MQTT_1008;
@@ -359,11 +371,17 @@ SubscribeResult MqttClientManager::subscribe(const std::string& topic, QoS qos) 
 bool MqttClientManager::unsubscribe(const std::string& topic) {
     if (!mosq_ || !connected_) return false;
 
+    int mid = 0;
     int rc = mosquitto_unsubscribe(mosq_,
-                                  nullptr,
+                                  &mid,
                                   topic.c_str());
 
-    return rc == MOSQ_ERR_SUCCESS;
+    if (rc == MOSQ_ERR_SUCCESS) {
+        std::lock_guard<std::mutex> lock(ack_mutex_);
+        pending_unsubscribe_mids_[mid] = topic;
+        return true;
+    }
+    return false;
 }
 
 void MqttClientManager::setMessageCallback(MessageCallback callback) {
@@ -382,8 +400,9 @@ void MqttClientManager::setLwtConfig(const LwtConfig& lwt_config) {
     lwt_config_ = lwt_config;
 }
 
-void MqttClientManager::on_connect(int rc) {
+void MqttClientManager::on_connect(int rc, int flags) {
     connected_ = (rc == 0);
+    session_present_ = (flags & 0x01) != 0;  // MQTT_CONNECT_FLAG_SESSION_PRESENT
     if (connected_) {
         // mqtt.connection.established event (CR-003 §4)
         MqttLogAdapter::connection().info(
@@ -442,13 +461,51 @@ void MqttClientManager::on_publish(int mid) {
     // This callback confirms the publish was received by broker
 }
 
+void MqttClientManager::setSubscribeAckCallback(SubscribeAckCallback callback) {
+    subscribe_ack_callback_ = std::move(callback);
+}
+
+void MqttClientManager::setUnsubscribeAckCallback(SubscribeAckCallback callback) {
+    unsubscribe_ack_callback_ = std::move(callback);
+}
+
 void MqttClientManager::on_subscribe(int mid, int qos_count, const int* granted_qos) {
-    // Subscription confirmed by broker
+    std::string topic;
+    {
+        std::lock_guard<std::mutex> lock(ack_mutex_);
+        auto it = pending_subscribe_mids_.find(mid);
+        if (it != pending_subscribe_mids_.end()) {
+            topic = it->second;
+            pending_subscribe_mids_.erase(it);
+        }
+    }
+    // success: granted_qos 不含 0x80 (Subscription Ack failure)
+    bool success = (qos_count > 0 && granted_qos != nullptr && (granted_qos[0] & 0x80) == 0);
+    if (!topic.empty() && subscribe_ack_callback_) {
+        subscribe_ack_callback_(topic, success);
+    }
     MqttLogAdapter::subscribe().debug(
         "mqtt.subscribe.acknowledged",
         "订阅确认",
-        {{"mid", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(mid))}}
+        {{"mid", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(mid))},
+         {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+         {"success", tbox::fw::log::FieldValue::makeBool(success)}}
     );
+}
+
+void MqttClientManager::on_unsubscribe(int mid) {
+    std::string topic;
+    {
+        std::lock_guard<std::mutex> lock(ack_mutex_);
+        auto it = pending_unsubscribe_mids_.find(mid);
+        if (it != pending_unsubscribe_mids_.end()) {
+            topic = it->second;
+            pending_unsubscribe_mids_.erase(it);
+        }
+    }
+    if (!topic.empty() && unsubscribe_ack_callback_) {
+        unsubscribe_ack_callback_(topic, true);
+    }
 }
 
 } // namespace mqtt

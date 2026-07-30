@@ -85,6 +85,7 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
 
     // Read offline queue config
     offline_queue_config_ = readOfflineQueueConfig();
+    subscription_config_ = readSubscriptionConfig();
 
     MqttLogAdapter::ipc().info(
         "mqtt.config.loaded",
@@ -240,6 +241,11 @@ OfflineQueueConfig ConfigManager::getOfflineQueueConfig() const {
     return offline_queue_config_;
 }
 
+SubscriptionConfig ConfigManager::getSubscriptionConfig() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return subscription_config_;
+}
+
 void ConfigManager::notifyChange() {
     if (change_callback_) {
         change_callback_();
@@ -257,6 +263,28 @@ OfflineQueueConfig ConfigManager::readOfflineQueueConfig() const {
         config.path = queue_section->getString("path", config.path);
         config.max_size = static_cast<size_t>(queue_section->getInt("max_size", static_cast<int>(config.max_size)));
         config.drop_policy = queue_section->getString("drop_policy", config.drop_policy);
+    }
+
+    return config;
+}
+
+SubscriptionConfig ConfigManager::readSubscriptionConfig() const {
+    SubscriptionConfig config;
+    if (!config_snapshot_) {
+        return config;
+    }
+
+    auto subs_section = config_snapshot_->getSection("mqtt.subscriptions");
+    if (subs_section) {
+        config.required_owners = subs_section->getStringList("required_owners");
+        config.startup_wait_timeout_ms = Duration(
+            subs_section->getInt("startup_wait_timeout_ms", 5000));
+        config.reconcile_timeout_ms = Duration(
+            subs_section->getInt("reconcile_timeout_ms", 10000));
+        config.suback_retry_max = static_cast<uint32_t>(
+            subs_section->getInt("suback_retry_max", 3));
+        config.owner_lease_ms = static_cast<uint64_t>(
+            subs_section->getInt("owner_lease_ms", 0));
     }
 
     return config;

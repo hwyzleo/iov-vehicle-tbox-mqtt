@@ -39,9 +39,13 @@ public:
     // Get offline queue config (sourced from framework-config)
     OfflineQueueConfig getOfflineQueueConfig() const;
 
+    // Get subscription snapshot config (CR-007 §6)
+    SubscriptionConfig getSubscriptionConfig() const;
+
 private:
     void notifyChange();
     OfflineQueueConfig readOfflineQueueConfig() const;
+    SubscriptionConfig readSubscriptionConfig() const;
 
     ConnectionConfig current_config_;
     uint32_t current_version_ = 0;
@@ -49,6 +53,7 @@ private:
     std::shared_ptr<hwyz::store::Store> store_;
     std::shared_ptr<const hwyz::config::ImmutableConfigView> config_snapshot_;
     OfflineQueueConfig offline_queue_config_;
+    SubscriptionConfig subscription_config_;
     mutable std::mutex mutex_;
 };
 

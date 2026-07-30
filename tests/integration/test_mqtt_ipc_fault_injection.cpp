@@ -28,6 +28,11 @@ public:
     std::pair<int32_t, bool> onUnsubscribe(int) override { return {0, true}; }
     std::pair<int32_t, bool> onRegisterRoute(const RouteEntry&) override { return {0, true}; }
     std::string onGetConnectionState() override { return R"({"state":"INIT"})"; }
+    ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot&) override { return ReplaceSnapshotResult{}; }
+    SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+        const std::string&, uint64_t) override { return SnapshotStatusResult{}; }
+    SubscriptionReadiness onGetSubscriptionReadiness() override { return SubscriptionReadiness{}; }
 };
 
 struct ServerCtx {

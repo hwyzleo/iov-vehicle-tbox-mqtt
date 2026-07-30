@@ -135,6 +135,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialInvalidTransition) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 
     sm.onCredentialInvalid("SEC-1011: credential invalid");
@@ -147,6 +148,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialChangedFromConnected) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionSuccess();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
 
@@ -160,6 +162,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialStateChangedFromReconnecting
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionFailure("network error");
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
 
@@ -183,6 +186,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialChangedFromConnecting) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 
     sm.onCredentialChanged();

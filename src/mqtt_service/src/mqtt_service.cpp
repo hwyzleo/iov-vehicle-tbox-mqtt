@@ -36,7 +36,13 @@ MqttService::MqttService()
       cache_queue_(std::make_unique<OfflineCacheQueue>(1000)),
       route_bridge_(std::make_unique<RouteBridge>()),
       config_manager_(std::make_unique<ConfigManager>()),
-      tls_adapter_(std::make_unique<SecTlsKeyAdapter>()) {
+      tls_adapter_(std::make_unique<SecTlsKeyAdapter>()),
+      snapshot_registry_(std::make_unique<OwnerSnapshotRegistry>()),
+      effective_table_(std::make_unique<EffectiveSubscriptionTable>()),
+      subscription_gate_(std::make_unique<StartupSubscriptionGate>()),
+      reconciler_(std::make_unique<BrokerSubscriptionReconciler>()),
+      manifest_store_(std::make_unique<AppliedSubscriptionManifestStore>()),
+      cloud_ready_gate_(std::make_unique<CloudReadinessGate>()) {
 }
 
 MqttService::~MqttService() {
@@ -187,6 +193,61 @@ bool MqttService::initialize(std::shared_ptr<ProvisionIdentityManager> prov_mgr,
             );
             client_manager_->connect(config);
         });
+
+    // CR-007 §2: 订阅快照与 Cloud Readiness 组件初始化
+    manifest_store_->setStore(store_);
+    subscription_config_ = config_manager_->getSubscriptionConfig();
+    subscription_gate_->configure(subscription_config_.required_owners,
+                                  subscription_config_.startup_wait_timeout_ms);
+    reconciler_->setBrokerOperations(this);
+    reconciler_->setManifestStore(manifest_store_.get());
+    reconciler_->setReconcileTimeout(subscription_config_.reconcile_timeout_ms);
+    reconciler_->setSubackRetryMax(subscription_config_.suback_retry_max);
+    effective_table_->setEcuUid(prov_mgr_->getEcuUid());
+
+    // CR-007 §9: SUBACK/UNSUBACK 回调 -> reconciler -> 评估 Cloud Ready
+    client_manager_->setSubscribeAckCallback(
+        [this](const std::string& topic, bool success) {
+            if (reconciler_) {
+                reconciler_->onSubAck(topic, success);
+                evaluateCloudReadiness();
+            }
+        });
+    client_manager_->setUnsubscribeAckCallback(
+        [this](const std::string& topic, bool success) {
+            if (reconciler_) {
+                reconciler_->onUnsubAck(topic, success);
+                evaluateCloudReadiness();
+            }
+        });
+
+    // CR-007 §10: CloudReadinessGate 回调 -> 发布事件 + 状态机
+    cloud_ready_gate_->setCallback(
+        [this](bool ready, uint32_t ma, uint32_t mt, const std::string& reason) {
+            publishCloudReadyEvent(ready, ma, mt, reason);
+            if (ready && state_machine_->getCurrentState() == ConnectionState::SUBSCRIBING) {
+                state_machine_->onSubscriptionsReady();
+            }
+        });
+
+    // CR-007 §6: IPC Server 先于首次 CONNECT 可用
+    if (!ipc_server_) {
+        MqttIpcConfig ipc_config;
+        auto snap = config_manager_->getSnapshot();
+        if (snap) {
+            auto ipc_section = snap->getSection("mqtt.ipc");
+            if (ipc_section) {
+                ipc_config.socket_path = ipc_section->getString("socket_path", ipc_config.socket_path);
+                ipc_config.dispatch_queue_size = static_cast<uint32_t>(
+                    ipc_section->getInt("dispatch_queue_size", ipc_config.dispatch_queue_size));
+                ipc_config.subscriber_queue_size = static_cast<uint32_t>(
+                    ipc_section->getInt("subscriber_queue_size", ipc_config.subscriber_queue_size));
+                ipc_config.slow_subscriber_policy = ipc_section->getString(
+                    "slow_subscriber_policy", ipc_config.slow_subscriber_policy);
+            }
+        }
+        startIpcServer(ipc_config);
+    }
 
     return true;
 }
@@ -546,6 +607,7 @@ std::string MqttService::onGetConnectionState() {
     j["state"] = connectionStateToString(state_info.state);
     j["last_error"] = state_info.last_error;
     j["retry_count"] = state_info.retry_count;
+    j["cloud_ready"] = cloud_ready_gate_ ? cloud_ready_gate_->isCloudReady() : false;
     return j.dump();
 }
 
@@ -612,6 +674,8 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
     // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
     if (new_state == ConnectionState::PROV_WAIT) {
         if (prov_mgr_->readBinding()) {
+            // CR-007 §5: 身份变化后更新 ecu_uid 用于 Topic 展开
+            effective_table_->setEcuUid(prov_mgr_->getEcuUid());
             state_machine_->onProvisionReady();
         } else {
             auto state_info = state_machine_->getStateInfo();
@@ -645,6 +709,13 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                 }
             );
         }
+    } else if (new_state == ConnectionState::SUBSCRIPTION_WAIT) {
+        // CR-007 §6: 等待 required owner 完整快照（门闩）
+        subscription_gate_->startWait();
+        state_machine_->setSubscriptionGateDeadline(
+            std::chrono::steady_clock::now() +
+            subscription_config_.startup_wait_timeout_ms);
+        checkStartupGate();
     } else if (new_state == ConnectionState::CONNECTING) {
         auto config = config_manager_->getConfig();
         // CR-006 §6: Populate identity-derived fields from PROV binding
@@ -739,18 +810,18 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             }
         }
 
-        auto downstream_routes = route_bridge_->getDownstreamRoutes();
-        if (!downstream_routes.empty()) {
-            MqttLogAdapter::subscribe().info(
-                "mqtt.subscribe.batch_start",
-                "连接恢复，订阅下行路由",
-                {{"route_count", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(downstream_routes.size()))}}
-            );
-        }
-        for (const auto& route : downstream_routes) {
-            client_manager_->subscribe(route.mqtt_topic, route.qos);
-        }
+        // CR-007 §8: CONNACK 后收敛订阅（替代旧的直接 subscribe downstream routes）
+        bool session_present = client_manager_->getSessionPresent();
+        // CR-007 §8.2: reconciler 内部根据 session_present + manifest identity 计算 diff
+        state_machine_->onSubscribing();
+        MqttLogAdapter::subscribe().info(
+            "mqtt.subscription.reconcile.started",
+            "CONNACK 后开始订阅收敛",
+            {{"session_present", tbox::fw::log::FieldValue::makeBool(session_present)},
+             {"identity_generation", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(connect_identity_generation_))}}
+        );
+        reconcileSubscriptions();
     } else if (new_state == ConnectionState::RECONNECTING) {
         auto state_info = state_machine_->getStateInfo();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -787,6 +858,178 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
         j["state"] = connectionStateToString(new_state);
         ipc_server_->push_event(
             static_cast<uint32_t>(ipc::EventType::CONNECTION_STATE_CHANGED), j.dump());
+    }
+}
+
+// ============================================================
+// CR-007: 订阅快照与 Cloud Readiness 实现
+// ============================================================
+
+ReplaceSnapshotResult MqttService::onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot& snapshot) {
+    if (ipc_reject_new_) {
+        ReplaceSnapshotResult r;
+        r.status = SnapshotAcceptStatus::REJECTED;
+        r.reason_code = "shutting_down";
+        return r;
+    }
+
+    auto result = snapshot_registry_->replaceSnapshot(snapshot);
+
+    if (result.status == SnapshotAcceptStatus::ACCEPTED &&
+        result.reason_code != "idempotent" &&
+        result.reason_code != "stale_generation") {
+        // 重算有效订阅投影
+        effective_table_->recompute(*snapshot_registry_);
+        onSnapshotAccepted(snapshot.owner, snapshot.registration_complete);
+        refreshUpstreamRoutes();
+
+        // 运行中收到新 generation：退出 Cloud Ready 并收敛
+        auto state = state_machine_->getCurrentState();
+        if (state == ConnectionState::CLOUD_READY) {
+            state_machine_->onCloudReadyLost();
+        }
+        if (state == ConnectionState::CLOUD_READY ||
+            state == ConnectionState::SUBSCRIBING ||
+            state == ConnectionState::CONNECTED_DEGRADED) {
+            reconcileSubscriptions();
+        }
+
+        MqttLogAdapter::subscribe().info(
+            "mqtt.subscription.snapshot.accepted",
+            "订阅快照已接受",
+            {{"owner", tbox::fw::log::FieldValue::makeString(snapshot.owner)},
+             {"generation", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(snapshot.generation))},
+             {"item_count", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(snapshot.items.size()))},
+             {"mandatory_count", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(effective_table_->mandatoryCount()))}}
+        );
+    } else if (result.status == SnapshotAcceptStatus::REJECTED) {
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.snapshot.rejected",
+            "订阅快照被拒绝",
+            {{"owner", tbox::fw::log::FieldValue::makeString(snapshot.owner)},
+             {"generation", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(snapshot.generation))},
+             {"reason_code", tbox::fw::log::FieldValue::makeString(result.reason_code)},
+             {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1010")}}
+        );
+    }
+
+    return result;
+}
+
+SnapshotStatusResult MqttService::onGetSubscriptionSnapshotStatus(
+        const std::string& owner, uint64_t generation) {
+    return snapshot_registry_->getSnapshotStatus(owner, generation);
+}
+
+SubscriptionReadiness MqttService::onGetSubscriptionReadiness() {
+    auto r = cloud_ready_gate_->getReadiness();
+    auto all = snapshot_registry_->getAllLatestSnapshots();
+    for (const auto& [owner, snap] : all) {
+        r.owner_generations[owner] = snap.generation;
+    }
+    return r;
+}
+
+bool MqttService::brokerSubscribe(const std::string& topic, uint8_t qos) {
+    auto r = client_manager_->subscribe(topic, static_cast<QoS>(qos));
+    return r.status;
+}
+
+bool MqttService::brokerUnsubscribe(const std::string& topic) {
+    return client_manager_->unsubscribe(topic);
+}
+
+void MqttService::onSnapshotAccepted(const std::string& owner, bool registration_complete) {
+    subscription_gate_->onSnapshotAccepted(owner, registration_complete);
+    if (state_machine_->getCurrentState() == ConnectionState::SUBSCRIPTION_WAIT) {
+        checkStartupGate();
+    }
+}
+
+void MqttService::checkStartupGate() {
+    if (subscription_gate_->isSatisfied()) {
+        state_machine_->onGateSatisfied();
+    } else if (subscription_gate_->isTimedOut()) {
+        auto missing = subscription_gate_->missingOwners();
+        MqttLogAdapter::subscribe().warn(
+            "mqtt.subscription.gate.timeout",
+            "门闩等待超时，降级连接",
+            {{"missing_owner_count", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(missing.size()))},
+             {"timeout_ms", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(subscription_config_.startup_wait_timeout_ms.count()))},
+             {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1011")}}
+        );
+        state_machine_->onGateTimeout();
+    }
+}
+
+void MqttService::reconcileSubscriptions() {
+    if (!reconciler_) return;
+    auto desired = effective_table_->downstreamSnapshot();
+    bool session_present = client_manager_->getSessionPresent();
+    auto config = config_manager_->getConfig();
+    std::string cid_hash = clientIdHash(config.client_id);
+    auto result = reconciler_->reconcile(desired, session_present, cid_hash,
+                                         connect_identity_generation_);
+    MqttLogAdapter::subscribe().info(
+        "mqtt.subscription.reconcile.completed",
+        "订阅收敛完成",
+        {{"session_present", tbox::fw::log::FieldValue::makeBool(session_present)},
+         {"manifest_valid", tbox::fw::log::FieldValue::makeBool(result.manifest_valid)},
+         {"subscribe_count", tbox::fw::log::FieldValue::makeInt(result.subscribe_count)},
+         {"unsubscribe_count", tbox::fw::log::FieldValue::makeInt(result.unsubscribe_count)},
+         {"active_count", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(reconciler_->activeTopics().size()))}}
+    );
+    evaluateCloudReadiness();
+}
+
+void MqttService::evaluateCloudReadiness() {
+    if (!reconciler_ || !cloud_ready_gate_) return;
+    bool ready = reconciler_->isConverged();
+    uint32_t ma = reconciler_->mandatoryActive();
+    uint32_t mt = reconciler_->mandatoryTotal();
+    cloud_ready_gate_->onSubscriptionsReady(ready, ma, mt);
+}
+
+void MqttService::publishCloudReadyEvent(bool ready, uint32_t mandatory_active,
+                                         uint32_t mandatory_total, const std::string& reason) {
+    if (ipc_server_) {
+        nlohmann::json j;
+        j["ready"] = ready;
+        j["mandatory_count"] = mandatory_total;
+        j["mandatory_active"] = mandatory_active;
+        j["reason_code"] = reason;
+        ipc_server_->push_event(
+            static_cast<uint32_t>(ipc::EventType::CLOUD_READY_CHANGED), j.dump());
+    }
+    MqttLogAdapter::connection().info(
+        "mqtt.cloud_ready.changed",
+        ready ? "Cloud Ready 达成" : "Cloud Ready 丢失",
+        {{"ready", tbox::fw::log::FieldValue::makeBool(ready)},
+         {"mandatory_count", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(mandatory_total))},
+         {"reason_code", tbox::fw::log::FieldValue::makeString(reason)}}
+    );
+}
+
+void MqttService::refreshUpstreamRoutes() {
+    // CR-007 §5: 上行路由（UP/BIDIRECTIONAL）注册到 RouteBridge（发布用）
+    auto routes = effective_table_->upstreamRoutes();
+    route_bridge_->clear();
+    for (const auto& r : routes) {
+        RouteEntry entry;
+        entry.internal_addr = r.internal_addr;
+        entry.mqtt_topic = r.mqtt_topic;
+        entry.direction = RouteEntry::Direction::UP;
+        entry.qos = static_cast<QoS>(r.qos);
+        route_bridge_->registerRoute(entry);
     }
 }
 

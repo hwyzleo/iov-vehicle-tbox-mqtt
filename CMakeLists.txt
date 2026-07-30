@@ -90,6 +90,13 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
     src/mqtt_service/src/mqtt_retry_policy.cpp
     src/mqtt_service/src/mqtt_dispatch_queue.cpp
+    # CR-007 §2 订阅快照与 Cloud Readiness 组件
+    src/mqtt_service/src/owner_snapshot_registry.cpp
+    src/mqtt_service/src/effective_subscription_table.cpp
+    src/mqtt_service/src/startup_subscription_gate.cpp
+    src/mqtt_service/src/applied_subscription_manifest.cpp
+    src/mqtt_service/src/broker_subscription_reconciler.cpp
+    src/mqtt_service/src/cloud_readiness_gate.cpp
 )
 
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})

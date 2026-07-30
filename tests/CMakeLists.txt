@@ -258,6 +258,76 @@ add_test(NAME MqttIpcBackpressureTest COMMAND test_mqtt_ipc_backpressure)
 add_test(NAME MqttIpcFaultInjectionTest COMMAND test_mqtt_ipc_fault_injection)
 
 # ============================================================
+# CR-007 Subscription snapshot integration test
+# ============================================================
+add_executable(test_mqtt_subscription_snapshot
+    integration/test_mqtt_subscription_snapshot.cpp
+)
+target_include_directories(test_mqtt_subscription_snapshot PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_directories(test_mqtt_subscription_snapshot PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_subscription_snapshot mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
+add_test(NAME MqttSubscriptionSnapshotTest COMMAND test_mqtt_subscription_snapshot)
+
+# ============================================================
+# CR-007 Subscription snapshot & Cloud Readiness unit tests
+# ============================================================
+
+add_executable(test_owner_snapshot_registry
+    unit/test_owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+)
+target_include_directories(test_owner_snapshot_registry PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_owner_snapshot_registry GTest::gtest_main pthread)
+
+add_executable(test_effective_subscription_table
+    unit/test_effective_subscription_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_subscription_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+)
+target_include_directories(test_effective_subscription_table PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_effective_subscription_table GTest::gtest_main pthread)
+
+add_executable(test_startup_subscription_gate
+    unit/test_startup_subscription_gate.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/startup_subscription_gate.cpp
+)
+target_include_directories(test_startup_subscription_gate PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_startup_subscription_gate GTest::gtest_main pthread)
+
+add_executable(test_applied_subscription_manifest
+    unit/test_applied_subscription_manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/applied_subscription_manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_applied_subscription_manifest PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_applied_subscription_manifest GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
+add_executable(test_cloud_readiness_gate
+    unit/test_cloud_readiness_gate.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/cloud_readiness_gate.cpp
+)
+target_include_directories(test_cloud_readiness_gate PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_cloud_readiness_gate GTest::gtest_main pthread)
+
+add_executable(test_broker_subscription_reconciler
+    unit/test_broker_subscription_reconciler.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/broker_subscription_reconciler.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/applied_subscription_manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_broker_subscription_reconciler PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_broker_subscription_reconciler GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
+add_test(NAME OwnerSnapshotRegistryTest COMMAND test_owner_snapshot_registry)
+add_test(NAME EffectiveSubscriptionTableTest COMMAND test_effective_subscription_table)
+add_test(NAME StartupSubscriptionGateTest COMMAND test_startup_subscription_gate)
+add_test(NAME AppliedSubscriptionManifestTest COMMAND test_applied_subscription_manifest)
+add_test(NAME CloudReadinessGateTest COMMAND test_cloud_readiness_gate)
+add_test(NAME BrokerSubscriptionReconcilerTest COMMAND test_broker_subscription_reconciler)
+
+# ============================================================
 # Log tests (CR-003 §7)
 # ============================================================
 

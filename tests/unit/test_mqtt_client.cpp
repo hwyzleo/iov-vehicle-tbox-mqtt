@@ -32,6 +32,18 @@ public:
     std::string onGetConnectionState() override {
         return R"({"state":"CONNECTED","last_error":"","retry_count":0})";
     }
+    // CR-007 §4 stub
+    ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot&) override {
+        return ReplaceSnapshotResult{};
+    }
+    SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+        const std::string&, uint64_t) override {
+        return SnapshotStatusResult{};
+    }
+    SubscriptionReadiness onGetSubscriptionReadiness() override {
+        return SubscriptionReadiness{};
+    }
 };
 
 class MqttClientTest : public ::testing::Test {

@@ -65,6 +65,26 @@ public:
     /// PROV_WAIT 退避超时，重新读取绑定
     void onProvisionPollTimeout();
 
+    // ---- CR-007 §7: 订阅门闩与 Cloud Ready 事件 ----
+    /// 门闩满足：SUBSCRIPTION_WAIT -> CONNECTING
+    void onGateSatisfied();
+    /// 门闩超时：SUBSCRIPTION_WAIT -> CONNECTING（标记 degraded，不得 Cloud Ready）
+    void onGateTimeout();
+    /// CONNACK 后需收敛：CONNECTED -> SUBSCRIBING
+    void onSubscribing();
+    /// Mandatory 全部 ACTIVE：SUBSCRIBING/CONNECTED/DEGRADED -> CLOUD_READY
+    void onSubscriptionsReady();
+    /// Mandatory 失败/超时：-> CONNECTED_DEGRADED
+    void onMandatoryFailed(const std::string& reason);
+    /// Cloud Ready 丢失（新 generation/mandatory 变化）：CLOUD_READY -> SUBSCRIBING
+    void onCloudReadyLost();
+    bool isDegraded() const;
+    void setDegraded(bool d);
+
+    // CR-007 §6: 门闩超时定时
+    void setSubscriptionGateDeadline(std::chrono::steady_clock::time_point deadline);
+    void onSubscriptionGateTimeout();
+
     // ---- CR-005 §7: connection generation ----
     uint64_t getConnectionGeneration() const;
     void invalidateConnectionGeneration();
@@ -97,8 +117,14 @@ private:
     uint32_t provision_poll_count_ = 0;
     std::chrono::steady_clock::time_point next_provision_poll_at_;
 
+    // CR-007 §6: SUBSCRIPTION_WAIT 门闩超时 deadline
+    std::chrono::steady_clock::time_point subscription_gate_deadline_;
+
     // CR-005 §7: connection generation（凭据变化时递增，阻止旧 callback 重入 CONNECTED）
     uint64_t connection_generation_ = 0;
+
+    // CR-007 §7: 门闩超时降级标记（不得发布 Cloud Ready）
+    bool degraded_ = false;
 
     std::thread timer_thread_;
     std::condition_variable timer_cv_;

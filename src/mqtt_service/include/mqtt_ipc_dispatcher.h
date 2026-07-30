@@ -45,6 +45,15 @@ public:
         virtual std::pair<int32_t, bool> onRegisterRoute(const RouteEntry& entry) = 0;
         /// getConnectionState：只读连接状态，返回 JSON 片段
         virtual std::string onGetConnectionState() = 0;
+        // ---- CR-007 §4: 订阅快照与 Cloud Readiness ----
+        /// replaceSubscriptionSnapshot：原子接受/拒绝完整快照
+        virtual ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+            const OwnerSubscriptionSnapshot& snapshot) = 0;
+        /// getSubscriptionSnapshotStatus：幂等查询接受状态
+        virtual SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+            const std::string& owner, uint64_t generation) = 0;
+        /// getSubscriptionReadiness：Cloud Ready 诊断
+        virtual SubscriptionReadiness onGetSubscriptionReadiness() = 0;
     };
 
     explicit MqttIpcDispatcher(ServiceHandler* service);
@@ -73,6 +82,10 @@ private:
     std::pair<int32_t, std::string> handleUnsubscribe(int client_fd);
     std::pair<int32_t, std::string> handleRegisterRoute(std::string_view params);
     std::pair<int32_t, std::string> handleGetConnectionState();
+    // CR-007 §4
+    std::pair<int32_t, std::string> handleReplaceSubscriptionSnapshot(std::string_view params);
+    std::pair<int32_t, std::string> handleGetSubscriptionSnapshotStatus(std::string_view params);
+    std::pair<int32_t, std::string> handleGetSubscriptionReadiness();
 
     // per-fd 订阅集合（client 断连时清理，CR-004 §4）
     std::map<int, std::unordered_set<std::string>> fd_subscriptions_;

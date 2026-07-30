@@ -54,6 +54,23 @@ public:
     std::string onGetConnectionState() override {
         return connection_state_json;
     }
+
+    // CR-007 §4 stub
+    ReplaceSnapshotResult last_snapshot_result;
+    SnapshotStatusResult last_snapshot_status;
+    SubscriptionReadiness last_readiness;
+
+    ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot&) override {
+        return last_snapshot_result;
+    }
+    SnapshotStatusResult onGetSubscriptionSnapshotStatus(
+        const std::string&, uint64_t) override {
+        return last_snapshot_status;
+    }
+    SubscriptionReadiness onGetSubscriptionReadiness() override {
+        return last_readiness;
+    }
 };
 
 class MqttIpcDispatcherTest : public ::testing::Test {

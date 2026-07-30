@@ -5,10 +5,13 @@
 // 本头由 daemon (MqttIpcDispatcher) 与 client SDK (tbox::mqtt::Client) 共享，
 // 构成双方的 protocol contract。调用方不接触 method_id、JSON/base64、socket。
 
+#include <cctype>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "tbox/mqtt/errors.h"
 
@@ -34,7 +37,9 @@ enum class Priority : uint8_t {
     CRITICAL = 3
 };
 
-/// 连接状态 (设计 §3, §4.1, CR-006 §4)
+/// 连接状态 (设计 §3, §4.1, CR-006 §4, CR-007 §7)
+/// CR-007 新增 SUBSCRIPTION_WAIT/SUBSCRIBING/CONNECTED_DEGRADED/CLOUD_READY。
+/// 新值追加在 OFFLINE 之后，保证既有枚举数值不变（framework-store int 兼容）。
 enum class ConnectionState {
     INIT,
     PROV_WAIT,
@@ -42,7 +47,12 @@ enum class ConnectionState {
     CONNECTING,
     CONNECTED,
     RECONNECTING,
-    OFFLINE
+    OFFLINE,
+    // ---- CR-007 §7 新增 ----
+    SUBSCRIPTION_WAIT,    // 等待 required owner 完整快照（门闩）
+    SUBSCRIBING,          // CONNACK 后收敛 Broker 订阅
+    CONNECTED_DEGRADED,   // mandatory 失败/门闩超时，连接在但未 Cloud Ready
+    CLOUD_READY           // CONNECTED && SUBSCRIPTIONS_READY
 };
 
 /// 将 ConnectionState 转为可读字符串
@@ -55,6 +65,10 @@ inline std::string connectionStateToString(ConnectionState state) {
         case ConnectionState::CONNECTED:    return "CONNECTED";
         case ConnectionState::RECONNECTING: return "RECONNECTING";
         case ConnectionState::OFFLINE:      return "OFFLINE";
+        case ConnectionState::SUBSCRIPTION_WAIT:  return "SUBSCRIPTION_WAIT";
+        case ConnectionState::SUBSCRIBING:        return "SUBSCRIBING";
+        case ConnectionState::CONNECTED_DEGRADED: return "CONNECTED_DEGRADED";
+        case ConnectionState::CLOUD_READY:        return "CLOUD_READY";
         default: return "UNKNOWN";
     }
 }
@@ -167,6 +181,110 @@ struct ConnectionStateResult {
 /// 下行消息回调（client SDK subscribe 注册）
 using MessageCallback = std::function<void(
     const std::string& topic, const std::vector<uint8_t>& payload)>;
+
+// ============================================================
+// 订阅快照与 Cloud Readiness (CR-007 §3, §4, §10; 对齐 TSP DSN-CR-004 §3, §5)
+// ============================================================
+// 本组 DTO 由 daemon (MqttIpcDispatcher) 与 client SDK (tbox::mqtt::Client) 共享，
+// 构成双方快照 IPC contract。TSP 等业务服务经 client SDK 提交完整版本化快照。
+// digest 由 owner 端规范化生成（如 TSP SnapshotBuilder: route_id|topic_template|
+// DIRECTION|qos|target|mandatory 按 route_id 排序 + SHA-256 hex），MQTT 侧只比对不重算。
+
+/// 订阅方向 (CR-007 §3; TSP DSN-CR-004 §3 含 BIDIRECTIONAL)
+enum class SnapshotDirection : uint8_t {
+    UP            = 0,
+    DOWN          = 1,
+    BIDIRECTIONAL = 2  // 同时上行发布 + 下行订阅
+};
+
+inline std::string snapshotDirectionToString(SnapshotDirection d) {
+    switch (d) {
+        case SnapshotDirection::UP:            return "UP";
+        case SnapshotDirection::DOWN:          return "DOWN";
+        case SnapshotDirection::BIDIRECTIONAL: return "BIDIRECTIONAL";
+        default: return "?";
+    }
+}
+
+/// 方向字符串解析（大小写不敏感，BIDI 为 BIDIRECTIONAL 缩写）
+inline bool snapshotDirectionFromString(std::string_view s, SnapshotDirection& out) {
+    std::string upper;
+    upper.reserve(s.size());
+    for (char c : s) {
+        upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    if (upper == "UP")                              { out = SnapshotDirection::UP;            return true; }
+    if (upper == "DOWN")                            { out = SnapshotDirection::DOWN;          return true; }
+    if (upper == "BIDIRECTIONAL" || upper == "BIDI") { out = SnapshotDirection::BIDIRECTIONAL; return true; }
+    return false;
+}
+
+/// 单条业务订阅项 (CR-007 §3; TSP DSN-CR-004 §3)
+struct SubscriptionItem {
+    std::string route_id;        // owner 内稳定唯一
+    std::string topic_template;  // 保存模板，不固化设备实例值（{ecu_uid} 占位）
+    SnapshotDirection direction = SnapshotDirection::UP;
+    uint8_t qos = 1;             // 0/1/2
+    std::string target;          // 目标处理器，如 tsp.fota
+    bool mandatory = false;
+};
+
+/// 完整版本化订阅快照 (CR-007 §3; TSP DSN-CR-004 §3)
+struct OwnerSubscriptionSnapshot {
+    std::string owner;                       // 稳定服务身份，如 "tsp"
+    uint64_t generation = 0;                 // 集合语义变化时单调递增
+    std::string content_digest;              // 规范化集合摘要（owner 生成, SHA-256 hex）
+    bool registration_complete = false;      // 是否包含全部 Mandatory 项
+    std::vector<SubscriptionItem> items;
+};
+
+/// 快照接受状态 (CR-007 §4; TSP DSN-CR-004 §5)
+enum class SnapshotAcceptStatus : uint8_t {
+    ACCEPTED = 0,  // MQTT 已原子接受完整集合（≠ Broker SUBACK）
+    REJECTED = 1,  // 快照整体未生效，无部分替换
+    UNKNOWN  = 2   // 结果未知，使用相同 owner/generation 查询或幂等重试
+};
+
+inline std::string snapshotAcceptStatusToString(SnapshotAcceptStatus s) {
+    switch (s) {
+        case SnapshotAcceptStatus::ACCEPTED: return "ACCEPTED";
+        case SnapshotAcceptStatus::REJECTED: return "REJECTED";
+        case SnapshotAcceptStatus::UNKNOWN:  return "UNKNOWN";
+        default: return "?";
+    }
+}
+
+/// replaceSubscriptionSnapshot 返回 (CR-007 §4; TSP DSN-CR-004 §5)
+/// ACCEPTED 仅表示本地投影已接受，不等于 Broker SUBACK 或 Cloud Ready。
+struct ReplaceSnapshotResult {
+    SnapshotAcceptStatus status = SnapshotAcceptStatus::UNKNOWN;
+    uint64_t accepted_generation = 0;       // ACCEPTED 时回填接受的 generation
+    std::vector<std::string> rejected_route_ids;  // REJECTED 时非法项 route_id
+    std::string reason_code;                // REJECTED 原因（MQTT-1010 等）
+};
+
+/// getSubscriptionSnapshotStatus 返回 (CR-007 §4; TSP DSN-CR-004 §5)
+/// 用于响应丢失后的幂等收敛：相同 owner/generation 查询已接受状态。
+struct SnapshotStatusResult {
+    SnapshotAcceptStatus status = SnapshotAcceptStatus::UNKNOWN;
+    uint64_t generation = 0;
+    std::string content_digest;
+    bool registration_complete = false;
+};
+
+/// Cloud Readiness / 订阅就绪查询返回 (CR-007 §4, §10)
+/// TSP 不消费此接口（用本地 RegistrationState 做业务门闩）；供诊断与事件联动。
+/// CLOUD_READY = connected && subscriptions_ready。
+struct SubscriptionReadiness {
+    bool cloud_ready = false;               // CLOUD_READY 综合态
+    bool subscriptions_ready = false;       // Mandatory 全部 ACTIVE
+    bool connected = false;                 // CONNACK 成功（含 SUBSCRIBING/CLOUD_READY/DEGRADED）
+    uint64_t connection_generation = 0;     // 连接 generation
+    std::map<std::string, uint64_t> owner_generations;  // owner -> 最新已接受 generation
+    uint32_t mandatory_count = 0;           // 当前 mandatory 项总数
+    uint32_t mandatory_active = 0;          // 已 SUBACK ACTIVE 的 mandatory 项数
+    std::string reason_code;                // 非 ready 时的原因（MQTT-1011 等）
+};
 
 } // namespace mqtt
 } // namespace tbox

@@ -18,6 +18,10 @@ enum class MethodId : uint32_t {
     UNSUBSCRIBE          = 3,  // unsubscribe -> 移除连接订阅
     REGISTER_ROUTE       = 4,  // registerRoute -> 维护 internal_addr <-> topic
     GET_CONNECTION_STATE = 5,  // getConnectionState -> 只读连接状态
+    // CR-007 §4: 订阅快照与 Cloud Readiness
+    REPLACE_SUBSCRIPTION_SNAPSHOT    = 6,  // replaceSubscriptionSnapshot -> 原子接受/拒绝
+    GET_SUBSCRIPTION_SNAPSHOT_STATUS = 7,  // getSubscriptionSnapshotStatus -> 幂等查询
+    GET_SUBSCRIPTION_READINESS       = 8,  // getSubscriptionReadiness -> Cloud Ready 诊断
 };
 
 /// MQTT IPC 事件类型（与 framework-ipc EventHeader.event_type 一致, CR-004 §6）
@@ -25,6 +29,7 @@ enum class MethodId : uint32_t {
 enum class EventType : uint32_t {
     DOWNLINK_MESSAGE          = 1,  // 下行消息（payload 为下行 envelope JSON）
     CONNECTION_STATE_CHANGED  = 2,  // 连接状态变更
+    CLOUD_READY_CHANGED       = 3,  // Cloud Ready 状态变更 (CR-007 §10)
 };
 
 } // namespace ipc

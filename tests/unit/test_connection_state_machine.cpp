@@ -30,12 +30,29 @@ TEST(ConnectionStateMachineTest, TransitionToCertWait) {
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 }
 
-TEST(ConnectionStateMachineTest, TransitionToConnectingWhenCertReady) {
+// CR-007 §7: CERT_WAIT -> SUBSCRIPTION_WAIT（门闩），onGateSatisfied -> CONNECTING
+TEST(ConnectionStateMachineTest, TransitionToSubscriptionWaitWhenCertReady) {
     ConnectionStateMachine sm;
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::SUBSCRIPTION_WAIT);
+
+    sm.onGateSatisfied();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
+}
+
+// CR-007 §6: 门闩超时降级连接
+TEST(ConnectionStateMachineTest, TransitionToConnectingOnGateTimeout) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::SUBSCRIPTION_WAIT);
+
+    sm.onGateTimeout();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
+    EXPECT_TRUE(sm.isDegraded());
 }
 
 TEST(ConnectionStateMachineTest, TransitionToConnectedOnSuccess) {
@@ -43,6 +60,7 @@ TEST(ConnectionStateMachineTest, TransitionToConnectedOnSuccess) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionSuccess();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
 }
@@ -52,6 +70,7 @@ TEST(ConnectionStateMachineTest, TransitionToReconnectingOnFailure) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionFailure("mTLS handshake failed");
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
 }
@@ -61,6 +80,7 @@ TEST(ConnectionStateMachineTest, ExponentialBackoffReconnection) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionFailure("timeout");
 
     auto state_info = sm.getStateInfo();
@@ -74,6 +94,7 @@ TEST(ConnectionStateMachineTest, TransitionToOfflineAfterMaxRetries) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
 
     for (int i = 0; i < 3; ++i) {
         sm.onConnectionFailure("timeout");
@@ -89,6 +110,7 @@ TEST(ConnectionStateMachineTest, ResetToProvWaitFromOffline) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
 
     for (int i = 0; i < 3; ++i) {
         sm.onConnectionFailure("timeout");
@@ -104,6 +126,7 @@ TEST(ConnectionStateMachineTest, TransitionToReconnectingOnDisconnect) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionSuccess();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
 
@@ -127,13 +150,16 @@ TEST(ConnectionStateMachineTest, CallbackInvokedOnStateChange) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionSuccess();
 
-    ASSERT_EQ(transitions.size(), 4u);
+    // PROV_WAIT, CERT_WAIT, SUBSCRIPTION_WAIT, CONNECTING, CONNECTED
+    ASSERT_EQ(transitions.size(), 5u);
     EXPECT_EQ(transitions[0], ConnectionState::PROV_WAIT);
     EXPECT_EQ(transitions[1], ConnectionState::CERT_WAIT);
-    EXPECT_EQ(transitions[2], ConnectionState::CONNECTING);
-    EXPECT_EQ(transitions[3], ConnectionState::CONNECTED);
+    EXPECT_EQ(transitions[2], ConnectionState::SUBSCRIPTION_WAIT);
+    EXPECT_EQ(transitions[3], ConnectionState::CONNECTING);
+    EXPECT_EQ(transitions[4], ConnectionState::CONNECTED);
 }
 
 TEST(ConnectionStateMachineTest, CallbackInvokedOnDisconnect) {
@@ -147,15 +173,18 @@ TEST(ConnectionStateMachineTest, CallbackInvokedOnDisconnect) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionSuccess();
     sm.onDisconnect();
 
-    ASSERT_EQ(transitions.size(), 5u);
+    // PROV_WAIT, CERT_WAIT, SUBSCRIPTION_WAIT, CONNECTING, CONNECTED, RECONNECTING
+    ASSERT_EQ(transitions.size(), 6u);
     EXPECT_EQ(transitions[0], ConnectionState::PROV_WAIT);
     EXPECT_EQ(transitions[1], ConnectionState::CERT_WAIT);
-    EXPECT_EQ(transitions[2], ConnectionState::CONNECTING);
-    EXPECT_EQ(transitions[3], ConnectionState::CONNECTED);
-    EXPECT_EQ(transitions[4], ConnectionState::RECONNECTING);
+    EXPECT_EQ(transitions[2], ConnectionState::SUBSCRIPTION_WAIT);
+    EXPECT_EQ(transitions[3], ConnectionState::CONNECTING);
+    EXPECT_EQ(transitions[4], ConnectionState::CONNECTED);
+    EXPECT_EQ(transitions[5], ConnectionState::RECONNECTING);
 }
 
 TEST(ConnectionStateMachineTest, StatePersistedToStore) {
@@ -168,9 +197,9 @@ TEST(ConnectionStateMachineTest, StatePersistedToStore) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionFailure("test error");
 
-    // Verify state was persisted to store
     int state_int = store->loadOr<int>(StoreKeys::kConnState, 0);
     EXPECT_EQ(static_cast<ConnectionState>(state_int), ConnectionState::RECONNECTING);
 
@@ -186,7 +215,6 @@ TEST(ConnectionStateMachineTest, StatePersistedToStore) {
 TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
     std::string store_dir = createTempStoreDir();
 
-    // First session: transition to RECONNECTING and persist
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -195,13 +223,11 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         sm.start();
         sm.onProvisionReady();
         sm.onCertificateReady();
+        sm.onGateSatisfied();
         sm.onConnectionFailure("persistent error");
-        // State is now RECONNECTING, persisted to store
         sm.stop();
     }
 
-    // Second session: restore from store, should downgrade to PROV_WAIT
-    // (PROV binding snapshot is in-memory only, must re-read on restart)
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -209,7 +235,6 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         sm.setStore(store);
         sm.start();
 
-        // RECONNECTING should be downgraded to PROV_WAIT on restart
         EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 
         auto state_info = sm.getStateInfo();
@@ -223,7 +248,6 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
 TEST(ConnectionStateMachineTest, ConnectedDowngradedToProvWaitOnRestore) {
     std::string store_dir = createTempStoreDir();
 
-    // First session: reach CONNECTED state (persisted to store)
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -232,13 +256,11 @@ TEST(ConnectionStateMachineTest, ConnectedDowngradedToProvWaitOnRestore) {
         sm.start();
         sm.onProvisionReady();
         sm.onCertificateReady();
+        sm.onGateSatisfied();
         sm.onConnectionSuccess();
-        // State is now CONNECTED, persisted to store
         sm.stop();
     }
 
-    // Second session: CONNECTED should be downgraded to PROV_WAIT
-    // (PROV binding snapshot is in-memory only, must re-read on restart)
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -265,16 +287,12 @@ TEST(ConnectionStateMachineTest, RetryTimerAutoTransitionsToConnecting) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
-    // Now in CONNECTING
+    sm.onGateSatisfied();
 
-    // Simulate connection failure -> RECONNECTING with short backoff
     sm.onConnectionFailure("timeout");
-    // Now in RECONNECTING, timer thread should auto-fire after backoff delay
 
-    // Wait for the timer to fire (base delay is 1s * 2^1 = 2s + jitter)
     std::this_thread::sleep_for(std::chrono::seconds(4));
 
-    // Timer should have auto-transitioned to CONNECTING
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 
     sm.stop();
@@ -285,12 +303,79 @@ TEST(ConnectionStateMachineTest, RetryTimerStopsOnStop) {
     sm.start();
     sm.onProvisionReady();
     sm.onCertificateReady();
+    sm.onGateSatisfied();
     sm.onConnectionFailure("timeout");
-    // Now in RECONNECTING
 
-    // Stop should cleanly join the timer thread
     sm.stop();
 
-    // State machine should still be usable after stop
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
+}
+
+// ============================================================
+// CR-007 §7: 订阅门闩与 Cloud Ready 状态转换
+// ============================================================
+
+TEST(ConnectionStateMachineTest, SubscribingToCloudReady) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
+
+    sm.onSubscribing();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::SUBSCRIBING);
+
+    sm.onSubscriptionsReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CLOUD_READY);
+}
+
+TEST(ConnectionStateMachineTest, CloudReadyLostToSubscribing) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    sm.onSubscribing();
+    sm.onSubscriptionsReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CLOUD_READY);
+
+    sm.onCloudReadyLost();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::SUBSCRIBING);
+}
+
+TEST(ConnectionStateMachineTest, MandatoryFailedToDegraded) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    sm.onSubscribing();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::SUBSCRIBING);
+
+    sm.onMandatoryFailed("suback_timeout");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED_DEGRADED);
+}
+
+TEST(ConnectionStateMachineTest, DegradedDoesNotReachCloudReady) {
+    // 门闩超时降级后，即使 mandatory active 也不得 Cloud Ready
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateTimeout();
+    EXPECT_TRUE(sm.isDegraded());
+
+    sm.onConnectionSuccess();
+    sm.onSubscribing();
+    sm.onSubscriptionsReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED_DEGRADED);
+
+    // 清除降级后可达 Cloud Ready
+    sm.setDegraded(false);
+    sm.onSubscriptionsReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CLOUD_READY);
 }

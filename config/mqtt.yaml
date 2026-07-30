@@ -58,3 +58,12 @@ mqtt:
     dispatch_queue_size: 1024        # 有界下行分发队列容量
     subscriber_queue_size: 128       # per-subscriber 有界队列容量
     slow_subscriber_policy: disconnect  # disconnect / drop / backpressure
+
+  # --- Subscription snapshot & Cloud Readiness (CR-007 §6) ---
+  # required_owners 只配置 owner 身份，不配置其业务 Topic。
+  subscriptions:
+    required_owners: ["tsp"]
+    startup_wait_timeout_ms: 5000    # 门闩等待超时（超时降级连接，不得 Cloud Ready）
+    reconcile_timeout_ms: 10000      # SUBACK 收敛超时
+    suback_retry_max: 3              # SUBACK 重试上限
+    owner_lease_ms: 0                # 0=关闭自动过期，避免进程抖动误删订阅

@@ -248,5 +248,107 @@ ConnectionState Client::getConnectionState() {
     }
 }
 
+// ============================================================
+// CR-007 §4: 订阅快照与 Cloud Readiness
+// ============================================================
+
+ReplaceSnapshotResult Client::replaceSubscriptionSnapshot(
+        const OwnerSubscriptionSnapshot& snapshot) {
+    nlohmann::json params;
+    params["owner"] = snapshot.owner;
+    params["generation"] = snapshot.generation;
+    params["content_digest"] = snapshot.content_digest;
+    params["registration_complete"] = snapshot.registration_complete;
+    nlohmann::json items = nlohmann::json::array();
+    for (const auto& it : snapshot.items) {
+        nlohmann::json item;
+        item["route_id"] = it.route_id;
+        item["topic_template"] = it.topic_template;
+        item["direction"] = snapshotDirectionToString(it.direction);
+        item["qos"] = static_cast<int>(it.qos);
+        item["target"] = it.target;
+        item["mandatory"] = it.mandatory;
+        items.push_back(item);
+    }
+    params["items"] = items;
+
+    auto [ok, status, response_json] = impl_->send_request(
+        static_cast<uint32_t>(ipc::MethodId::REPLACE_SUBSCRIPTION_SNAPSHOT), params.dump());
+
+    ReplaceSnapshotResult result;
+    if (!ok) {
+        result.status = SnapshotAcceptStatus::UNKNOWN;
+        result.reason_code = "transport_failed";
+        return result;
+    }
+    try {
+        auto j = nlohmann::json::parse(response_json);
+        std::string s = j.value("status", "UNKNOWN");
+        if (s == "ACCEPTED") result.status = SnapshotAcceptStatus::ACCEPTED;
+        else if (s == "REJECTED") result.status = SnapshotAcceptStatus::REJECTED;
+        else result.status = SnapshotAcceptStatus::UNKNOWN;
+        result.accepted_generation = j.value("accepted_generation", 0ULL);
+        result.reason_code = j.value("reason_code", "");
+        if (j.contains("rejected_route_ids") && j["rejected_route_ids"].is_array()) {
+            for (const auto& rid : j["rejected_route_ids"]) {
+                result.rejected_route_ids.push_back(rid.get<std::string>());
+            }
+        }
+    } catch (...) {
+        result.status = SnapshotAcceptStatus::UNKNOWN;
+    }
+    return result;
+}
+
+SnapshotStatusResult Client::getSubscriptionSnapshotStatus(
+        const std::string& owner, uint64_t generation) {
+    nlohmann::json params;
+    params["owner"] = owner;
+    params["generation"] = generation;
+
+    auto [ok, status, response_json] = impl_->send_request(
+        static_cast<uint32_t>(ipc::MethodId::GET_SUBSCRIPTION_SNAPSHOT_STATUS), params.dump());
+
+    SnapshotStatusResult r;
+    if (!ok) { r.status = SnapshotAcceptStatus::UNKNOWN; return r; }
+    try {
+        auto j = nlohmann::json::parse(response_json);
+        std::string s = j.value("status", "UNKNOWN");
+        if (s == "ACCEPTED") r.status = SnapshotAcceptStatus::ACCEPTED;
+        else if (s == "REJECTED") r.status = SnapshotAcceptStatus::REJECTED;
+        else r.status = SnapshotAcceptStatus::UNKNOWN;
+        r.generation = j.value("generation", 0ULL);
+        r.content_digest = j.value("content_digest", "");
+        r.registration_complete = j.value("registration_complete", false);
+    } catch (...) {
+        r.status = SnapshotAcceptStatus::UNKNOWN;
+    }
+    return r;
+}
+
+SubscriptionReadiness Client::getSubscriptionReadiness() {
+    auto [ok, status, response_json] = impl_->send_request(
+        static_cast<uint32_t>(ipc::MethodId::GET_SUBSCRIPTION_READINESS), "{}");
+
+    SubscriptionReadiness r;
+    if (!ok) return r;
+    try {
+        auto j = nlohmann::json::parse(response_json);
+        r.cloud_ready = j.value("cloud_ready", false);
+        r.subscriptions_ready = j.value("subscriptions_ready", false);
+        r.connected = j.value("connected", false);
+        r.connection_generation = j.value("connection_generation", 0ULL);
+        r.mandatory_count = j.value("mandatory_count", 0);
+        r.mandatory_active = j.value("mandatory_active", 0);
+        r.reason_code = j.value("reason_code", "");
+        if (j.contains("owner_generations") && j["owner_generations"].is_object()) {
+            for (auto it = j["owner_generations"].begin(); it != j["owner_generations"].end(); ++it) {
+                r.owner_generations[it.key()] = it.value().get<uint64_t>();
+            }
+        }
+    } catch (...) {}
+    return r;
+}
+
 } // namespace mqtt
 } // namespace tbox

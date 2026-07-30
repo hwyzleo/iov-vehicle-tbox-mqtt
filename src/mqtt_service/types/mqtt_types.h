@@ -165,6 +165,15 @@ struct MqttIpcConfig {
     std::string slow_subscriber_policy = "disconnect";  // disconnect/drop/backpressure
 };
 
+/// 订阅快照与 Cloud Readiness 配置 (CR-007 §6)
+struct SubscriptionConfig {
+    std::vector<std::string> required_owners;  // 启动必需 owner，如 ["tsp"]
+    Duration startup_wait_timeout_ms{5000};    // 门闩等待超时
+    Duration reconcile_timeout_ms{10000};      // SUBACK 收敛超时
+    uint32_t suback_retry_max = 3;             // SUBACK 重试上限
+    uint64_t owner_lease_ms = 0;               // 0=关闭自动过期 (CR-007 §5)
+};
+
 // ============================================================
 // framework-store key 常量 (设计 §5)
 // ============================================================
@@ -175,6 +184,8 @@ namespace StoreKeys {
     constexpr const char* kConnLastError  = "mqtt.conn_last_error";
     constexpr const char* kConnRetryCount = "mqtt.conn_retry_count";
     constexpr const char* kConfigVersion  = "mqtt.config_version";
+    // CR-007 §3.1: 已应用 Broker 订阅清单（JSON blob，仅传输恢复状态）
+    constexpr const char* kSubsManifest = "mqtt.subs_manifest";
 } // namespace StoreKeys
 
 } // namespace mqtt
