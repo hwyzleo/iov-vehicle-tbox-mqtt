@@ -17,28 +17,22 @@ find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
-# Framework library (framework-config + framework-store + framework-ipc)
-set(FRAMEWORK_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework)
-if(EXISTS ${FRAMEWORK_DIR}/include)
-    set(FRAMEWORK_INCLUDE_DIR ${FRAMEWORK_DIR}/include)
+# TBox Framework：统一通过 find_package 消费（自包含 yaml-cpp / spdlog）
+# 查找前缀由 scripts/build.sh 从 iov-vehicle-tbox-framework/scripts/tbox-env.sh
+# 取得的 TBOX_PREFIX 决定，切换本地/生产环境无需改动本文件。
+if(NOT TARGET TBoxFramework::tbox-framework)
+    find_package(TBoxFramework REQUIRED)
 endif()
-find_library(FRAMEWORK_LIB tbox-framework PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
-if(NOT FRAMEWORK_LIB)
-    message(FATAL_ERROR "Framework library not found in ${FRAMEWORK_DIR}/build")
-endif()
+set(FRAMEWORK_LIB TBoxFramework::tbox-framework)
+set(FRAMEWORK_INCLUDE_DIR ${TBoxFramework_INCLUDE_DIRS})
 
 # SEC client SDK (CR-004)
 set(SEC_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-sec)
 set(SEC_INCLUDE_DIR ${SEC_DIR}/include)
 find_library(SEC_CLIENT_LIB tbox_sec_client PATHS ${SEC_DIR}/build NO_DEFAULT_PATH)
 
-# Find yaml-cpp (required by framework-config headers transitively)
-find_package(yaml-cpp QUIET)
-if(YAML_CPP_INCLUDE_DIRS)
-    set(YAML_CPP_INC ${YAML_CPP_INCLUDE_DIRS})
-elseif(EXISTS "/opt/homebrew/include/yaml-cpp/yaml.h")
-    set(YAML_CPP_INC /opt/homebrew/include)
-endif()
+# yaml-cpp 头文件随 TBoxFramework 一起安装在 ${FRAMEWORK_INCLUDE_DIR} 下，
+# 不再探测 brew / conda 路径。
 
 set(TEST_COMMON_INCLUDES
     ${PROJECT_SOURCE_DIR}/include
@@ -112,7 +106,7 @@ add_executable(test_offline_cache_queue
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
-target_include_directories(test_offline_cache_queue PRIVATE ${TEST_COMMON_INCLUDES} ${YAML_CPP_INC})
+target_include_directories(test_offline_cache_queue PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_offline_cache_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
 add_executable(test_route_bridge
@@ -128,7 +122,7 @@ add_executable(test_config_manager
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
-target_include_directories(test_config_manager PRIVATE ${TEST_COMMON_INCLUDES} ${YAML_CPP_INC})
+target_include_directories(test_config_manager PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_config_manager GTest::gtest_main ${FRAMEWORK_LIB} pthread)
 
 add_executable(test_mqtt_service_integration

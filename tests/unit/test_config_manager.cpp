@@ -19,12 +19,13 @@ std::string createTempConfigDir(const std::string& broker_host = "test.mqtt.com"
     // common.yaml
     {
         std::ofstream ofs(tmp_dir / "common.yaml");
-        ofs << "store:\n"
-            << "  root: /tmp/tbox_mqtt_test_store\n"
+        ofs << "common:\n"
+            << "  store:\n"
+            << "    root: /tmp/tbox_mqtt_test_store\n"
+            << "  log:\n"
+            << "    level: debug\n"
             << "bus:\n"
-            << "  address: /tmp/tbox_test_bus.sock\n"
-            << "log:\n"
-            << "  level: debug\n";
+            << "  address: /tmp/tbox_test_bus.sock\n";
     }
 
     // conf.d/mqtt.yaml

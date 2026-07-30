@@ -76,18 +76,6 @@ int main(int argc, char* argv[]) {
             snapshot->getInt("common.log.max_files", 5));
     }
 
-    auto mqtt_log_section = snapshot->getSection("mqtt.log");
-    if (mqtt_log_section) {
-        std::string mqtt_level = mqtt_log_section->getString("level", "");
-        if (!mqtt_level.empty()) {
-            if (mqtt_level == "trace") log_config.level = tbox::fw::log::LogLevel::kTrace;
-            else if (mqtt_level == "debug") log_config.level = tbox::fw::log::LogLevel::kDebug;
-            else if (mqtt_level == "info") log_config.level = tbox::fw::log::LogLevel::kInfo;
-            else if (mqtt_level == "warn") log_config.level = tbox::fw::log::LogLevel::kWarn;
-            else if (mqtt_level == "error") log_config.level = tbox::fw::log::LogLevel::kError;
-        }
-    }
-
     auto log_result = MqttLogAdapter::init("mqtt", log_config);
     if (log_result.error != tbox::fw::log::LogError::kOk) {
         std::cerr << "[MQTT] framework-log init degraded: " << log_result.error_message << std::endl;

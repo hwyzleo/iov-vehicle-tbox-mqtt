@@ -15,12 +15,13 @@ std::string createTempConfigDir() {
 
     {
         std::ofstream ofs(tmp_dir / "common.yaml");
-        ofs << "store:\n"
-            << "  root: /tmp/tbox_mqtt_integration_store\n"
+        ofs << "common:\n"
+            << "  store:\n"
+            << "    root: /tmp/tbox_mqtt_integration_store\n"
+            << "  log:\n"
+            << "    level: info\n"
             << "bus:\n"
-            << "  address: /tmp/tbox_test_bus.sock\n"
-            << "log:\n"
-            << "  level: info\n";
+            << "  address: /tmp/tbox_test_bus.sock\n";
     }
 
     {

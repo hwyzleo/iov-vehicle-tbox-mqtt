@@ -17,10 +17,11 @@ std::string createE2EConfigDir() {
 
     {
         std::ofstream ofs(tmp_dir / "common.yaml");
-        ofs << "store:\n"
-            << "  root: /tmp/tbox_mqtt_e2e_store\n"
-            << "log:\n"
-            << "  level: info\n";
+        ofs << "common:\n"
+            << "  store:\n"
+            << "    root: /tmp/tbox_mqtt_e2e_store\n"
+            << "  log:\n"
+            << "    level: info\n";
     }
 
     {

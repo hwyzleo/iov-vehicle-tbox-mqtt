@@ -17,22 +17,20 @@ find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 
-# yaml-cpp (framework dependency)
-find_package(yaml-cpp REQUIRED)
+# yaml-cpp / spdlog 由 TBoxFramework 自包含提供，不再单独 find_package，
+# 避免命中构建机上的 brew / conda 副本造成版本漂移。
 
 # SQLite for offline cache
 find_package(SQLite3 REQUIRED)
 
-# Framework library (framework-config + framework-store + framework-log + framework-ipc)
-set(FRAMEWORK_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework)
-if(EXISTS ${FRAMEWORK_DIR}/include)
-    set(FRAMEWORK_INCLUDE_DIR ${FRAMEWORK_DIR}/include)
+# TBox Framework：统一通过 find_package 消费（自包含 yaml-cpp / spdlog）
+# 查找前缀由 scripts/build.sh 从 iov-vehicle-tbox-framework/scripts/tbox-env.sh
+# 取得的 TBOX_PREFIX 决定，切换本地/生产环境无需改动本文件。
+if(NOT TARGET TBoxFramework::tbox-framework)
+    find_package(TBoxFramework REQUIRED)
 endif()
-find_library(FRAMEWORK_LIB tbox-framework PATHS ${FRAMEWORK_DIR}/build NO_DEFAULT_PATH)
-if(NOT FRAMEWORK_LIB)
-    message(FATAL_ERROR "Framework library not found in ${FRAMEWORK_DIR}/build. "
-                        "Please build framework first: cmake -B ${FRAMEWORK_DIR}/build && cmake --build ${FRAMEWORK_DIR}/build")
-endif()
+set(FRAMEWORK_LIB TBoxFramework::tbox-framework)
+set(FRAMEWORK_INCLUDE_DIR ${TBoxFramework_INCLUDE_DIRS})
 
 # SEC client SDK (CR-004 §1: MQTT 获取证书/私钥句柄只使用 tbox::sec_client)
 set(SEC_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-sec)
@@ -88,7 +86,6 @@ target_link_libraries(mqtt_service_lib
     nlohmann_json::nlohmann_json
     ${FRAMEWORK_LIB}
     ${SEC_CLIENT_LIB}
-    yaml-cpp::yaml-cpp
 )
 
 # ============================================================

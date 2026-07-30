@@ -11,6 +11,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
 
+# 构建环境单一来源：由 framework 仓库提供 TBOX_PREFIX / TBoxFramework_DIR
+# 切换本地开发与生产环境只需覆盖环境变量，例如：
+#   TBOX_PREFIX=/opt/tbox ./scripts/build.sh
+TBOX_ENV_FILE="$PROJECT_DIR/../iov-vehicle-tbox-framework/scripts/tbox-env.sh"
+if [ ! -f "$TBOX_ENV_FILE" ]; then
+    echo "[ERROR] 未找到 $TBOX_ENV_FILE" >&2
+    echo "        请确认 iov-vehicle-tbox-framework 与本项目位于同级目录" >&2
+    exit 1
+fi
+source "$TBOX_ENV_FILE"
+
 # 默认选项
 BUILD_TYPE="Release"
 CLEAN_BUILD=false
@@ -59,7 +70,7 @@ cd "$BUILD_DIR"
 
 # 配置 CMake
 echo "[2/4] 配置 CMake..."
-cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" ..
+cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DTBoxFramework_DIR="$TBoxFramework_DIR" ..
 
 # 编译
 echo "[3/4] 编译中..."

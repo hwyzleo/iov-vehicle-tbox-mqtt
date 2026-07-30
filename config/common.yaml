@@ -2,27 +2,28 @@
 # This file contains settings shared across all TBOX services.
 # Placed at: /etc/tbox/common.yaml
 #
-# framework-config requires a top-level 'log' map (validated).
+# framework-config requires a 'common.log' map (validated).
+# 所有公共配置统一收敛到 common 命名空间下，与代码读取的 common.* 键一致。
 
-# Framework-store root path (Design §5)
-# Each service opens its store via Store::open("mqtt", store.root)
-store:
-  root: /var/lib/tbox
+common:
+  # Framework-store root path (Design §5)
+  # Each service opens its store via Store::open("mqtt", store.root)
+  store:
+    root: /var/lib/tbox
+
+  # Framework-IPC common config (CR-004 §8)
+  ipc:
+    max_frame_bytes: 10485760      # 10 MiB
+    receive_timeout_ms: 60000
+    connect_timeout_ms: 3000
+    listen_backlog: 5
+
+  # Logging (required by framework-config validator: common.log)
+  log:
+    level: info
+    max_size_mb: 10
+    max_files: 5
 
 # Internal bus address (shared across services)
 bus:
   address: /tmp/tbox-bus.sock
-
-# Framework-IPC common config (CR-004 §8)
-ipc:
-  max_frame_bytes: 10485760      # 10 MiB
-  receive_timeout_ms: 60000
-  connect_timeout_ms: 3000
-  listen_backlog: 5
-
-# Logging (required by framework-config validator)
-log:
-  level: info
-  file: /var/log/tbox/mqtt.log
-  max_size_mb: 10
-  max_files: 5
