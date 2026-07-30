@@ -45,6 +45,22 @@ if(NOT SEC_CLIENT_LIB)
                         "Please build SEC first: cmake -B ${SEC_DIR}/build && cmake --build ${SEC_DIR}/build")
 endif()
 
+# PROV client SDK (CR-006 §1: MQTT 获取 PROV 绑定信息只使用 tbox::prov_client)
+set(PROV_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov)
+if(EXISTS ${PROV_DIR}/include)
+    set(PROV_INCLUDE_DIR ${PROV_DIR}/include)
+else()
+    message(FATAL_ERROR "PROV project not found at ${PROV_DIR}")
+endif()
+find_library(PROV_CLIENT_LIB tbox_prov_client PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
+if(NOT PROV_CLIENT_LIB)
+    message(FATAL_ERROR "PROV client library not found in ${PROV_DIR}/build. "
+                        "Please build PROV first: cmake -B ${PROV_DIR}/build && cmake --build ${PROV_DIR}/build")
+endif()
+
+# PROV daemon lib: provides ProvLogAdapter used by prov_client (CR-006)
+find_library(PROV_DAEMON_LIB TboxProvLib PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
+
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -52,6 +68,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
     ${FRAMEWORK_INCLUDE_DIR}
     ${SEC_INCLUDE_DIR}
+    ${PROV_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 
@@ -68,6 +85,7 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/route_bridge.cpp
     src/mqtt_service/src/config_manager.cpp
     src/mqtt_service/src/credential_manager.cpp
+    src/mqtt_service/src/provision_identity_manager.cpp
     src/mqtt_service/src/sec_tls_key_adapter.cpp
     src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
     src/mqtt_service/src/mqtt_retry_policy.cpp
@@ -86,6 +104,8 @@ target_link_libraries(mqtt_service_lib
     nlohmann_json::nlohmann_json
     ${FRAMEWORK_LIB}
     ${SEC_CLIENT_LIB}
+    ${PROV_CLIENT_LIB}
+    ${PROV_DAEMON_LIB}
 )
 
 # ============================================================

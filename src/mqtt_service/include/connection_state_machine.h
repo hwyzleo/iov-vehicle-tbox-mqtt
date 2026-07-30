@@ -34,6 +34,9 @@ public:
     // ---- CR-005 §6: 凭据轮询退避配置 ----
     void setCredentialPollConfig(const CredentialPollConfig& config);
 
+    // ---- CR-006 §4: PROV 绑定前置 ----
+    void setProvisionRetryConfig(const ProvisionRetryConfig& config);
+
     // ---- 原有事件 ----
     void onCertificateReady();
     void onConnectionSuccess();
@@ -52,6 +55,16 @@ public:
     /// CERT_WAIT 退避超时，重新检查凭据状态
     void onCredentialPollTimeout();
 
+    // ---- CR-006 §4: PROV 绑定事件 ----
+    /// 绑定有效：PROV_WAIT -> CERT_WAIT
+    void onProvisionReady();
+    /// 绑定无效/失效：CONNECTING/CONNECTED/RECONNECTING -> PROV_WAIT；PROV_WAIT 保持
+    void onProvisionInvalid(const std::string& reason);
+    /// 绑定变化：CONNECTED/CONNECTING/RECONNECTING -> PROV_WAIT
+    void onProvisionChanged();
+    /// PROV_WAIT 退避超时，重新读取绑定
+    void onProvisionPollTimeout();
+
     // ---- CR-005 §7: connection generation ----
     uint64_t getConnectionGeneration() const;
     void invalidateConnectionGeneration();
@@ -60,6 +73,7 @@ private:
     StateChangeCallback transitionTo(ConnectionState new_state);
     void calculateNextRetry();
     void calculateNextCredentialPoll();  // CR-005 §6: CERT_WAIT 独立退避
+    void calculateNextProvisionPoll();   // CR-006 §4: PROV_WAIT 独立退避
     void persistState();
     void restoreState();
     void timerLoop();
@@ -77,6 +91,11 @@ private:
     CredentialPollConfig credential_poll_config_;
     uint32_t credential_poll_count_ = 0;
     std::chrono::steady_clock::time_point next_credential_poll_at_;
+
+    // CR-006 §4: PROV_WAIT 独立退避（不与 CERT_WAIT / 网络重连混用）
+    ProvisionRetryConfig provision_retry_config_;
+    uint32_t provision_poll_count_ = 0;
+    std::chrono::steady_clock::time_point next_provision_poll_at_;
 
     // CR-005 §7: connection generation（凭据变化时递增，阻止旧 callback 重入 CONNECTED）
     uint64_t connection_generation_ = 0;

@@ -44,6 +44,10 @@ tbox::fw::log::Logger MqttLogAdapter::ipc() {
     return tbox::fw::log::Logger::get("ipc");
 }
 
+tbox::fw::log::Logger MqttLogAdapter::provision() {
+    return tbox::fw::log::Logger::get("provision");
+}
+
 tbox::fw::log::Logger MqttLogAdapter::service() {
     return tbox::fw::log::Logger::get("service");
 }

@@ -21,6 +21,7 @@ enum class ErrorCode : uint32_t {
     MQTT_1006 = 1006,  // 离线缓存已满（消息被丢弃）
     MQTT_1007 = 1007,  // 下行消息无法路由 / 无订阅者
     MQTT_1008 = 1008,  // 订阅失败
+    MQTT_1009 = 1009,  // PROV 不可用、未绑定或 VIN/SN/ECU UID 不完整/不一致 (CR-006 §8)
 };
 
 /// 将 ErrorCode 转为可读字符串 (CR-003 §6)
@@ -34,6 +35,7 @@ inline std::string errorCodeToString(ErrorCode code) {
         case ErrorCode::MQTT_1006: return "MQTT-1006";
         case ErrorCode::MQTT_1007: return "MQTT-1007";
         case ErrorCode::MQTT_1008: return "MQTT-1008";
+        case ErrorCode::MQTT_1009: return "MQTT-1009";
         default: return "MQTT-UNKNOWN";
     }
 }

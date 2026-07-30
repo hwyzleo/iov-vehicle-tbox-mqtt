@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "mqtt_service.h"
 #include "credential_manager.h"
+#include "provision_identity_manager.h"
 #include "config.h"
 #include <thread>
 #include <chrono>
@@ -29,7 +30,8 @@ std::string createE2EConfigDir() {
         ofs << "mqtt:\n"
             << "  broker_host: localhost\n"
             << "  broker_port: 1883\n"
-            << "  client_id: VIN123SN456\n"
+            << "  identity:\n"
+            << "    client_id_format: \"{vin}-{sn}\"\n"
             << "  keepalive: 60\n"
             << "  clean_start: false\n"
             << "  session_expiry: 3600\n"
@@ -53,6 +55,18 @@ void cleanupE2EDirs() {
     std::filesystem::remove_all(std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_config");
     std::filesystem::remove_all(std::filesystem::temp_directory_path() / "tbox_mqtt_e2e_store");
 }
+
+std::shared_ptr<ProvisionIdentityManager> createSimulatedProvMgrE2E() {
+    auto mgr = std::make_shared<ProvisionIdentityManager>();
+    ProvisionIdentitySnapshot snapshot;
+    snapshot.vin = "VIN123SN45678901";
+    snapshot.ecu_uid = "ECU123456789ABCD";
+    snapshot.sn = "SN45678901";
+    snapshot.state = tbox::prov::ProvisionState::BOUND;
+    snapshot.locked = true;
+    mgr->simulateBinding(snapshot);
+    return mgr;
+}
 } // anonymous namespace
 
 class EndToEndTest : public ::testing::Test {
@@ -65,8 +79,9 @@ protected:
         cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
 
         cred_mgr->simulateReady();
+        prov_mgr = createSimulatedProvMgrE2E();
 
-        service->initialize(cred_mgr, config_dir, store_dir);
+        service->initialize(prov_mgr, cred_mgr, config_dir, store_dir);
         service->start();
 
         // Wait for connection
@@ -82,6 +97,7 @@ protected:
     std::string store_dir;
     std::unique_ptr<MqttService> service;
     std::shared_ptr<CredentialManager> cred_mgr;
+    std::shared_ptr<ProvisionIdentityManager> prov_mgr;
 };
 
 TEST_F(EndToEndTest, PublishAndSubscribe) {
@@ -149,7 +165,7 @@ TEST_F(EndToEndTest, ConfigurationUpdate) {
     ConnectionConfig new_config;
     new_config.broker_host = "new.mqtt.com";
     new_config.broker_port = 8883;
-    new_config.client_id = "VIN123SN456";
+    new_config.client_id_format = "{vin}-{sn}";
     new_config.credential_profile = "mqtt";
     new_config.version = 2;
 

@@ -34,9 +34,10 @@ enum class Priority : uint8_t {
     CRITICAL = 3
 };
 
-/// 连接状态 (设计 §3, §4.1)
+/// 连接状态 (设计 §3, §4.1, CR-006 §4)
 enum class ConnectionState {
     INIT,
+    PROV_WAIT,
     CERT_WAIT,
     CONNECTING,
     CONNECTED,
@@ -48,6 +49,7 @@ enum class ConnectionState {
 inline std::string connectionStateToString(ConnectionState state) {
     switch (state) {
         case ConnectionState::INIT:         return "INIT";
+        case ConnectionState::PROV_WAIT:    return "PROV_WAIT";
         case ConnectionState::CERT_WAIT:    return "CERT_WAIT";
         case ConnectionState::CONNECTING:   return "CONNECTING";
         case ConnectionState::CONNECTED:    return "CONNECTED";

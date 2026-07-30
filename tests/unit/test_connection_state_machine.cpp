@@ -27,12 +27,13 @@ TEST(ConnectionStateMachineTest, InitialStateIsInit) {
 TEST(ConnectionStateMachineTest, TransitionToCertWait) {
     ConnectionStateMachine sm;
     sm.start();
-    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 }
 
 TEST(ConnectionStateMachineTest, TransitionToConnectingWhenCertReady) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 }
@@ -40,6 +41,7 @@ TEST(ConnectionStateMachineTest, TransitionToConnectingWhenCertReady) {
 TEST(ConnectionStateMachineTest, TransitionToConnectedOnSuccess) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionSuccess();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
@@ -48,6 +50,7 @@ TEST(ConnectionStateMachineTest, TransitionToConnectedOnSuccess) {
 TEST(ConnectionStateMachineTest, TransitionToReconnectingOnFailure) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionFailure("mTLS handshake failed");
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
@@ -56,6 +59,7 @@ TEST(ConnectionStateMachineTest, TransitionToReconnectingOnFailure) {
 TEST(ConnectionStateMachineTest, ExponentialBackoffReconnection) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionFailure("timeout");
 
@@ -68,6 +72,7 @@ TEST(ConnectionStateMachineTest, TransitionToOfflineAfterMaxRetries) {
     ConnectionStateMachine sm;
     sm.setMaxRetries(3);
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
 
     for (int i = 0; i < 3; ++i) {
@@ -78,10 +83,11 @@ TEST(ConnectionStateMachineTest, TransitionToOfflineAfterMaxRetries) {
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::OFFLINE);
 }
 
-TEST(ConnectionStateMachineTest, ResetToCertWaitFromOffline) {
+TEST(ConnectionStateMachineTest, ResetToProvWaitFromOffline) {
     ConnectionStateMachine sm;
     sm.setMaxRetries(3);
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
 
     for (int i = 0; i < 3; ++i) {
@@ -90,12 +96,13 @@ TEST(ConnectionStateMachineTest, ResetToCertWaitFromOffline) {
     }
 
     sm.onNetworkRestored();
-    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 }
 
 TEST(ConnectionStateMachineTest, TransitionToReconnectingOnDisconnect) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionSuccess();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
@@ -118,13 +125,15 @@ TEST(ConnectionStateMachineTest, CallbackInvokedOnStateChange) {
     });
 
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionSuccess();
 
-    ASSERT_EQ(transitions.size(), 3u);
-    EXPECT_EQ(transitions[0], ConnectionState::CERT_WAIT);
-    EXPECT_EQ(transitions[1], ConnectionState::CONNECTING);
-    EXPECT_EQ(transitions[2], ConnectionState::CONNECTED);
+    ASSERT_EQ(transitions.size(), 4u);
+    EXPECT_EQ(transitions[0], ConnectionState::PROV_WAIT);
+    EXPECT_EQ(transitions[1], ConnectionState::CERT_WAIT);
+    EXPECT_EQ(transitions[2], ConnectionState::CONNECTING);
+    EXPECT_EQ(transitions[3], ConnectionState::CONNECTED);
 }
 
 TEST(ConnectionStateMachineTest, CallbackInvokedOnDisconnect) {
@@ -136,15 +145,17 @@ TEST(ConnectionStateMachineTest, CallbackInvokedOnDisconnect) {
     });
 
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionSuccess();
     sm.onDisconnect();
 
-    ASSERT_EQ(transitions.size(), 4u);
-    EXPECT_EQ(transitions[0], ConnectionState::CERT_WAIT);
-    EXPECT_EQ(transitions[1], ConnectionState::CONNECTING);
-    EXPECT_EQ(transitions[2], ConnectionState::CONNECTED);
-    EXPECT_EQ(transitions[3], ConnectionState::RECONNECTING);
+    ASSERT_EQ(transitions.size(), 5u);
+    EXPECT_EQ(transitions[0], ConnectionState::PROV_WAIT);
+    EXPECT_EQ(transitions[1], ConnectionState::CERT_WAIT);
+    EXPECT_EQ(transitions[2], ConnectionState::CONNECTING);
+    EXPECT_EQ(transitions[3], ConnectionState::CONNECTED);
+    EXPECT_EQ(transitions[4], ConnectionState::RECONNECTING);
 }
 
 TEST(ConnectionStateMachineTest, StatePersistedToStore) {
@@ -155,6 +166,7 @@ TEST(ConnectionStateMachineTest, StatePersistedToStore) {
     ConnectionStateMachine sm;
     sm.setStore(store);
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionFailure("test error");
 
@@ -181,13 +193,15 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         ConnectionStateMachine sm;
         sm.setStore(store);
         sm.start();
+        sm.onProvisionReady();
         sm.onCertificateReady();
         sm.onConnectionFailure("persistent error");
         // State is now RECONNECTING, persisted to store
         sm.stop();
     }
 
-    // Second session: restore from store, should downgrade to CERT_WAIT
+    // Second session: restore from store, should downgrade to PROV_WAIT
+    // (PROV binding snapshot is in-memory only, must re-read on restart)
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -195,8 +209,8 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
         sm.setStore(store);
         sm.start();
 
-        // RECONNECTING should be downgraded to CERT_WAIT on restart
-        EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+        // RECONNECTING should be downgraded to PROV_WAIT on restart
+        EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 
         auto state_info = sm.getStateInfo();
         EXPECT_EQ(state_info.retry_count, 0u);
@@ -206,7 +220,7 @@ TEST(ConnectionStateMachineTest, StateRestoredFromStore) {
     cleanupTempStoreDir(store_dir);
 }
 
-TEST(ConnectionStateMachineTest, ConnectedDowngradedToCertWaitOnRestore) {
+TEST(ConnectionStateMachineTest, ConnectedDowngradedToProvWaitOnRestore) {
     std::string store_dir = createTempStoreDir();
 
     // First session: reach CONNECTED state (persisted to store)
@@ -216,13 +230,15 @@ TEST(ConnectionStateMachineTest, ConnectedDowngradedToCertWaitOnRestore) {
         ConnectionStateMachine sm;
         sm.setStore(store);
         sm.start();
+        sm.onProvisionReady();
         sm.onCertificateReady();
         sm.onConnectionSuccess();
         // State is now CONNECTED, persisted to store
         sm.stop();
     }
 
-    // Second session: CONNECTED should be downgraded to CERT_WAIT
+    // Second session: CONNECTED should be downgraded to PROV_WAIT
+    // (PROV binding snapshot is in-memory only, must re-read on restart)
     {
         auto store = std::make_shared<hwyz::store::Store>(
             hwyz::store::Store::open("mqtt", store_dir));
@@ -230,7 +246,7 @@ TEST(ConnectionStateMachineTest, ConnectedDowngradedToCertWaitOnRestore) {
         sm.setStore(store);
         sm.start();
 
-        EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+        EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
         sm.stop();
     }
 
@@ -247,6 +263,7 @@ TEST(ConnectionStateMachineTest, RetryTimerAutoTransitionsToConnecting) {
     });
 
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     // Now in CONNECTING
 
@@ -266,6 +283,7 @@ TEST(ConnectionStateMachineTest, RetryTimerAutoTransitionsToConnecting) {
 TEST(ConnectionStateMachineTest, RetryTimerStopsOnStop) {
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionFailure("timeout");
     // Now in RECONNECTING

@@ -5,6 +5,7 @@
 #include "route_bridge.h"
 #include "config_manager.h"
 #include "credential_manager.h"
+#include "provision_identity_manager.h"
 #include "sec_tls_key_adapter.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
@@ -42,14 +43,16 @@ MqttService::~MqttService() {
     stop();
 }
 
-bool MqttService::initialize(std::shared_ptr<CredentialManager> cred_mgr,
+bool MqttService::initialize(std::shared_ptr<ProvisionIdentityManager> prov_mgr,
+                             std::shared_ptr<CredentialManager> cred_mgr,
                              const std::string& config_root,
                              const std::string& store_root) {
-    if (!cred_mgr) {
+    if (!cred_mgr || !prov_mgr) {
         return false;
     }
 
     cred_mgr_ = cred_mgr;
+    prov_mgr_ = prov_mgr;
 
     // Open framework-store for runtime state and OTA-updatable params (Design §5)
     store_ = std::make_shared<hwyz::store::Store>(
@@ -78,6 +81,29 @@ bool MqttService::initialize(std::shared_ptr<CredentialManager> cred_mgr,
     // CR-005 §4.2: 初始化离线队列
     auto queue_config = config_manager_->getOfflineQueueConfig();
     cache_queue_ = std::make_unique<OfflineCacheQueue>(queue_config.max_size);
+
+    // CR-006 §4: 初始化 tbox::prov_client (before SEC, per CR-006 §4 init order)
+    auto identity_snapshot = config_manager_->getSnapshot();
+    if (identity_snapshot) {
+        auto identity_section = identity_snapshot->getSection("mqtt.identity");
+        if (identity_section) {
+            prov_mgr_->setClientIdFormat(
+                identity_section->getString("client_id_format", "{vin}-{sn}"));
+
+            auto prov_retry_section = identity_section->getSection("prov_retry");
+            if (prov_retry_section) {
+                ProvisionRetryConfig prov_config;
+                prov_config.initial_backoff = Duration(
+                    prov_retry_section->getInt("initial_backoff_ms", 500));
+                prov_config.max_backoff = Duration(
+                    prov_retry_section->getInt("max_backoff_ms", 30000));
+                prov_config.multiplier =
+                    prov_retry_section->getDouble("multiplier", 2.0);
+                state_machine_->setProvisionRetryConfig(prov_config);
+            }
+        }
+    }
+    prov_mgr_->initialize();
 
     // CR-005 §4.2: 初始化 tbox::sec_client
     cred_mgr_->initialize();
@@ -139,6 +165,18 @@ bool MqttService::initialize(std::shared_ptr<CredentialManager> cred_mgr,
     config_manager_->setChangeCallback(
         [this]() {
             auto config = config_manager_->getConfig();
+            // CR-006 §6: Populate identity-derived fields before connect
+            auto identity = prov_mgr_->getSnapshot();
+            if (identity.client_id.empty() || identity.ecu_uid.empty()) {
+                MqttLogAdapter::connection().warn(
+                    "mqtt.config.applied",
+                    "配置已应用但身份无效，等待 PROV 绑定",
+                    {{"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}}
+                );
+                return;
+            }
+            config.client_id = identity.client_id;
+            config.username = identity.ecu_uid;
             MqttLogAdapter::connection().info(
                 "mqtt.config.applied",
                 "配置已应用，发起重连",
@@ -154,34 +192,13 @@ bool MqttService::initialize(std::shared_ptr<CredentialManager> cred_mgr,
 }
 
 bool MqttService::start() {
-    if (!cred_mgr_) {
+    if (!cred_mgr_ || !prov_mgr_) {
         return false;
     }
 
+    // CR-006 §4: State machine starts in PROV_WAIT; onConnectionStateChanged
+    // callback reads PROV binding and transitions to CERT_WAIT if valid.
     state_machine_->start();
-
-    // CR-005 §4.2: 启动 Broker connection state machine
-    if (cred_mgr_->isCredentialReady()) {
-        MqttLogAdapter::connection().info(
-            "mqtt.certificate.ready",
-            "SEC 凭据就绪，进入连接流程"
-        );
-        state_machine_->onCertificateReady();
-    } else {
-        // mqtt.certificate.waiting event (CR-003 §4, CR-005 §9)
-        auto state_info = state_machine_->getStateInfo();
-        MqttLogAdapter::connection().info(
-            "mqtt.certificate.waiting",
-            "SEC 凭据尚未就绪，连接保持等待",
-            {
-                {"state", tbox::fw::log::FieldValue::makeString(
-                    connectionStateToString(state_info.state))},
-                {"retry_count", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(state_info.retry_count))},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
-            }
-        );
-    }
 
     return true;
 }
@@ -323,6 +340,7 @@ PublishResult MqttService::publishEnvelope(const PublishEnvelope& env) {
         msg.priority = env.priority;
         msg.created_at = std::chrono::steady_clock::now();
         msg.state = MessageState::PENDING;
+        msg.identity_generation = prov_mgr_->getGeneration();  // CR-006 §7
 
         if (cache_queue_->enqueue(msg)) {
             // accepted: 离线时成功写入离线队列 (CR-004 §5.2)
@@ -591,8 +609,23 @@ void MqttService::onMessageReceived(const std::string& topic,
 // ============================================================
 
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
-    // CR-005 §6: CERT_WAIT 状态检查凭据（初始进入或退避超时轮询）
-    if (new_state == ConnectionState::CERT_WAIT) {
+    // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
+    if (new_state == ConnectionState::PROV_WAIT) {
+        if (prov_mgr_->readBinding()) {
+            state_machine_->onProvisionReady();
+        } else {
+            auto state_info = state_machine_->getStateInfo();
+            MqttLogAdapter::provision().info(
+                "mqtt.provision.waiting",
+                "PROV 绑定未就绪，保持 PROV_WAIT 退避重试",
+                {
+                    {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(state_info.retry_count))},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
+                }
+            );
+        }
+    } else if (new_state == ConnectionState::CERT_WAIT) {
         ActiveTlsCredential credential;
         if (cred_mgr_->getTlsCredential(credential) && credential.ready) {
             MqttLogAdapter::connection().info(
@@ -614,13 +647,23 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
         }
     } else if (new_state == ConnectionState::CONNECTING) {
         auto config = config_manager_->getConfig();
+        // CR-006 §6: Populate identity-derived fields from PROV binding
+        auto identity = prov_mgr_->getSnapshot();
+        config.client_id = identity.client_id;
+        config.username = identity.ecu_uid;
+        // CR-006 §7: Capture identity generation for post-CONNACK verification
+        connect_identity_generation_ = identity.generation;
+
         MqttLogAdapter::connection().info(
             "mqtt.connection.connecting",
             "发起 MQTT 连接",
             {
                 {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
                 {"broker_port", tbox::fw::log::FieldValue::makeInt(config.broker_port)},
-                {"keepalive_s", tbox::fw::log::FieldValue::makeInt(config.keepalive)}
+                {"keepalive_s", tbox::fw::log::FieldValue::makeInt(config.keepalive)},
+                {"client_id_hash", tbox::fw::log::FieldValue::makeString(clientIdHash(config.client_id))},
+                {"identity_generation", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(connect_identity_generation_))}
             }
         );
         if (!client_manager_->connect(config)) {
@@ -639,6 +682,22 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             state_machine_->onConnectionFailure("Failed to initiate MQTT connection");
         }
     } else if (new_state == ConnectionState::CONNECTED) {
+        // CR-006 §7: Verify identity generation hasn't changed since CONNECT
+        if (prov_mgr_->hasIdentityChanged(connect_identity_generation_)) {
+            MqttLogAdapter::provision().warn(
+                "mqtt.provision.identity_changed",
+                "CONNACK 后身份 generation 已变化，断开重连",
+                {
+                    {"generation", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(prov_mgr_->getGeneration()))},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
+                }
+            );
+            client_manager_->disconnect();
+            state_machine_->onProvisionChanged();
+            return;
+        }
+
         auto config = config_manager_->getConfig();
         MqttLogAdapter::connection().info(
             "mqtt.connection.established",
@@ -657,9 +716,25 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                 {{"queue_depth", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(cached))}}
             );
         }
+        auto current_gen = prov_mgr_->getGeneration();
         while (!cache_queue_->empty()) {
             auto msg = cache_queue_->dequeue();
             if (msg.has_value()) {
+                // CR-006 §7: Skip messages with stale identity generation
+                if (msg->identity_generation != 0 &&
+                    msg->identity_generation != current_gen) {
+                    MqttLogAdapter::offline_queue().warn(
+                        "mqtt.offline_queue.message_dropped",
+                        "身份变化后丢弃旧 Topic 消息",
+                        {
+                            {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(msg->msg_id))},
+                            {"queue_depth", tbox::fw::log::FieldValue::makeInt(
+                                static_cast<int64_t>(cache_queue_->size()))},
+                            {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1006")}
+                        }
+                    );
+                    continue;
+                }
                 client_manager_->publish(msg->topic, msg->payload, msg->qos);
             }
         }

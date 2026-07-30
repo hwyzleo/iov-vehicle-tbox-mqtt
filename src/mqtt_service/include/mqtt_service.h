@@ -21,6 +21,7 @@ class RouteBridge;
 class ConfigManager;
 class CredentialManager;
 class SecTlsKeyAdapter;
+class ProvisionIdentityManager;
 
 /// Main MQTT service (设计 §5, CR-004 §2)
 ///
@@ -31,9 +32,11 @@ public:
     MqttService();
     ~MqttService();
 
-    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4, CR-005 §4.2)
+    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4, CR-005 §4.2, CR-006 §4)
     // CR-005: 使用 CredentialManager 替代 SecCertInterface
-    bool initialize(std::shared_ptr<CredentialManager> cred_mgr,
+    // CR-006: 使用 ProvisionIdentityManager 获取 PROV 绑定前置
+    bool initialize(std::shared_ptr<ProvisionIdentityManager> prov_mgr,
+                    std::shared_ptr<CredentialManager> cred_mgr,
                     const std::string& config_root,
                     const std::string& store_root);
 
@@ -105,6 +108,7 @@ private:
     std::unique_ptr<RouteBridge> route_bridge_;
     std::unique_ptr<ConfigManager> config_manager_;
     std::shared_ptr<CredentialManager> cred_mgr_;
+    std::shared_ptr<ProvisionIdentityManager> prov_mgr_;
     std::unique_ptr<SecTlsKeyAdapter> tls_adapter_;
     std::shared_ptr<hwyz::store::Store> store_;
 
@@ -114,6 +118,9 @@ private:
     std::unique_ptr<MqttDispatchQueue> dispatch_queue_;
     MqttIpcConfig ipc_config_;
     bool ipc_reject_new_ = false;  // 停止时拒绝新请求 (CR-004 §4)
+
+    // CR-006 §7: 连接构造时捕获的身份 generation，CONNACK 后核对
+    uint64_t connect_identity_generation_ = 0;
 };
 
 } // namespace mqtt

@@ -58,7 +58,9 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
 
     // Read static config fields from framework-config snapshot (CR-005 §3.1, §8)
     current_config_.credential_profile = config_snapshot_->getString("mqtt.tls.credential_profile", "mqtt");
-    current_config_.client_id = config_snapshot_->getString("mqtt.client_id", "");
+    // CR-006 §9: client_id_format (read-only cloud access contract), not instance value
+    current_config_.client_id_format =
+        config_snapshot_->getString("mqtt.identity.client_id_format", "{vin}-{sn}");
     current_config_.keepalive = static_cast<uint16_t>(config_snapshot_->getInt("mqtt.keepalive", 60));
     current_config_.clean_start = config_snapshot_->getBool("mqtt.clean_start", false);
     current_config_.session_expiry = static_cast<uint32_t>(config_snapshot_->getInt("mqtt.session_expiry", 3600));
@@ -73,8 +75,7 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
     current_config_.handshake_timeout = Duration(
         config_snapshot_->getInt("mqtt.tls.handshake_timeout_ms", 10000));
 
-    current_config_.username = config_snapshot_->getString("mqtt.username", "");
-
+    // CR-006 §6.3: username is runtime-derived from ecu_uid, not from config
     // Read default broker values from framework-config (may be overridden by store)
     current_config_.broker_host = config_snapshot_->getString("mqtt.broker_host", "localhost");
     current_config_.broker_port = static_cast<uint16_t>(config_snapshot_->getInt("mqtt.broker_port", 1883));
@@ -202,7 +203,8 @@ bool ConfigManager::validateConfig(const ConnectionConfig& config) const {
         return false;
     }
 
-    if (config.client_id.empty()) {
+    // CR-006 §9: client_id_format 必填（云端接入契约）
+    if (config.client_id_format.empty()) {
         return false;
     }
 

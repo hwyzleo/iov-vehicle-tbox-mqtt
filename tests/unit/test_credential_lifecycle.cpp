@@ -133,6 +133,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialInvalidTransition) {
     // CR-005 §6: CONNECTING -> CERT_WAIT (SEC-1011~1014)
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 
@@ -144,6 +145,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialChangedFromConnected) {
     // CR-005 §6: CONNECTED -> CERT_WAIT (credential changed / revoked / SEC restart)
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionSuccess();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
@@ -156,6 +158,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialStateChangedFromReconnecting
     // CR-005 §6: RECONNECTING -> CERT_WAIT (credential state changed)
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     sm.onConnectionFailure("network error");
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
@@ -178,6 +181,7 @@ TEST(CredentialLifecycleTest, StateMachineCredentialChangedFromConnecting) {
     // CR-005 §6: CONNECTING -> CERT_WAIT (credential changed during connect)
     ConnectionStateMachine sm;
     sm.start();
+    sm.onProvisionReady();
     sm.onCertificateReady();
     ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
 
@@ -193,9 +197,9 @@ TEST(CredentialLifecycleTest, CredentialPollConfigSetsBackoff) {
     config.max_backoff = Duration(5000);
     sm.setCredentialPollConfig(config);
 
-    // Start -> CERT_WAIT (should use configured backoff)
+    // Start -> PROV_WAIT
     sm.start();
-    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
 }
 
 TEST(CredentialLifecycleTest, TlsAdapterDestroyAfterBuild) {

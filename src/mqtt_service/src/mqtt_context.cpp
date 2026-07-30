@@ -104,7 +104,7 @@ std::string topicTemplate(const std::string& topic) {
             first = false;
 
             if (isLikelyDeviceSegment(segment)) {
-                result += "{device_sn}";
+                result += "{ecu_uid}";
             } else {
                 result += segment;
             }
@@ -120,6 +120,18 @@ std::string topicTemplate(const std::string& topic) {
 
 std::string clientIdHash(const std::string& client_id) {
     return hashPrefix(client_id, "c_");
+}
+
+std::string vinHash(const std::string& vin) {
+    return hashPrefix(vin, "v_");
+}
+
+std::string snHash(const std::string& sn) {
+    return hashPrefix(sn, "s_");
+}
+
+std::string ecuUidHash(const std::string& ecu_uid) {
+    return hashPrefix(ecu_uid, "e_");
 }
 
 std::string msgIdHash(const std::string& msg_id) {

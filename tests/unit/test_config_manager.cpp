@@ -11,7 +11,7 @@ namespace {
 // Helper: create a temp config directory with common.yaml and mqtt.yaml
 std::string createTempConfigDir(const std::string& broker_host = "test.mqtt.com",
                                  int broker_port = 1883,
-                                 const std::string& client_id = "TEST123") {
+                                 const std::string& client_id_format = "{vin}-{sn}") {
     auto tmp_dir = std::filesystem::temp_directory_path() / "tbox_mqtt_test_config";
     auto conf_d = tmp_dir / "conf.d";
     std::filesystem::create_directories(conf_d);
@@ -34,7 +34,8 @@ std::string createTempConfigDir(const std::string& broker_host = "test.mqtt.com"
         ofs << "mqtt:\n"
             << "  broker_host: " << broker_host << "\n"
             << "  broker_port: " << broker_port << "\n"
-            << "  client_id: " << client_id << "\n"
+            << "  identity:\n"
+            << "    client_id_format: \"" << client_id_format << "\"\n"
             << "  keepalive: 30\n"
             << "  clean_start: true\n"
             << "  session_expiry: 7200\n"
@@ -76,7 +77,7 @@ TEST(ConfigManagerTest, LoadFromFrameworkConfig) {
     auto cfg = config.getConfig();
     EXPECT_EQ(cfg.broker_host, "test.mqtt.com");
     EXPECT_EQ(cfg.broker_port, 1883);
-    EXPECT_EQ(cfg.client_id, "TEST123");
+    EXPECT_EQ(cfg.client_id_format, "{vin}-{sn}");
     EXPECT_EQ(cfg.keepalive, 30);
     EXPECT_TRUE(cfg.clean_start);
     EXPECT_EQ(cfg.session_expiry, 7200);
@@ -116,7 +117,7 @@ TEST(ConfigManagerTest, ApplyFactoryConfig) {
     ConnectionConfig factory_config;
     factory_config.broker_host = "factory.mqtt.com";
     factory_config.broker_port = 8883;
-    factory_config.client_id = "TEST123";
+    factory_config.client_id_format = "{vin}-{sn}";
     factory_config.credential_profile = "mqtt";
     factory_config.source = ConnectionConfig::Source::FACTORY;
     factory_config.version = 1;
@@ -143,7 +144,7 @@ TEST(ConfigManagerTest, ApplyOtaConfigWithStore) {
     ConnectionConfig ota_config;
     ota_config.broker_host = "ota.mqtt.com";
     ota_config.broker_port = 8883;
-    ota_config.client_id = "TEST123";
+    ota_config.client_id_format = "{vin}-{sn}";
     ota_config.credential_profile = "mqtt";
     ota_config.source = ConnectionConfig::Source::OTA;
     ota_config.version = 2;
@@ -175,7 +176,7 @@ TEST(ConfigManagerTest, LoadFromStoreAfterOTA) {
         ConnectionConfig ota_config;
         ota_config.broker_host = "ota-loaded.mqtt.com";
         ota_config.broker_port = 9999;
-        ota_config.client_id = "TEST123";
+        ota_config.client_id_format = "{vin}-{sn}";
         ota_config.credential_profile = "mqtt";
         ota_config.source = ConnectionConfig::Source::OTA;
         ota_config.version = 5;
@@ -225,7 +226,7 @@ TEST(ConfigManagerTest, ConfigChangeCallback) {
 
     ConnectionConfig new_config;
     new_config.broker_host = "new.mqtt.com";
-    new_config.client_id = "TEST123";
+    new_config.client_id_format = "{vin}-{sn}";
     new_config.credential_profile = "mqtt";
     config.applyConfig(new_config, ConnectionConfig::Source::FACTORY);
 
@@ -249,7 +250,7 @@ TEST(ConfigManagerTest, OtaConfigVersionCheck) {
     ConnectionConfig v2_config;
     v2_config.broker_host = "v2.mqtt.com";
     v2_config.broker_port = 8883;
-    v2_config.client_id = "TEST123";
+    v2_config.client_id_format = "{vin}-{sn}";
     v2_config.credential_profile = "mqtt";
     v2_config.version = 2;
     ASSERT_TRUE(config.applyConfig(v2_config, ConnectionConfig::Source::OTA));
@@ -258,7 +259,7 @@ TEST(ConfigManagerTest, OtaConfigVersionCheck) {
     ConnectionConfig v1_config;
     v1_config.broker_host = "v1.mqtt.com";
     v1_config.broker_port = 1883;
-    v1_config.client_id = "TEST123";
+    v1_config.client_id_format = "{vin}-{sn}";
     v1_config.credential_profile = "mqtt";
     v1_config.version = 1;
     EXPECT_FALSE(config.applyConfig(v1_config, ConnectionConfig::Source::OTA));

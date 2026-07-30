@@ -36,6 +36,7 @@ public:
     static tbox::fw::log::Logger offline_queue();
     static tbox::fw::log::Logger router();
     static tbox::fw::log::Logger ipc();
+    static tbox::fw::log::Logger provision();
 
     // 获取 service 级别 Logger（用于初始化成功等生命周期事件）
     static tbox::fw::log::Logger service();

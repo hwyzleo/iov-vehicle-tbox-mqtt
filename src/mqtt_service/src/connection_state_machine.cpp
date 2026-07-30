@@ -35,26 +35,31 @@ void ConnectionStateMachine::start() {
         // Restore previous state from framework-store before starting
         restoreState();
 
-        // On restart, any active connection state is invalid - a live
-        // TCP/TLS session cannot be resumed across process boundaries.
-        // Downgrade CONNECTED / CONNECTING / RECONNECTING to CERT_WAIT so
-        // the normal flow (CERT_WAIT -> onCertificateReady -> CONNECTING)
+        // CR-006 §4: On restart, PROV binding snapshot is in-memory only,
+        // so we must always re-read binding from PROV_WAIT. A live TCP/TLS
+        // session also cannot be resumed across process boundaries.
+        // Downgrade CONNECTED / CONNECTING / RECONNECTING / CERT_WAIT to
+        // PROV_WAIT so the normal flow (PROV_WAIT -> CERT_WAIT -> CONNECTING)
         // re-establishes the connection from scratch.
         if (state_info_.state == ConnectionState::CONNECTED ||
             state_info_.state == ConnectionState::CONNECTING ||
-            state_info_.state == ConnectionState::RECONNECTING) {
-            state_info_.state = ConnectionState::CERT_WAIT;
-            state_info_.last_error = "Restarted, re-entering CERT_WAIT";
+            state_info_.state == ConnectionState::RECONNECTING ||
+            state_info_.state == ConnectionState::CERT_WAIT) {
+            state_info_.state = ConnectionState::PROV_WAIT;
+            state_info_.last_error = "Restarted, re-entering PROV_WAIT";
             state_info_.retry_count = 0;
             persistState();
         }
 
         if (state_info_.state == ConnectionState::INIT ||
             state_info_.state == ConnectionState::OFFLINE) {
-            credential_poll_count_ = 0;
-            calculateNextCredentialPoll();
-            cb = transitionTo(ConnectionState::CERT_WAIT);
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
+            cb = transitionTo(ConnectionState::PROV_WAIT);
         } else {
+            // PROV_WAIT (from downgrade or restored)
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
             cb = callback_;
         }
 
@@ -163,10 +168,12 @@ void ConnectionStateMachine::onNetworkRestored() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_info_.state == ConnectionState::OFFLINE) {
             state_info_.retry_count = 0;
-            cb = transitionTo(ConnectionState::CERT_WAIT);
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
+            cb = transitionTo(ConnectionState::PROV_WAIT);
         }
     }
-    if (cb) cb(ConnectionState::CERT_WAIT);
+    if (cb) cb(ConnectionState::PROV_WAIT);
 }
 
 void ConnectionStateMachine::onDisconnect() {
@@ -191,6 +198,89 @@ void ConnectionStateMachine::onDisconnect() {
 void ConnectionStateMachine::setCredentialPollConfig(const CredentialPollConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     credential_poll_config_ = config;
+}
+
+// ============================================================
+// CR-006 §4: PROV 绑定事件
+// ============================================================
+
+void ConnectionStateMachine::setProvisionRetryConfig(const ProvisionRetryConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    provision_retry_config_ = config;
+}
+
+void ConnectionStateMachine::onProvisionReady() {
+    // CR-006 §4: PROV_WAIT -> CERT_WAIT (binding valid)
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::PROV_WAIT) {
+            provision_poll_count_ = 0;  // Reset PROV poll count
+            credential_poll_count_ = 0;
+            calculateNextCredentialPoll();
+            cb = transitionTo(ConnectionState::CERT_WAIT);
+        }
+    }
+    if (cb) cb(ConnectionState::CERT_WAIT);
+}
+
+void ConnectionStateMachine::onProvisionInvalid(const std::string& reason) {
+    // CR-006 §4: binding invalid/changed -> PROV_WAIT
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTING ||
+            state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::RECONNECTING) {
+            state_info_.last_error = reason;
+            state_info_.retry_count = 0;
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
+            cb = transitionTo(ConnectionState::PROV_WAIT);
+        } else if (state_info_.state == ConnectionState::PROV_WAIT) {
+            // Already in PROV_WAIT, increment poll count for next retry
+            provision_poll_count_++;
+            calculateNextProvisionPoll();
+            cb = callback_;
+        }
+    }
+    timer_cv_.notify_all();
+    if (cb) cb(ConnectionState::PROV_WAIT);
+}
+
+void ConnectionStateMachine::onProvisionChanged() {
+    // CR-006 §7: binding changed during active connection -> PROV_WAIT
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::CONNECTED ||
+            state_info_.state == ConnectionState::CONNECTING ||
+            state_info_.state == ConnectionState::RECONNECTING) {
+            connection_generation_++;  // Invalidate connection generation
+            state_info_.last_error = "Provision binding changed";
+            state_info_.retry_count = 0;
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
+            cb = transitionTo(ConnectionState::PROV_WAIT);
+        }
+    }
+    timer_cv_.notify_all();
+    if (cb) cb(ConnectionState::PROV_WAIT);
+}
+
+void ConnectionStateMachine::onProvisionPollTimeout() {
+    // CR-006 §4: PROV_WAIT 退避超时，递增计数并重新计算退避
+    // 实际的 PROV readBinding 由 MqttService 经 state change callback 触发
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::PROV_WAIT) {
+            provision_poll_count_++;
+            calculateNextProvisionPoll();
+            cb = callback_;
+        }
+    }
+    if (cb) cb(ConnectionState::PROV_WAIT);
 }
 
 void ConnectionStateMachine::onCredentialInvalid(const std::string& reason) {
@@ -304,6 +394,29 @@ void ConnectionStateMachine::calculateNextCredentialPoll() {
     next_credential_poll_at_ = std::chrono::steady_clock::now() + delay;
 }
 
+// CR-006 §4: PROV_WAIT 独立退避（不与 CERT_WAIT / 网络重连混用）
+void ConnectionStateMachine::calculateNextProvisionPoll() {
+    // 指数退避 with configurable multiplier (CR-006 §9)
+    double multiplier = provision_retry_config_.multiplier;
+    if (multiplier < 1.0) multiplier = 1.0;
+
+    double delay_ms = static_cast<double>(provision_retry_config_.initial_backoff.count());
+    for (uint32_t i = 0; i < std::min(provision_poll_count_, 6u); ++i) {
+        delay_ms *= multiplier;
+    }
+    auto delay = Duration(static_cast<int64_t>(delay_ms));
+    delay = std::min(delay, provision_retry_config_.max_backoff);
+
+    auto jitter_ms = delay.count() / 10;
+    if (jitter_ms > 0) {
+        std::uniform_int_distribution<int64_t> dist(-jitter_ms, jitter_ms);
+        auto jitter = dist(rng_);
+        delay += std::chrono::milliseconds(jitter);
+    }
+
+    next_provision_poll_at_ = std::chrono::steady_clock::now() + delay;
+}
+
 void ConnectionStateMachine::persistState() {
     if (!store_ || !store_->isReady()) {
         return;
@@ -393,12 +506,28 @@ void ConnectionStateMachine::timerLoop() {
             lock.unlock();
             onCredentialPollTimeout();
             lock.lock();
+        } else if (state_info_.state == ConnectionState::PROV_WAIT) {
+            // CR-006 §4: PROV_WAIT 独立退避定时器
+            auto wake_time = next_provision_poll_at_;
+            bool predicate_changed = timer_cv_.wait_until(lock, wake_time, [this] {
+                return !timer_running_ ||
+                       state_info_.state != ConnectionState::PROV_WAIT;
+            });
+
+            if (!timer_running_) break;
+            if (predicate_changed) continue; // State changed externally, re-evaluate
+
+            // Timeout expired and state is still PROV_WAIT -> trigger provision poll.
+            lock.unlock();
+            onProvisionPollTimeout();
+            lock.lock();
         } else {
             // Not in RECONNECTING or CERT_WAIT; sleep until state changes or we stop
             timer_cv_.wait(lock, [this] {
                 return !timer_running_ ||
                        state_info_.state == ConnectionState::RECONNECTING ||
-                       state_info_.state == ConnectionState::CERT_WAIT;
+                       state_info_.state == ConnectionState::CERT_WAIT ||
+                       state_info_.state == ConnectionState::PROV_WAIT;
             });
         }
     }

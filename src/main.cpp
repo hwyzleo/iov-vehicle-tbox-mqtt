@@ -2,6 +2,7 @@
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include "credential_manager.h"
+#include "provision_identity_manager.h"
 #include "config.h"
 #include "log_types.h"
 #include <iostream>
@@ -101,6 +102,23 @@ int main(int argc, char* argv[]) {
         }
     );
 
+    // CR-006 §4: 初始化 tbox::prov_client (ProvisionIdentityManager)
+    // CR-006 §4 init order: PROV before SEC
+    std::string prov_socket_path = snapshot->getString("prov.socket_path", "/tmp/tbox-prov.sock");
+    auto prov_mgr = std::make_shared<ProvisionIdentityManager>(prov_socket_path);
+
+#ifdef SIMULATE_PROV
+    {
+        ProvisionIdentitySnapshot sim_snapshot;
+        sim_snapshot.vin = "HWYZTEST900000001";
+        sim_snapshot.ecu_uid = "00000001AA00000001";
+        sim_snapshot.sn = "TBOX00000001";
+        sim_snapshot.state = tbox::prov::ProvisionState::BOUND;
+        sim_snapshot.locked = true;
+        prov_mgr->simulateBinding(sim_snapshot);
+    }
+#endif
+
     // CR-005 §4.2: 初始化 tbox::sec_client (CredentialManager)
     std::string sec_socket_path = snapshot->getString("sec.socket_path", "/tmp/tbox-sec.sock");
     std::string credential_profile = snapshot->getString("mqtt.tls.credential_profile", "mqtt");
@@ -113,7 +131,7 @@ int main(int argc, char* argv[]) {
     // CR-004 §4: 构造 MqttService 并初始化
     g_service = std::make_unique<MqttService>();
 
-    if (!g_service->initialize(cred_mgr, config_root, store_root)) {
+    if (!g_service->initialize(prov_mgr, cred_mgr, config_root, store_root)) {
         MqttLogAdapter::service().error(
             "mqtt.service.init_failed",
             "Failed to initialize MQTT service"

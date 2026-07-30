@@ -31,6 +31,12 @@ set(SEC_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-sec)
 set(SEC_INCLUDE_DIR ${SEC_DIR}/include)
 find_library(SEC_CLIENT_LIB tbox_sec_client PATHS ${SEC_DIR}/build NO_DEFAULT_PATH)
 
+# PROV client SDK (CR-006)
+set(PROV_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov)
+set(PROV_INCLUDE_DIR ${PROV_DIR}/include)
+find_library(PROV_CLIENT_LIB tbox_prov_client PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
+find_library(PROV_DAEMON_LIB TboxProvLib PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
+
 # yaml-cpp 头文件随 TBoxFramework 一起安装在 ${FRAMEWORK_INCLUDE_DIR} 下，
 # 不再探测 brew / conda 路径。
 
@@ -40,6 +46,7 @@ set(TEST_COMMON_INCLUDES
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
     ${FRAMEWORK_INCLUDE_DIR}
     ${SEC_INCLUDE_DIR}
+    ${PROV_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 
@@ -211,6 +218,18 @@ target_link_libraries(test_mqtt_ipc_fault_injection mqtt_service_lib tbox_mqtt_c
 
 # Add tests
 add_test(NAME ConnectionStateMachineTest COMMAND test_connection_state_machine)
+
+# CR-006: ProvisionIdentityManager tests
+add_executable(test_provision_identity_manager
+    unit/test_provision_identity_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/provision_identity_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_provision_identity_manager PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_provision_identity_manager GTest::gtest_main ${FRAMEWORK_LIB} ${PROV_CLIENT_LIB} ${PROV_DAEMON_LIB} pthread)
+
+add_test(NAME ProvisionIdentityManagerTest COMMAND test_provision_identity_manager)
 add_test(NAME CredentialManagerTest COMMAND test_credential_manager)
 add_test(NAME SecTlsKeyAdapterTest COMMAND test_sec_tls_key_adapter)
 add_test(NAME CredentialLifecycleTest COMMAND test_credential_lifecycle)
@@ -219,6 +238,16 @@ add_test(NAME OfflineCacheQueueTest COMMAND test_offline_cache_queue)
 add_test(NAME RouteBridgeTest COMMAND test_route_bridge)
 add_test(NAME ConfigManagerTest COMMAND test_config_manager)
 add_test(NAME MqttServiceIntegrationTest COMMAND test_mqtt_service_integration)
+
+# CR-006: MqttService PROV integration tests
+add_executable(test_mqtt_service_provision
+    unit/test_mqtt_service_provision.cpp
+)
+target_include_directories(test_mqtt_service_provision PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_directories(test_mqtt_service_provision PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_service_provision mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
+
+add_test(NAME MqttServiceProvisionTest COMMAND test_mqtt_service_provision)
 add_test(NAME EndToEndTest COMMAND test_end_to_end)
 add_test(NAME MqttIpcProtocolTest COMMAND test_mqtt_ipc_protocol)
 add_test(NAME MqttIpcDispatcherTest COMMAND test_mqtt_ipc_dispatcher)

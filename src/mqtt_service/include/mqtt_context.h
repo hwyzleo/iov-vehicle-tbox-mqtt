@@ -58,9 +58,9 @@ std::string generateRequestId();
 std::string brokerHash(const std::string& broker_host);
 
 /**
- * 将 topic 模板化，移除设备实例值 (CR-003 §5)
+ * 将 topic 模板化，移除设备实例值 (CR-003 §5, CR-006 §6.2)
  * 例如: vehicle/HWYZTEST900000001-00000001AA00000001/up/fota
- *    -> vehicle/{device_sn}/up/fota
+ *    -> vehicle/{ecu_uid}/up/fota
  * 若无法模板化则输出不可逆摘要: t_<8位hex>
  */
 std::string topicTemplate(const std::string& topic);
@@ -70,6 +70,24 @@ std::string topicTemplate(const std::string& topic);
  * 输出格式: "c_<8位hex>"
  */
 std::string clientIdHash(const std::string& client_id);
+
+/**
+ * 对 VIN 生成不可逆摘要 (CR-006 §8)
+ * 输出格式: "v_<8位hex>"
+ */
+std::string vinHash(const std::string& vin);
+
+/**
+ * 对 SN 生成不可逆摘要 (CR-006 §8)
+ * 输出格式: "s_<8位hex>"
+ */
+std::string snHash(const std::string& sn);
+
+/**
+ * 对 ECU UID 生成不可逆摘要 (CR-006 §8)
+ * 输出格式: "e_<8位hex>"
+ */
+std::string ecuUidHash(const std::string& ecu_uid);
 
 /**
  * 对 msg_id 生成不可逆摘要 (CR-003 §5)

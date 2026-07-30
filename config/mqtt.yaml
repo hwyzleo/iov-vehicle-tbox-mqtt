@@ -19,7 +19,14 @@ mqtt:
   broker_port: 8883
 
   # --- Static connection parameters (read-only) ---
-  client_id: HWYZTEST900000001-00000001AA00000001          # VIN + SN combination
+  # CR-006 §9: client_id is no longer a static config value; it is derived
+  # at runtime from PROV binding (VIN + SN). Only the format template is configured.
+  identity:
+    client_id_format: "{vin}-{sn}"    # cloud access contract; must reference vin and sn only
+    prov_retry:
+      initial_backoff_ms: 500
+      max_backoff_ms: 30000
+      multiplier: 2.0
   keepalive: 60                    # seconds
   clean_start: false
   session_expiry: 3600             # seconds
@@ -34,8 +41,7 @@ mqtt:
       initial_backoff_ms: 1000
       max_backoff_ms: 60000
 
-  # --- MQTT username (optional, mTLS 默认认证) ---
-  username: ""
+  # --- MQTT username (CR-006: runtime-derived from ecu_uid, not configured) ---
 
   # --- Offline cache queue (MQTT self-developed persistence, Design §3) ---
   # Queue persistence is self-developed by MQTT (SQLite/file ring buffer),

@@ -134,6 +134,25 @@ TEST_F(MqttLogRedactionTest, HashHelperFunctions) {
     EXPECT_EQ(brokerHash(""), "h_empty");
     EXPECT_EQ(clientIdHash(""), "c_empty");
     EXPECT_EQ(msgIdHash(""), "m_empty");
+
+    // CR-006 §8: 新增身份 hash 函数
+    EXPECT_EQ(vinHash(""), "v_empty");
+    EXPECT_EQ(snHash(""), "s_empty");
+    EXPECT_EQ(ecuUidHash(""), "e_empty");
+
+    std::string vhash = vinHash("HWYZTEST900000001");
+    std::string shash = snHash("TBOX00000001");
+    std::string ehash = ecuUidHash("00000001AA00000001");
+    EXPECT_NE(vhash.find("v_"), std::string::npos);
+    EXPECT_NE(shash.find("s_"), std::string::npos);
+    EXPECT_NE(ehash.find("e_"), std::string::npos);
+    // 不同标识产生不同 hash
+    EXPECT_NE(vhash, shash);
+    EXPECT_NE(vhash, ehash);
+    EXPECT_NE(shash, ehash);
+    // 不可逆：不含原始值
+    EXPECT_EQ(vhash.find("HWYZTEST"), std::string::npos);
+    EXPECT_EQ(ehash.find("00000001"), std::string::npos);
 }
 
 // ============================================================
@@ -142,7 +161,7 @@ TEST_F(MqttLogRedactionTest, HashHelperFunctions) {
 TEST_F(MqttLogRedactionTest, TopicTemplateFunction) {
     // 包含设备标识的 topic 应被模板化
     std::string templated = topicTemplate("vehicle/HWYZTEST900000001-00000001AA00000001/up/fota");
-    EXPECT_NE(templated.find("{device_sn}"), std::string::npos);
+    EXPECT_NE(templated.find("{ecu_uid}"), std::string::npos);
     EXPECT_EQ(templated.find("HWYZTEST900000001"), std::string::npos);
 
     // 不含设备标识的 topic 保持原样
@@ -154,7 +173,7 @@ TEST_F(MqttLogRedactionTest, TopicTemplateFunction) {
 
     // 多段设备标识
     std::string multi = topicTemplate("vehicle/VIN123SN456/down/VIN123SN456/config");
-    EXPECT_NE(multi.find("{device_sn}"), std::string::npos);
+    EXPECT_NE(multi.find("{ecu_uid}"), std::string::npos);
     EXPECT_EQ(multi.find("VIN123SN456"), std::string::npos);
 }
 
