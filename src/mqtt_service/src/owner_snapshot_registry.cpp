@@ -50,6 +50,13 @@ OwnerSnapshotRegistry::ValidationResult OwnerSnapshotRegistry::validate(
             r.reason_code = "invalid_topic_template";
             return r;
         }
+        // CR-009 §4.2: 模板语法/变量白名单/静态结构校验
+        auto tvr = template_validator_.validate(item.topic_template);
+        if (!tvr.ok) {
+            r.rejected_route_ids.push_back(item.route_id);
+            r.reason_code = tvr.reason_code;
+            return r;
+        }
         if (!validQos(item.qos)) {
             r.rejected_route_ids.push_back(item.route_id);
             r.reason_code = "invalid_qos";

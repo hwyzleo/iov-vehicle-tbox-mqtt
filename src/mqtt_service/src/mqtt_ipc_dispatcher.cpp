@@ -95,6 +95,14 @@ std::string MqttIpcDispatcher::dispatch(uint32_t method_id,
             case ipc::MethodId::GET_SUBSCRIPTION_READINESS:
                 result = handleGetSubscriptionReadiness();
                 break;
+            // CR-009 §6.1: route-based 发布
+            case ipc::MethodId::PUBLISH_ROUTE:
+                result = handlePublishRoute(params_json);
+                break;
+            // CR-010 §3: routed downlink 事件订阅
+            case ipc::MethodId::SUBSCRIBE_ROUTED_DOWNLINK:
+                result = handleSubscribeRoutedDownlink(params_json, client_fd);
+                break;
             default:
                 MqttLogAdapter::ipc().warn(
                     "mqtt.ipc.unknown_method",
@@ -162,6 +170,20 @@ void MqttIpcDispatcher::onClientDisconnected(int client_fd) {
                  tbox::fw::log::FieldValue::makeInt(static_cast<int>(it->second.size())))}
         );
         fd_subscriptions_.erase(it);
+    }
+    // CR-010 §3: 清理 routed downlink fd->owner 注册表
+    {
+        std::lock_guard<std::mutex> rlock(routed_mutex_);
+        auto fit = fd_routed_owner_.find(client_fd);
+        if (fit != fd_routed_owner_.end()) {
+            const std::string& owner = fit->second;
+            auto oit = routed_owner_fds_.find(owner);
+            if (oit != routed_owner_fds_.end()) {
+                oit->second.erase(client_fd);
+                if (oit->second.empty()) routed_owner_fds_.erase(oit);
+            }
+            fd_routed_owner_.erase(fit);
+        }
     }
 }
 
@@ -403,6 +425,128 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetSubscriptionReadines
     resp["mandatory_active"] = r.mandatory_active;
     resp["reason_code"] = r.reason_code;
     return {0, resp.dump()};
+}
+
+// ============================================================
+// CR-009 §6.1: Route-based 发布 handler
+// ============================================================
+
+std::pair<int32_t, std::string> MqttIpcDispatcher::handlePublishRoute(
+        std::string_view params) {
+    auto j = nlohmann::json::parse(params);
+
+    RoutePublishRequest req;
+    req.key.owner = j.value("owner", "");
+    req.key.route_id = j.value("route_id", "");
+    req.msg_id = j.value("msg_id", "");
+    req.priority = parse_priority(j.value("priority", 1));
+    req.content_type = j.value("content_type", "");
+    req.trace_id = j.value("trace_id", "");
+    req.request_id = j.value("request_id", "");
+
+    if (j.contains("qos")) {
+        req.qos = static_cast<uint8_t>(j["qos"].get<int>());
+    }
+
+    std::string payload_b64 = j.value("payload_base64", "");
+    if (!payload_b64.empty()) {
+        req.payload = b64_decode(payload_b64);
+    }
+
+    // msg_id / owner / route_id 必填 (CR-009 §6.1)
+    if (req.msg_id.empty() || req.key.owner.empty() || req.key.route_id.empty()) {
+        MqttLogAdapter::publish().warn(
+            "mqtt.route.publish.rejected",
+            "msg_id/owner/route_id 为空，拒绝发布",
+            {{"owner", tbox::fw::log::FieldValue::makeString(req.key.owner)},
+             {"route_id_hash", tbox::fw::log::FieldValue::makeString(
+                 topicTemplate(req.key.route_id))},
+             {"payload_bytes", tbox::fw::log::FieldValue::makeInt(
+                 static_cast<int64_t>(req.payload.size()))},
+             {"validation_reason", tbox::fw::log::FieldValue::makeString("missing_required_field")},
+             {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1004")}}
+        );
+        nlohmann::json resp;
+        resp["accepted"] = false;
+        resp["outcome"] = "rejected";
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004), resp.dump()};
+    }
+
+    // 去重：相同 msg_id 已受理则返回已有受理状态 (CR-004 §5.2)
+    {
+        std::lock_guard<std::mutex> lock(dedup_mutex_);
+        if (accepted_msg_ids_.count(req.msg_id) > 0) {
+            nlohmann::json resp;
+            resp["accepted"] = true;
+            resp["outcome"] = "accepted";
+            resp["deduplicated"] = true;
+            return {0, resp.dump()};
+        }
+    }
+
+    auto result = service_->onPublishRoute(req);
+
+    if (result.accepted) {
+        std::lock_guard<std::mutex> lock(dedup_mutex_);
+        accepted_msg_ids_.insert(req.msg_id);
+    }
+
+    nlohmann::json resp;
+    resp["accepted"] = result.accepted;
+    resp["outcome"] = result.accepted ? "accepted" : "rejected";
+    return {result.error.has_value() ? static_cast<int32_t>(result.error.value()) : 0,
+            resp.dump()};
+}
+
+// ============================================================
+// CR-010 §3: routed downlink 事件订阅 handler
+// ============================================================
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleSubscribeRoutedDownlink(
+        std::string_view params, int client_fd) {
+    // framework-ipc Client::subscribe 携带 {"owner": ...} params (CR-010 §3.1)
+    std::string owner;
+    try {
+        auto j = nlohmann::json::parse(params);
+        owner = j.value("owner", "");
+    } catch (...) {
+        nlohmann::json resp;
+        resp["ok"] = false;
+        resp["error"] = "Invalid params";
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004), resp.dump()};
+    }
+    if (owner.empty()) {
+        nlohmann::json resp;
+        resp["ok"] = false;
+        resp["error"] = "Missing owner";
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004), resp.dump()};
+    }
+
+    // 登记 fd<->owner（daemon 按 owner 定向推送，不广播给 legacy 订阅者, CR-010 §3.1）
+    {
+        std::lock_guard<std::mutex> lock(routed_mutex_);
+        fd_routed_owner_[client_fd] = owner;
+        routed_owner_fds_[owner].insert(client_fd);
+    }
+
+    auto [status, ok] = service_->onSubscribeRoutedDownlinkEventChannel(owner, client_fd);
+
+    MqttLogAdapter::ipc().info(
+        "mqtt.ipc.routed_subscribed",
+        "Routed downlink event channel subscribed",
+        {tbox::fw::log::Field("peer", tbox::fw::log::FieldValue::makeInt(client_fd)),
+         tbox::fw::log::Field("owner", tbox::fw::log::FieldValue::makeString(owner))}
+    );
+
+    nlohmann::json resp;
+    resp["ok"] = ok;
+    return {status, resp.dump()};
+}
+
+std::vector<int> MqttIpcDispatcher::getRoutedFdsForOwner(const std::string& owner) const {
+    std::lock_guard<std::mutex> lock(routed_mutex_);
+    auto it = routed_owner_fds_.find(owner);
+    if (it == routed_owner_fds_.end()) return {};
+    return std::vector<int>(it->second.begin(), it->second.end());
 }
 
 } // namespace mqtt

@@ -38,7 +38,7 @@ void MqttDispatchQueue::start() {
             }
             try {
                 if (push_cb_) {
-                    push_cb_(item.topic, item.payload);
+                    push_cb_(item.topic, item.payload, item.route_event);
                 }
             } catch (const std::exception& e) {
                 MqttLogAdapter::ipc().error(
@@ -81,7 +81,38 @@ bool MqttDispatchQueue::enqueue(const std::string& topic,
             );
             return false;
         }
-        queue_.push(Item{topic, payload});
+        queue_.push(Item{topic, payload, std::nullopt});
+    }
+    cv_.notify_one();
+    return true;
+}
+
+bool MqttDispatchQueue::enqueueRouted(const RoutedDownlinkEnvelope& event) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.size() >= max_size_) {
+            dropped_.fetch_add(1);
+            MqttLogAdapter::router().warn(
+                "mqtt.downlink.route_failed",
+                "分发队列已满，route-based 下行消息被丢弃",
+                {{"route_id_hash", tbox::fw::log::FieldValue::makeString(
+                     topicTemplate(event.key.route_id))},
+                 {"payload_size", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(event.payload.size()))},
+                 {"queue_depth", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(queue_.size()))},
+                 {"queue_capacity", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(max_size_))},
+                 {"reason", tbox::fw::log::FieldValue::makeString("dispatch_queue_full")},
+                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1007")}}
+            );
+            return false;
+        }
+        Item item;
+        item.topic = "";  // route-based 不携带完整 topic
+        item.payload = event.payload;
+        item.route_event = event;
+        queue_.push(std::move(item));
     }
     cv_.notify_one();
     return true;

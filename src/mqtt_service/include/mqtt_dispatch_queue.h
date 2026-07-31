@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -22,7 +23,8 @@ namespace mqtt {
 class MqttDispatchQueue {
 public:
     using PushCallback = std::function<void(const std::string& topic,
-                                            const std::vector<uint8_t>& payload)>;
+                                            const std::vector<uint8_t>& payload,
+                                            const std::optional<RoutedDownlinkEnvelope>& route_event)>;;
 
     /// @param max_size    队列容量（dispatch_queue_size）
     /// @param push_cb     出队时调用的推送回调
@@ -41,6 +43,10 @@ public:
     /// @return true 入队成功；false 队列满已丢弃
     bool enqueue(const std::string& topic, const std::vector<uint8_t>& payload);
 
+    /// CR-009 §7: 入队 route-based 下行事件（非阻塞，有界）
+    /// @return true 入队成功；false 队列满已丢弃
+    bool enqueueRouted(const RoutedDownlinkEnvelope& event);
+
     /// 当前队列深度
     size_t size() const;
 
@@ -51,6 +57,7 @@ private:
     struct Item {
         std::string topic;
         std::vector<uint8_t> payload;
+        std::optional<RoutedDownlinkEnvelope> route_event;  // CR-009 §7
     };
 
     const size_t max_size_;

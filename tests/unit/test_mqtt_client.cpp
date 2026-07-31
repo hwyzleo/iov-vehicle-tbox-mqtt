@@ -44,6 +44,9 @@ public:
     SubscriptionReadiness onGetSubscriptionReadiness() override {
         return SubscriptionReadiness{};
     }
+    PublishResult onPublishRoute(const RoutePublishRequest&) override {
+        return PublishResult{};
+    }
 };
 
 class MqttClientTest : public ::testing::Test {

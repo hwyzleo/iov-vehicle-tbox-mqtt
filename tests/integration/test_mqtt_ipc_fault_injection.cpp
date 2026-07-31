@@ -33,6 +33,7 @@ public:
     SnapshotStatusResult onGetSubscriptionSnapshotStatus(
         const std::string&, uint64_t) override { return SnapshotStatusResult{}; }
     SubscriptionReadiness onGetSubscriptionReadiness() override { return SubscriptionReadiness{}; }
+    PublishResult onPublishRoute(const RoutePublishRequest&) override { return PublishResult{}; }
 };
 
 struct ServerCtx {

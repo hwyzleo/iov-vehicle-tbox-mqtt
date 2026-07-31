@@ -54,6 +54,7 @@ public:
     SnapshotStatusResult onGetSubscriptionSnapshotStatus(
         const std::string&, uint64_t) override { return SnapshotStatusResult{}; }
     SubscriptionReadiness onGetSubscriptionReadiness() override { return SubscriptionReadiness{}; }
+    PublishResult onPublishRoute(const RoutePublishRequest&) override { return PublishResult{}; }
 };
 } // namespace
 
@@ -103,7 +104,7 @@ TEST(MqttIpcBackpressureTest, BurstMessagesDelivered) {
 // ---- Broker callback 不阻塞：经 dispatch queue 推送 (CR-004 §4) ----
 TEST(MqttIpcBackpressureTest, BrokerCallbackNonBlockingViaDispatchQueue) {
     std::atomic<int> pushed{0};
-    MqttDispatchQueue dq(256, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue dq(256, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         pushed.fetch_add(1);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));  // 模拟慢 push
     });
@@ -128,7 +129,7 @@ TEST(MqttIpcBackpressureTest, DispatchQueueFullDropsAndLogs) {
     bool block = true;
     std::atomic<int> processed{0};
 
-    MqttDispatchQueue dq(4, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue dq(4, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         std::unique_lock<std::mutex> lk(mtx);
         processed.fetch_add(1);
         cv.notify_one();

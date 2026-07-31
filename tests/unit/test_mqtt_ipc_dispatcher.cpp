@@ -71,6 +71,9 @@ public:
     SubscriptionReadiness onGetSubscriptionReadiness() override {
         return last_readiness;
     }
+    PublishResult onPublishRoute(const RoutePublishRequest&) override {
+        return PublishResult{};
+    }
 };
 
 class MqttIpcDispatcherTest : public ::testing::Test {

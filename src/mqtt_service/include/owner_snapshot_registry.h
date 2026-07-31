@@ -18,6 +18,7 @@
 
 #include "mqtt_types.h"
 #include "tbox/mqtt/types.h"
+#include "topic_template_validator.h"
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,9 @@ private:
         std::vector<std::string> rejected_route_ids;
     };
     ValidationResult validate(const OwnerSubscriptionSnapshot& snapshot) const;
+
+    // CR-009 §4: Topic 模板校验器
+    TopicTemplateValidator template_validator_;
 
     mutable std::mutex mutex_;
     std::shared_ptr<const State> state_;

@@ -3,11 +3,276 @@
 #include "mqtt_retry_policy.h"
 #include "utils.h"
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace tbox {
 namespace mqtt {
+
+// ============================================================
+// CR-010 §4: routed downlink 解析与校验助手
+// ============================================================
+namespace {
+
+// 字段长度与 payload 上限 (CR-010 §4, 安全边界)
+constexpr size_t kMaxOwnerLen     = 128;
+constexpr size_t kMaxRouteIdLen   = 128;
+constexpr size_t kMaxTargetLen    = 128;
+constexpr size_t kMaxRequestIdLen = 128;
+constexpr size_t kMaxTraceIdLen   = 256;
+constexpr size_t kMaxPayloadBytes = 1 * 1024 * 1024;  // 1 MiB
+// 每 owner 有界 dispatch queue 容量 (CR-010 §5)
+constexpr size_t kRoutedDispatchQueueSize = 128;
+
+/// owner 命名规则：非空、长度受限、仅 [A-Za-z0-9._-]
+bool isValidOwnerName(const std::string& s) {
+    if (s.empty() || s.size() > kMaxOwnerLen) return false;
+    for (char c : s) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// 通用非空可打印字符串校验
+bool isValidMetaString(const std::string& s, size_t max_len) {
+    if (s.empty() || s.size() > max_len) return false;
+    for (char c : s) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7f) return false;  // 拒绝控制字符
+    }
+    return true;
+}
+
+/// base64 字符 -> 6bit 值，非法返回 -1
+static int b64CharVal(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/// 严格 base64 解码：校验字母表/填充/长度后解码，失败返回 false 且不产生部分输出 (CR-010 §4)
+bool strictB64Decode(const std::string& s, std::vector<std::uint8_t>& out) {
+    out.clear();
+    if (s.empty()) return true;
+    if (s.size() % 4 != 0) return false;
+
+    // 校验尾部填充
+    size_t pad = 0;
+    if (s.size() >= 1 && s.back() == '=') pad++;
+    if (s.size() >= 2 && s[s.size() - 2] == '=') pad++;
+    for (size_t i = 0; i < s.size() - pad; ++i) {
+        if (s[i] == '=') return false;  // 填充只能出现在末尾
+    }
+    for (size_t i = s.size() - pad; i < s.size(); ++i) {
+        if (s[i] != '=') return false;
+    }
+    // 字母表校验（非填充位）
+    for (size_t i = 0; i < s.size() - pad; ++i) {
+        if (b64CharVal(static_cast<unsigned char>(s[i])) < 0) return false;
+    }
+
+    out.reserve((s.size() / 4) * 3);
+    for (size_t i = 0; i < s.size(); i += 4) {
+        int v0 = b64CharVal(static_cast<unsigned char>(s[i]));
+        int v1 = b64CharVal(static_cast<unsigned char>(s[i + 1]));
+        int v2 = (s[i + 2] != '=') ? b64CharVal(static_cast<unsigned char>(s[i + 2])) : 0;
+        int v3 = (s[i + 3] != '=') ? b64CharVal(static_cast<unsigned char>(s[i + 3])) : 0;
+        out.push_back(static_cast<std::uint8_t>((v0 << 2) | (v1 >> 4)));
+        if (s[i + 2] != '=') out.push_back(static_cast<std::uint8_t>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+        if (s[i + 3] != '=') out.push_back(static_cast<std::uint8_t>(((v2 & 0x03) << 6) | v3));
+    }
+    if (out.size() > kMaxPayloadBytes) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+/// 解析并校验 routed downlink JSON -> typed event (CR-010 §4)
+/// 任一步失败返回 false（不产生部分 event）；expected_owner 必须与事件 owner 完全一致。
+bool parseRoutedEvent(std::string_view payload_json,
+                     const std::string& expected_owner,
+                     RoutedDownlinkEvent& out) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(payload_json);
+    } catch (...) {
+        return false;
+    }
+    if (!j.is_object()) return false;
+
+    std::string owner = j.value("owner", "");
+    std::string route_id = j.value("route_id", "");
+    std::string target = j.value("target", "");
+    std::string request_id = j.value("request_id", "");
+    std::string trace_id = j.value("trace_id", "");
+    std::string payload_b64 = j.value("payload_base64", "");
+
+    // 必填非空 + 长度/格式校验
+    if (!isValidOwnerName(owner)) return false;
+    if (owner != expected_owner) return false;  // SDK 二次验证 owner (CR-010 §4 step 3)
+    if (!isValidMetaString(route_id, kMaxRouteIdLen)) return false;
+    if (!isValidMetaString(target, kMaxTargetLen)) return false;
+    if (!isValidMetaString(request_id, kMaxRequestIdLen)) return false;
+    if (!trace_id.empty() && !isValidMetaString(trace_id, kMaxTraceIdLen)) return false;
+
+    // qos 只接受 0/1/2
+    if (!j.contains("qos") || !j["qos"].is_number_integer()) return false;
+    int qos = j["qos"].get<int>();
+    if (qos < 0 || qos > 2) return false;
+
+    // payload_base64 类型校验 + 严格解码
+    if (!j["payload_base64"].is_string()) return false;
+    std::vector<std::uint8_t> payload;
+    if (!strictB64Decode(payload_b64, payload)) return false;
+
+    out.owner = std::move(owner);
+    out.route_id = std::move(route_id);
+    out.target = std::move(target);
+    out.qos = static_cast<std::uint8_t>(qos);
+    out.payload = std::move(payload);
+    out.request_id = std::move(request_id);
+    out.trace_id = std::move(trace_id);
+    return true;
+}
+
+} // anonymous namespace
+
+// ============================================================
+// CR-010 §2.2/§5/§6: RoutedSubscription::Impl
+// 每个 routed 订阅独立连接 + 有界 dispatch queue（解耦 IPC 读取与业务 callback）。
+// reader 线程 = framework Subscription 读取线程（解析/校验后入队）；
+// dispatcher 线程 = 出队调用业务 callback。队列满按 disconnect 策略由 dispatcher
+// 取消 framework 订阅（不能在 reader 线程内 cancel，避免 join 自身死锁）。
+// ============================================================
+class RoutedSubscription::Impl
+    : public std::enable_shared_from_this<RoutedSubscription::Impl> {
+public:
+    Impl(std::string owner, RoutedDownlinkCallback callback,
+         size_t queue_capacity)
+        : owner_(std::move(owner))
+        , callback_(std::move(callback))
+        , queue_capacity_(queue_capacity) {}
+
+    ~Impl() { cancel(); }
+
+    // 在 Client::Impl 持有的 fw_client 上建立独立事件连接 (CR-010 §3.1)
+    void start(::tbox::fw::ipc::Client* fw_client) {
+        nlohmann::json params;
+        params["owner"] = owner_;
+        auto self = shared_from_this();
+        fw_sub_ = fw_client->subscribe(
+            static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_ROUTED_DOWNLINK),
+            static_cast<uint32_t>(ipc::EventType::ROUTED_DOWNLINK_MESSAGE),
+            params.dump(),
+            [self](uint32_t /*ev_type*/, std::string_view payload_json) {
+                self->onEvent(payload_json);
+            });
+        dispatcher_ = std::thread(&Impl::dispatchLoop, this);
+    }
+
+    // 幂等取消：停 reader + dispatcher，等待在途 callback 完成 (CR-010 §6)
+    void cancel() {
+        bool expected = true;
+        if (!active_.compare_exchange_strong(expected, false)) {
+            return;  // 已取消
+        }
+        overflowed_.store(true);  // 唤醒 dispatcher
+        queue_cv_.notify_all();
+        if (dispatcher_.joinable()) dispatcher_.join();
+        fw_sub_.cancel();  // 幂等：停 reader 线程并关闭连接
+    }
+
+    bool isActive() const {
+        return active_.load() && !overflowed_.load() && fw_sub_.isActive();
+    }
+
+private:
+    // reader 线程回调：解析/校验后入队；队列满按 disconnect 策略标记溢出 (CR-010 §5)
+    void onEvent(std::string_view payload_json) {
+        if (!active_.load() || overflowed_.load()) return;
+        RoutedDownlinkEvent event;
+        if (!parseRoutedEvent(payload_json, owner_, event)) {
+            // MQTT-1013：缺失/非法/owner 不匹配/base64 失败，丢弃当前事件，继续读取 (CR-010 §4/§9)
+            return;
+        }
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (queue_.size() >= queue_capacity_) {
+                overflow = true;
+            } else {
+                queue_.push_back(std::move(event));
+            }
+        }
+        if (overflow) {
+            // disconnect 策略：标记溢出，由 dispatcher 取消 framework 订阅 (CR-010 §5)
+            overflowed_.store(true);
+            queue_cv_.notify_all();
+        } else {
+            queue_cv_.notify_one();
+        }
+    }
+
+    // dispatcher 线程：串行出队调用业务 callback（锁外），异常不终止线程 (CR-010 §5)
+    void dispatchLoop() {
+        while (true) {
+            RoutedDownlinkEvent event;
+            bool have_event = false;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_cv_.wait(lock, [this] {
+                    return !active_.load() || overflowed_.load() || !queue_.empty();
+                });
+                if (!active_.load()) {
+                    return;  // cancel：不再启动新 callback (CR-010 §6)
+                }
+                if (overflowed_.load()) {
+                    break;  // 溢出：退出后取消 framework 订阅
+                }
+                if (!queue_.empty()) {
+                    event = std::move(queue_.front());
+                    queue_.pop_front();
+                    have_event = true;
+                }
+            }
+            if (have_event) {
+                try {
+                    if (callback_) callback_(event);
+                } catch (...) {
+                    // 捕获业务异常，继续读取 (CR-010 §5)
+                }
+            }
+        }
+        // 溢出 disconnect：由 dispatcher（非 reader 线程）取消 framework 订阅，关闭 fd
+        fw_sub_.cancel();
+    }
+
+    std::string owner_;
+    RoutedDownlinkCallback callback_;
+    size_t queue_capacity_;
+
+    std::deque<RoutedDownlinkEvent> queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+
+    std::atomic<bool> active_{true};
+    std::atomic<bool> overflowed_{false};
+
+    ::tbox::fw::ipc::Subscription fw_sub_;
+    std::thread dispatcher_;
+};
 
 // ============================================================
 // Client::Impl
@@ -20,6 +285,7 @@ public:
     }
 
     ~Impl() {
+        cancelAllRouted();  // CR-010 §6: 先取消 routed 订阅（join reader/dispatcher），再断 fw_client
         disconnect();
     }
 
@@ -107,10 +373,79 @@ public:
             });
     }
 
+    // ---- CR-010 §2.2/§7: routed downlink 订阅 ----
+    // 返回 shared_ptr<RoutedSubscription::Impl>；nullptr 表示 owner 互斥冲突或参数非法。
+    std::shared_ptr<RoutedSubscription::Impl>
+    subscribeRoutedDownlink(std::string_view owner, RoutedDownlinkCallback callback) {
+        std::string owner_str(owner);
+        if (!isValidOwnerName(owner_str) || !callback) {
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(routed_mutex_);
+        // 互斥注册表：同一 owner 不得重复 routed 订阅 (CR-010 §7)
+        auto it = routed_registry_.find(owner_str);
+        if (it != routed_registry_.end()) {
+            if (auto sp = it->second.lock()) {
+                if (sp->isActive()) {
+                    // 冲突：在发出任何 IPC 请求前失败 (CR-010 §7)
+                    return nullptr;
+                }
+            }
+            routed_registry_.erase(it);
+        }
+
+        auto impl = std::make_shared<RoutedSubscription::Impl>(
+            owner_str, std::move(callback), kRoutedDispatchQueueSize);
+        impl->start(fw_client_.get());
+        routed_registry_[owner_str] = impl;
+        return impl;
+    }
+
+    void cancelAllRouted() {
+        std::vector<std::shared_ptr<RoutedSubscription::Impl>> live;
+        {
+            std::lock_guard<std::mutex> lock(routed_mutex_);
+            live.reserve(routed_registry_.size());
+            for (auto& [owner, weak] : routed_registry_) {
+                if (auto sp = weak.lock()) live.push_back(std::move(sp));
+            }
+            routed_registry_.clear();
+        }
+        for (auto& sp : live) sp->cancel();  // join reader/dispatcher
+    }
+
 private:
     std::string socket_path_;
     std::unique_ptr<::tbox::fw::ipc::Client> fw_client_;
+
+    // CR-010 §7: owner -> routed 订阅注册表（互斥 + 析构批量取消）
+    std::map<std::string, std::weak_ptr<RoutedSubscription::Impl>> routed_registry_;
+    std::mutex routed_mutex_;
 };
+
+// ============================================================
+// RoutedSubscription facade (CR-010 §2.2)
+// ============================================================
+RoutedSubscription::RoutedSubscription() = default;
+
+RoutedSubscription::~RoutedSubscription() {
+    if (impl_) impl_->cancel();
+}
+
+RoutedSubscription::RoutedSubscription(RoutedSubscription&&) noexcept = default;
+RoutedSubscription& RoutedSubscription::operator=(RoutedSubscription&&) noexcept = default;
+
+RoutedSubscription::RoutedSubscription(std::shared_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+void RoutedSubscription::cancel() {
+    if (impl_) impl_->cancel();
+}
+
+bool RoutedSubscription::isActive() const {
+    return impl_ && impl_->isActive();
+}
 
 // ============================================================
 // Client facade (CR-004 §7.1)
@@ -179,6 +514,61 @@ PublishResult Client::publish(const PublishEnvelope& message) {
     return result;
 }
 
+// ============================================================
+// CR-009 §6.1: Route-based 发布
+// ============================================================
+
+PublishResult Client::publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   QoS qos,
+                                   Priority priority,
+                                   const std::string& content_type,
+                                   const std::string& trace_id,
+                                   const std::string& request_id) {
+    PublishResult result;
+
+    // 构建 route publish JSON (CR-009 §6.1)
+    nlohmann::json params;
+    params["owner"] = owner;
+    params["route_id"] = route_id;
+    params["msg_id"] = msg_id;
+    params["qos"] = static_cast<int>(qos);
+    params["priority"] = static_cast<int>(priority);
+    params["content_type"] = content_type;
+    if (!payload.empty()) {
+        params["payload_base64"] = impl_->b64_encode(payload);
+    }
+    params["trace_id"] = trace_id;
+    params["request_id"] = request_id;
+
+    // publishRoute: 相同 msg_id 可去重时允许一次重试 (同 publish 语义, CR-004 §7.1)
+    auto [ok, status, response_json] = impl_->send_request(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), params.dump());
+
+    if (!ok) {
+        result.accepted = false;
+        result.outcome = PublishOutcome::UNKNOWN;
+        return result;
+    }
+
+    try {
+        auto j = nlohmann::json::parse(response_json);
+        result.accepted = j.value("accepted", false);
+        std::string outcome = j.value("outcome", "rejected");
+        result.outcome = (outcome == "accepted") ? PublishOutcome::ACCEPTED
+                                                  : PublishOutcome::UNKNOWN;
+        if (status != 0) {
+            result.error = static_cast<ErrorCode>(status);
+        }
+    } catch (const std::exception&) {
+        result.accepted = false;
+        result.outcome = PublishOutcome::UNKNOWN;
+    }
+    return result;
+}
+
 ::tbox::fw::ipc::Subscription Client::subscribe(const Route& route, MessageCallback callback) {
     nlohmann::json params;
     params["topic"] = route.topic;
@@ -204,6 +594,18 @@ PublishResult Client::publish(const PublishEnvelope& message) {
                 if (cb) cb(topic, payload);
             }
         });
+}
+
+// ============================================================
+// CR-010 §2.2: Routed downlink 订阅
+// ============================================================
+RoutedSubscription Client::subscribeRoutedDownlink(std::string_view owner,
+                                                   RoutedDownlinkCallback callback) {
+    auto impl = impl_->subscribeRoutedDownlink(owner, std::move(callback));
+    if (!impl) {
+        return RoutedSubscription{};  // 互斥冲突或参数非法：空句柄
+    }
+    return RoutedSubscription(std::move(impl));
 }
 
 Result<void> Client::registerRoute(const RouteEntry& route) {

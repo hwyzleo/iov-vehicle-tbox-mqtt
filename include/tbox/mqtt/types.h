@@ -183,6 +183,32 @@ using MessageCallback = std::function<void(
     const std::string& topic, const std::vector<uint8_t>& payload)>;
 
 // ============================================================
+// Routed Downlink 事件模型 (CR-010 §2.1)
+// ============================================================
+//
+// daemon 已将 Broker 下行完整 Topic 映射为 routed downlink 事件，事件 payload
+// 包含 owner/route_id/target/qos/payload_base64/request_id/trace_id，不下发完整 Topic。
+// SDK 严格解码后以此结构交付业务调用方，使调用方按稳定业务路由而非完整 Topic 分发。
+// 完整 Broker Topic 默认不进入该公开事件模型。
+
+/// Routed downlink 公开事件 (CR-010 §2.1)
+/// 字段经 SDK 严格校验与 base64 解码后填充；调用方按 owner/route_id/target 分发。
+struct RoutedDownlinkEvent {
+    std::string owner;            // 必填，订阅 owner
+    std::string route_id;         // 必填，owner 内稳定路由标识
+    std::string target;           // 必填，目标处理器，如 tsp.fota
+    std::uint8_t qos{0};          // 0/1/2
+    std::vector<std::uint8_t> payload;  // payload_base64 解码后的二进制
+    std::string request_id;       // 必填
+    std::string trace_id;         // 可选，存在时已通过格式校验
+};
+
+/// Routed downlink 业务回调 (CR-010 §2.1)
+/// callback 在 SDK 内部锁外调用；抛出的异常由 SDK 捕获，不得终止读取线程。
+using RoutedDownlinkCallback =
+    std::function<void(const RoutedDownlinkEvent&)>;
+
+// ============================================================
 // 订阅快照与 Cloud Readiness (CR-007 §3, §4, §10; 对齐 TSP DSN-CR-004 §3, §5)
 // ============================================================
 // 本组 DTO 由 daemon (MqttIpcDispatcher) 与 client SDK (tbox::mqtt::Client) 共享，

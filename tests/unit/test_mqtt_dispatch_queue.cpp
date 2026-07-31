@@ -14,7 +14,7 @@ TEST(MqttDispatchQueueTest, EnqueueAndDispatch) {
     std::atomic<int> count{0};
     std::vector<std::string> topics;
     std::mutex mtx;
-    MqttDispatchQueue q(16, [&](const std::string& topic, const std::vector<uint8_t>&) {
+    MqttDispatchQueue q(16, [&](const std::string& topic, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         std::lock_guard<std::mutex> lk(mtx);
         topics.push_back(topic);
         count.fetch_add(1);
@@ -45,7 +45,7 @@ TEST(MqttDispatchQueueTest, QueueFullDrops) {
     std::condition_variable push_cv;
     bool block = true;
 
-    MqttDispatchQueue q(2, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue q(2, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         std::unique_lock<std::mutex> lk(push_mtx);
         pushed.fetch_add(1);
         push_cv.notify_one();
@@ -75,7 +75,7 @@ TEST(MqttDispatchQueueTest, QueueFullDrops) {
 // ---- Broker callback 不阻塞 (CR-004 §4) ----
 // 即使 push 回调慢，enqueue 应快速返回
 TEST(MqttDispatchQueueTest, EnqueueDoesNotBlockOnSlowCallback) {
-    MqttDispatchQueue q(64, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue q(64, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     });
     q.start();
@@ -95,7 +95,7 @@ TEST(MqttDispatchQueueTest, EnqueueDoesNotBlockOnSlowCallback) {
 // ---- stop flush 剩余项 ----
 TEST(MqttDispatchQueueTest, StopFlushesRemaining) {
     std::atomic<int> count{0};
-    MqttDispatchQueue q(32, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue q(32, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         count.fetch_add(1);
     });
     q.start();
@@ -112,7 +112,7 @@ TEST(MqttDispatchQueueTest, StopFlushesRemaining) {
 // ---- 突发消息不丢（容量内） ----
 TEST(MqttDispatchQueueTest, BurstWithinCapacity) {
     std::atomic<int> count{0};
-    MqttDispatchQueue q(128, [&](const std::string&, const std::vector<uint8_t>&) {
+    MqttDispatchQueue q(128, [&](const std::string&, const std::vector<uint8_t>&, const std::optional<RoutedDownlinkEnvelope>&) {
         count.fetch_add(1);
     });
     q.start();

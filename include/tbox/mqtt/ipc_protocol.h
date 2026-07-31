@@ -22,6 +22,11 @@ enum class MethodId : uint32_t {
     REPLACE_SUBSCRIPTION_SNAPSHOT    = 6,  // replaceSubscriptionSnapshot -> 原子接受/拒绝
     GET_SUBSCRIPTION_SNAPSHOT_STATUS = 7,  // getSubscriptionSnapshotStatus -> 幂等查询
     GET_SUBSCRIPTION_READINESS       = 8,  // getSubscriptionReadiness -> Cloud Ready 诊断
+    // CR-009 §6.1: route-based 发布
+    PUBLISH_ROUTE                    = 9,  // publishRoute -> 按 owner/route_id 发布
+    GET_ROUTE_PROJECTION_STATUS      = 10, // getRouteProjectionStatus -> 投影状态诊断
+    // CR-010 §3: route-aware 下行事件订阅（握手携 owner，不触发 Broker SUBSCRIBE）
+    SUBSCRIBE_ROUTED_DOWNLINK        = 11, // subscribeRoutedDownlink -> 登记 fd->owner 事件通道
 };
 
 /// MQTT IPC 事件类型（与 framework-ipc EventHeader.event_type 一致, CR-004 §6）
@@ -30,6 +35,8 @@ enum class EventType : uint32_t {
     DOWNLINK_MESSAGE          = 1,  // 下行消息（payload 为下行 envelope JSON）
     CONNECTION_STATE_CHANGED  = 2,  // 连接状态变更
     CLOUD_READY_CHANGED       = 3,  // Cloud Ready 状态变更 (CR-007 §10)
+    // CR-010 §3: routed downlink 事件（daemon 按 owner 定向推送，不广播给 legacy 订阅者）
+    ROUTED_DOWNLINK_MESSAGE   = 4,  // routed downlink（payload 为 routed envelope JSON）
 };
 
 } // namespace ipc

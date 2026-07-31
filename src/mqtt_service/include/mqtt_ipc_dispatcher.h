@@ -54,6 +54,14 @@ public:
             const std::string& owner, uint64_t generation) = 0;
         /// getSubscriptionReadiness：Cloud Ready 诊断
         virtual SubscriptionReadiness onGetSubscriptionReadiness() = 0;
+        // ---- CR-009 §6.1: route-based 发布 ----
+        /// publishRoute：按 owner/route_id 发布
+        virtual PublishResult onPublishRoute(const RoutePublishRequest& req) = 0;
+        // ---- CR-010 §3: routed downlink 事件订阅 ----
+        /// subscribeRoutedDownlink 事件通道：登记 fd 到 ROUTED_DOWNLINK_MESSAGE 并记录 owner。
+        /// 默认实现返回成功（便于既有 stub 不破纲）。
+        virtual std::pair<int32_t, bool> onSubscribeRoutedDownlinkEventChannel(
+            const std::string& owner, int client_fd) { (void)owner; (void)client_fd; return {0, true}; }
     };
 
     explicit MqttIpcDispatcher(ServiceHandler* service);
@@ -69,6 +77,9 @@ public:
 
     /// client 断连清理：移除 per-fd 订阅，不自动删除持久 RouteEntry (CR-004 §4)
     void onClientDisconnected(int client_fd);
+
+    /// CR-010 §3: 查询 owner 的活跃 routed 订阅 fd 列表（daemon 按 owner 定向推送）
+    std::vector<int> getRoutedFdsForOwner(const std::string& owner) const;
 
     /// 查询 msg_id 是否已被受理（去重，CR-004 §5.2）
     bool isAccepted(const std::string& msg_id) const;
@@ -86,10 +97,19 @@ private:
     std::pair<int32_t, std::string> handleReplaceSubscriptionSnapshot(std::string_view params);
     std::pair<int32_t, std::string> handleGetSubscriptionSnapshotStatus(std::string_view params);
     std::pair<int32_t, std::string> handleGetSubscriptionReadiness();
+    // CR-009 §6.1
+    std::pair<int32_t, std::string> handlePublishRoute(std::string_view params);
+    // CR-010 §3
+    std::pair<int32_t, std::string> handleSubscribeRoutedDownlink(std::string_view params, int client_fd);
 
     // per-fd 订阅集合（client 断连时清理，CR-004 §4）
     std::map<int, std::unordered_set<std::string>> fd_subscriptions_;
     mutable std::mutex fd_mutex_;
+
+    // CR-010 §3: routed downlink fd<->owner 注册表（daemon 按 owner 定向推送）
+    std::unordered_map<int, std::string> fd_routed_owner_;
+    std::unordered_map<std::string, std::unordered_set<int>> routed_owner_fds_;
+    mutable std::mutex routed_mutex_;
 
     // msg_id 去重表（进程生命周期内，accepted 状态，CR-004 §5.2）
     std::unordered_set<std::string> accepted_msg_ids_;

@@ -123,10 +123,110 @@ struct ConnectionStateInfo {
     std::chrono::steady_clock::time_point next_retry_at;
 };
 
+// ============================================================
+// CR-009: Topic 模板与 route-based 路由投影
+// ============================================================
+// 业务 owner 维护稳定的 route_id、topic_template 和业务路由属性；MQTT 使用自身
+// 当前有效的 ProvisionIdentitySnapshot.ecu_uid 将模板实例化为完整 Broker Topic。
+// expanded_topic 只存在于 MQTT 内存运行时投影，不得回写业务快照或成为业务事实来源。
+
+/// Topic 模板变量 (CR-009 §3; v1 仅 ecu_uid)
+struct TopicTemplateVariable {
+    std::string name;  // e.g. "ecu_uid"
+};
+
+/// Topic 模板 (CR-009 §3)
+struct TopicTemplate {
+    std::string value;                          // 原始模板字符串，如 "vehicle/{ecu_uid}/up/fota"
+    std::vector<TopicTemplateVariable> variables;  // v1 仅 ecu_uid
+};
+
+/// 路由键：owner + route_id (CR-009 §3)
+struct RouteKey {
+    std::string owner;
+    std::string route_id;
+
+    bool operator==(const RouteKey& o) const {
+        return owner == o.owner && route_id == o.route_id;
+    }
+    bool operator<(const RouteKey& o) const {
+        if (owner != o.owner) return owner < o.owner;
+        return route_id < o.route_id;
+    }
+};
+
+/// 路由定义（业务 owner 提交的稳定属性，CR-009 §3）
+struct RouteDefinition {
+    RouteKey key;
+    TopicTemplate topic_template;
+    SnapshotDirection direction = SnapshotDirection::UP;
+    uint8_t qos = 1;
+    std::string target;          // 目标处理器，如 tsp.fota
+    bool mandatory = false;
+    uint64_t snapshot_generation = 0;  // owner 快照 generation
+};
+
+/// 路由解析状态 (CR-009 §3, §8)
+enum class RouteState : uint8_t {
+    UNRESOLVED = 0,  // PROV 不可用/未绑定，模板未实例化
+    BUILDING   = 1,  // 正在用当前 identity generation 实例化
+    ACTIVE     = 2,  // 投影已原子发布，可发布/订阅
+    RETIRING   = 3,  // identity generation 已变化，旧路由失效中
+    INVALID    = 4   // 模板展开失败
+};
+
+inline std::string routeStateToString(RouteState s) {
+    switch (s) {
+        case RouteState::UNRESOLVED: return "UNRESOLVED";
+        case RouteState::BUILDING:   return "BUILDING";
+        case RouteState::ACTIVE:     return "ACTIVE";
+        case RouteState::RETIRING:   return "RETIRING";
+        case RouteState::INVALID:    return "INVALID";
+        default: return "UNKNOWN";
+    }
+}
+
+/// 已解析路由（运行时投影条目，CR-009 §3）
+/// expanded_topic 只存在于内存运行时投影，不持久化、不进日志明文。
+struct ResolvedRoute {
+    RouteDefinition definition;
+    std::string expanded_topic;      // 实例化后的完整 Broker Topic（内存）
+    uint64_t identity_generation = 0;  // 展开时使用的身份 generation
+    RouteState state = RouteState::UNRESOLVED;
+};
+
+/// Route-based 发布请求 (CR-009 §3, §6.1)
+struct RoutePublishRequest {
+    RouteKey key;
+    std::string msg_id;
+    std::vector<uint8_t> payload;
+    std::optional<uint8_t> qos;      // 覆盖 route 定义 QoS（策略允许范围内）
+    Priority priority = Priority::NORMAL;
+    std::string content_type;
+    std::string trace_id;
+    std::string request_id;
+};
+
+/// Route-based 下行事件 (CR-009 §3, §7)
+/// 通过 owner 的独立 framework-ipc 订阅连接分发；业务服务无需解析完整 Topic。
+struct RoutedDownlinkEnvelope {
+    RouteKey key;
+    std::string target;             // 目标处理器，如 tsp.fota
+    std::vector<uint8_t> payload;
+    uint8_t qos = 1;
+    std::string request_id;
+    std::string trace_id;
+};
+
 /// 离线缓存队列元素 (设计 §3，MQTT 自身业务数据，自研持久化)
+/// CR-009 §9: route-based 路径保存 RouteKey + accepted_identity_generation，
+/// 发送时从当前投影重新解析 Topic，不将完整 Topic 作为唯一恢复依据。
+/// legacy 路径（route.owner 为空）仍使用 topic 字段。
 struct OutboundMessage {
     std::string msg_id;
-    std::string topic;
+    std::string topic;               // legacy 路径：完整 Topic；route-based 路径可为空
+    RouteKey route;                  // CR-009 §9: route-based 路径的 RouteKey
+    uint64_t accepted_identity_generation = 0;  // CR-009 §9: 入队时身份 generation
     QoS qos;
     std::vector<uint8_t> payload;
     Priority priority = Priority::NORMAL;
@@ -134,6 +234,9 @@ struct OutboundMessage {
     uint32_t retries = 0;
     MessageState state = MessageState::PENDING;
     uint64_t identity_generation = 0;  // CR-006 §7: 入队时绑定身份 generation，身份变化后跳过过期消息
+
+    /// 是否为 route-based 消息（CR-009 §9）
+    bool isRouteBased() const { return !route.owner.empty(); }
 };
 
 /// LWT 配置 (设计 §3)

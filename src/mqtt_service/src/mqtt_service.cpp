@@ -48,7 +48,13 @@ MqttService::MqttService(std::shared_ptr<hwyz::store::Store> store,
       subscription_gate_(std::make_unique<StartupSubscriptionGate>()),
       reconciler_(std::make_unique<BrokerSubscriptionReconciler>()),
       manifest_store_(std::make_unique<AppliedSubscriptionManifestStore>()),
-      cloud_ready_gate_(std::make_unique<CloudReadinessGate>()) {
+      cloud_ready_gate_(std::make_unique<CloudReadinessGate>()),
+      template_resolver_(std::make_unique<TopicTemplateResolver>()),
+      projection_builder_(std::make_unique<TopicProjectionBuilder>()),
+      route_table_(std::make_shared<const EffectiveRouteTable>()),
+      route_publisher_(std::make_unique<RoutePublisher>()),
+      downlink_dispatcher_(std::make_unique<DownlinkRouteDispatcher>()),
+      legacy_guard_(std::make_unique<LegacyTopicGuard>()) {
 }
 
 MqttService::~MqttService() {
@@ -128,6 +134,34 @@ bool MqttService::initializeLocal() {
     reconciler_->setReconcileTimeout(subscription_config_.reconcile_timeout_ms);
     reconciler_->setSubackRetryMax(subscription_config_.suback_retry_max);
     effective_table_->setEcuUid(prov_mgr_.getEcuUid());
+
+    // CR-009 §5: 初始化模板解析器身份
+    template_resolver_->setIdentity(prov_mgr_.getEcuUid(), prov_mgr_.getGeneration());
+
+    // CR-009 §6: RoutePublisher 回调装配
+    route_publisher_->setBrokerPublishFn(
+        [this](const std::string& topic, const std::vector<uint8_t>& payload, QoS qos) -> bool {
+            auto r = client_manager_->publish(topic, payload, qos);
+            return r.accepted;
+        });
+    route_publisher_->setQueueEnqueueFn(
+        [this](const OutboundMessage& msg) -> bool {
+            return cache_queue_->enqueue(msg);
+        });
+    route_publisher_->setIsConnectedFn(
+        [this]() -> bool {
+            auto s = state_machine_->getCurrentState();
+            return s == ConnectionState::CONNECTED || s == ConnectionState::CLOUD_READY ||
+                   s == ConnectionState::SUBSCRIBING || s == ConnectionState::CONNECTED_DEGRADED;
+        });
+
+    // CR-009 §7: DownlinkRouteDispatcher 回调装配
+    downlink_dispatcher_->setDispatchFn(
+        [this](const RoutedDownlinkEnvelope& event) {
+            if (dispatch_queue_) {
+                dispatch_queue_->enqueueRouted(event);
+            }
+        });
 
     // CR-007 §9: SUBACK/UNSUBACK 回调 -> reconciler -> 评估 Cloud Ready
     client_manager_->setSubscribeAckCallback(
@@ -305,8 +339,13 @@ bool MqttService::startIpcServer(const MqttIpcConfig& ipc_config) {
     auto* server_ptr_placeholder = this;
     dispatch_queue_ = std::make_unique<MqttDispatchQueue>(
         ipc_config.dispatch_queue_size,
-        [server_ptr_placeholder](const std::string& topic, const std::vector<uint8_t>& payload) {
-            server_ptr_placeholder->pushDownlinkEvent(topic, payload);
+        [server_ptr_placeholder](const std::string& topic, const std::vector<uint8_t>& payload,
+                                 const std::optional<RoutedDownlinkEnvelope>& route_event) {
+            if (route_event.has_value()) {
+                server_ptr_placeholder->pushRoutedDownlinkEvent(route_event.value());
+            } else {
+                server_ptr_placeholder->pushDownlinkEvent(topic, payload);
+            }
         });
     dispatch_queue_->start();
 
@@ -400,6 +439,24 @@ PublishResult MqttService::publishEnvelope(const PublishEnvelope& env) {
         result.accepted = false;
         result.error = ErrorCode::MQTT_1004;
         return result;
+    }
+
+    // CR-009 §10.2: Legacy 完整 Topic 必须经过 LegacyTopicGuard 校验
+    // 仅当身份有效且有 owner 启用 route API 时校验（混合模式安全守卫）
+    if (template_resolver_->isIdentityValid() && snapshot_registry_->ownerCount() > 0) {
+        if (!legacy_guard_->validate(env.topic, *template_resolver_)) {
+            MqttLogAdapter::publish().warn(
+                "mqtt.route.publish.rejected",
+                "Legacy Topic 未通过守卫校验（设备层不匹配或身份无效）",
+                {{"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(env.topic))},
+                 {"qos", tbox::fw::log::FieldValue::makeString(qosToString(env.qos))},
+                 {"validation_reason", tbox::fw::log::FieldValue::makeString("legacy_guard_rejected")},
+                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1004")}}
+            );
+            result.accepted = false;
+            result.error = ErrorCode::MQTT_1004;
+            return result;
+        }
     }
 
     if (state_machine_->getCurrentState() != ConnectionState::CONNECTED) {
@@ -583,6 +640,26 @@ std::pair<int32_t, bool> MqttService::onSubscribeEventChannel(int client_fd) {
     return {0, true};
 }
 
+// CR-010 §3.1: routed downlink 事件订阅 -- 登记 fd 到 ROUTED_DOWNLINK_MESSAGE
+std::pair<int32_t, bool> MqttService::onSubscribeRoutedDownlinkEventChannel(
+        const std::string& owner, int client_fd) {
+    bool ok = false;
+    if (ipc_server_) {
+        ok = ipc_server_->add_subscription(
+            client_fd, static_cast<uint32_t>(ipc::EventType::ROUTED_DOWNLINK_MESSAGE));
+    }
+    if (!ok) {
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.routed_failed",
+            "routed downlink 事件订阅登记失败",
+            {tbox::fw::log::Field("owner", tbox::fw::log::FieldValue::makeString(owner)),
+             tbox::fw::log::Field("error_code", tbox::fw::log::FieldValue::makeString("MQTT-1008"))}
+        );
+        return {static_cast<int32_t>(ErrorCode::MQTT_1008), false};
+    }
+    return {0, true};
+}
+
 std::pair<int32_t, bool> MqttService::onUnsubscribe(int client_fd) {
     if (ipc_server_) {
         ipc_server_->remove_subscription(
@@ -633,6 +710,19 @@ std::string MqttService::buildDownlinkEventPayload(const std::string& topic,
     return j.dump();
 }
 
+// CR-009 §7: route-based 下行事件 payload（不含完整 Topic）
+std::string MqttService::buildRoutedDownlinkPayload(const RoutedDownlinkEnvelope& event) const {
+    nlohmann::json j;
+    j["owner"] = event.key.owner;
+    j["route_id"] = event.key.route_id;
+    j["target"] = event.target;
+    j["qos"] = static_cast<int>(event.qos);
+    j["payload_base64"] = b64_encode(event.payload);
+    j["request_id"] = event.request_id;
+    j["trace_id"] = event.trace_id;
+    return j.dump();
+}
+
 void MqttService::pushDownlinkEvent(const std::string& topic,
                                     const std::vector<uint8_t>& payload) {
     if (!ipc_server_) {
@@ -644,20 +734,49 @@ void MqttService::pushDownlinkEvent(const std::string& topic,
                             payload_json);
 }
 
+// CR-009 §7: 推送 route-based 下行事件
+// CR-010 §3.1: 按 owner 定向推送（push_event_to），不广播给 legacy 订阅者
+void MqttService::pushRoutedDownlinkEvent(const RoutedDownlinkEnvelope& event) {
+    if (!ipc_server_) {
+        return;
+    }
+    auto fds = ipc_dispatcher_->getRoutedFdsForOwner(event.key.owner);
+    if (fds.empty()) {
+        return;  // 无该 owner 的活跃 routed 订阅者
+    }
+    std::string payload_json = buildRoutedDownlinkPayload(event);
+    for (int fd : fds) {
+        ipc_server_->push_event_to(fd,
+            static_cast<uint32_t>(ipc::EventType::ROUTED_DOWNLINK_MESSAGE),
+            payload_json);
+    }
+}
+
 void MqttService::onMessageReceived(const std::string& topic,
                                     const std::vector<uint8_t>& payload) {
     // 下行消息进入时生成 request_id (CR-003 §3)
     std::string request_id = generateRequestId();
     auto scope = makeContextScope("", request_id);
 
+    // CR-009 §7: 优先使用 route-based 反向索引分发
+    if (downlink_dispatcher_ && route_table_) {
+        auto current_gen = prov_mgr_.getGeneration();
+        size_t matched = downlink_dispatcher_->dispatch(
+            topic, payload, route_table_, current_gen);
+        if (matched > 0) {
+            return;  // 已通过 route-based 分发
+        }
+    }
+
+    // Legacy: route_bridge 查找 (CR-004 §6)
     auto route = route_bridge_->findRouteByMqttTopic(topic);
     if (!route.has_value()) {
-        // mqtt.downlink.route_failed event (CR-003 §4, MQTT-1007)
+        // mqtt.route.downlink.unmatched event (CR-009 §11)
         MqttLogAdapter::router().warn(
-            "mqtt.downlink.route_failed",
-            "下行消息无法路由或无订阅者",
+            "mqtt.route.downlink.unmatched",
+            "下行消息无法匹配路由或无订阅者",
             {
-                {"topic_template", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
+                {"topic_hash", tbox::fw::log::FieldValue::makeString(topicTemplate(topic))},
                 {"payload_size", tbox::fw::log::FieldValue::makeInt(
                     static_cast<int64_t>(payload.size()))},
                 {"reason", tbox::fw::log::FieldValue::makeString("no_route")},
@@ -684,8 +803,28 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
     // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
     if (new_state == ConnectionState::PROV_WAIT) {
         if (prov_mgr_.readBinding()) {
-            // CR-007 §5: 身份变化后更新 ecu_uid 用于 Topic 展开
+            // CR-009 §5: 身份变化后更新 ecu_uid 用于 Topic 展开
+            uint64_t prev_gen = template_resolver_->identityGeneration();
             effective_table_->setEcuUid(prov_mgr_.getEcuUid());
+            // CR-009 §5: 更新模板解析器身份并重建路由投影
+            template_resolver_->setIdentity(prov_mgr_.getEcuUid(), prov_mgr_.getGeneration());
+            // CR-009 §8: 身份变化时退出 Cloud Ready 并失效旧投影
+            if (prev_gen != 0 && prev_gen != prov_mgr_.getGeneration()) {
+                auto state = state_machine_->getCurrentState();
+                if (state == ConnectionState::CLOUD_READY) {
+                    state_machine_->onCloudReadyLost();
+                }
+                MqttLogAdapter::subscribe().warn(
+                    "mqtt.topic_projection.invalidated",
+                    "身份变化，旧路由投影已失效",
+                    {{"old_generation", tbox::fw::log::FieldValue::makeInt(
+                         static_cast<int64_t>(prev_gen))},
+                     {"new_generation", tbox::fw::log::FieldValue::makeInt(
+                         static_cast<int64_t>(prov_mgr_.getGeneration()))},
+                     {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}}
+                );
+            }
+            rebuildRouteProjection();
             state_machine_->onProvisionReady();
         } else {
             auto state_info = state_machine_->getStateInfo();
@@ -816,7 +955,46 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                     );
                     continue;
                 }
-                client_manager_->publish(msg->topic, msg->payload, msg->qos);
+
+                // CR-009 §9: route-based 消息从当前投影重新解析 Topic
+                if (msg->isRouteBased()) {
+                    auto route = route_table_->lookupRoute(msg->route);
+                    if (!route.has_value() || route->state != RouteState::ACTIVE ||
+                        route->expanded_topic.empty()) {
+                        // 路由不存在或未展开 -> 丢弃 (CR-009 §9)
+                        MqttLogAdapter::offline_queue().warn(
+                            "mqtt.offline_queue.message_dropped",
+                            "路由不可用或未展开，丢弃 route-based 消息",
+                            {
+                                {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(msg->msg_id))},
+                                {"route_id_hash", tbox::fw::log::FieldValue::makeString(
+                                    topicTemplate(msg->route.route_id))},
+                                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1012")}
+                            }
+                        );
+                        continue;
+                    }
+                    // identity generation 变化检查 (CR-009 §9)
+                    if (msg->accepted_identity_generation != route->identity_generation) {
+                        // 默认策略：IDENTITY_CHANGED，不静默改写 Topic (CR-009 §9)
+                        MqttLogAdapter::offline_queue().warn(
+                            "mqtt.offline_queue.message_dropped",
+                            "身份变化后不补发旧 UID Topic 的 route-based 消息",
+                            {
+                                {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(msg->msg_id))},
+                                {"route_id_hash", tbox::fw::log::FieldValue::makeString(
+                                    topicTemplate(msg->route.route_id))},
+                                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1006")}
+                            }
+                        );
+                        continue;
+                    }
+                    // 重新解析成功，用当前投影的 expanded_topic 发布
+                    client_manager_->publish(route->expanded_topic, msg->payload, msg->qos);
+                } else {
+                    // legacy 路径：使用存储的完整 Topic
+                    client_manager_->publish(msg->topic, msg->payload, msg->qos);
+                }
             }
         }
 
@@ -891,6 +1069,8 @@ ReplaceSnapshotResult MqttService::onReplaceSubscriptionSnapshot(
         result.reason_code != "stale_generation") {
         // 重算有效订阅投影
         effective_table_->recompute(*snapshot_registry_);
+        // CR-009 §5: 重建 route-based 路由投影
+        rebuildRouteProjection();
         onSnapshotAccepted(snapshot.owner, snapshot.registration_complete);
         refreshUpstreamRoutes();
 
@@ -1043,6 +1223,54 @@ void MqttService::refreshUpstreamRoutes() {
         entry.qos = static_cast<QoS>(r.qos);
         route_bridge_->registerRoute(entry);
     }
+}
+
+// ============================================================
+// CR-009: 路由投影实现
+// ============================================================
+
+void MqttService::rebuildRouteProjection() {
+    // CR-009 §5: 从 owner 快照 + 当前身份构建不可变路由投影
+    // 先同步当前身份到模板解析器
+    template_resolver_->setIdentity(prov_mgr_.getEcuUid(), prov_mgr_.getGeneration());
+    auto new_table = projection_builder_->build(*snapshot_registry_, *template_resolver_);
+    route_table_ = new_table;  // 原子替换（shared_ptr 赋值）
+
+    // 日志: 投影构建事件 (CR-009 §11)
+    MqttLogAdapter::subscribe().info(
+        "mqtt.topic_projection.built",
+        "路由投影已构建",
+        {{"identity_generation", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(new_table->identityGeneration()))},
+         {"route_count", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(new_table->totalRoutes()))},
+         {"active_count", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(new_table->activeRoutes()))},
+         {"unresolved_count", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(new_table->unresolvedRoutes()))}}
+    );
+}
+
+std::shared_ptr<const EffectiveRouteTable> MqttService::getRouteTable() const {
+    return route_table_;
+}
+
+// ============================================================
+// CR-009 §6: Route-based 发布
+// ============================================================
+
+PublishResult MqttService::publishRoute(const RoutePublishRequest& req) {
+    return route_publisher_->publishRoute(req, route_table_, *template_resolver_);
+}
+
+PublishResult MqttService::onPublishRoute(const RoutePublishRequest& req) {
+    if (ipc_reject_new_) {
+        PublishResult r;
+        r.accepted = false;
+        r.error = ErrorCode::MQTT_1002;
+        return r;
+    }
+    return publishRoute(req);
 }
 
 } // namespace mqtt

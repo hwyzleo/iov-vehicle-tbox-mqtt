@@ -11,6 +11,12 @@
 #include "applied_subscription_manifest.h"
 #include "broker_subscription_reconciler.h"
 #include "cloud_readiness_gate.h"
+#include "topic_template_resolver.h"
+#include "topic_projection_builder.h"
+#include "effective_route_table.h"
+#include "route_publisher.h"
+#include "downlink_route_dispatcher.h"
+#include "legacy_topic_guard.h"
 #include "store.h"
 #include "ipc.h"
 #include <functional>
@@ -80,6 +86,9 @@ public:
                           QoS qos,
                           Priority priority = Priority::NORMAL);
 
+    // CR-009 §6.1: route-based 发布（按 owner/route_id）
+    PublishResult publishRoute(const RoutePublishRequest& req);
+
     // subscribe（直接登记下行路由）
     SubscribeResult subscribe(const std::string& topic,
                               QoS qos,
@@ -92,6 +101,11 @@ public:
 
     // getConnectionState
     ConnectionStateResult getConnectionState() const;
+
+    // CR-009: 获取当前不可变路由投影（测试/诊断用）
+    std::shared_ptr<const EffectiveRouteTable> getRouteTable() const;
+    // CR-009: 重建路由投影（测试/身份变化后用）
+    void rebuildRouteProjection();
 
     // applyConfig（source=OTA 写 store 覆盖）
     bool applyConfig(const ConnectionConfig& config,
@@ -126,9 +140,15 @@ private:
     std::string buildDownlinkEventPayload(const std::string& topic,
                                           const std::vector<uint8_t>& payload) const;
 
+    // CR-009 §7: 构建 route-based 下行事件 payload JSON
+    std::string buildRoutedDownlinkPayload(const RoutedDownlinkEnvelope& event) const;
+
     // 向已订阅 client_fd 推送下行事件
     void pushDownlinkEvent(const std::string& topic,
                            const std::vector<uint8_t>& payload);
+
+    // CR-009 §7: 向已订阅 client_fd 推送 route-based 下行事件
+    void pushRoutedDownlinkEvent(const RoutedDownlinkEnvelope& event);
 
     std::unique_ptr<ConnectionStateMachine> state_machine_;
     std::unique_ptr<MqttClientManager> client_manager_;
@@ -161,6 +181,14 @@ private:
     SubscriptionConfig subscription_config_;
     bool ipc_started_ = false;  // CR-007 §6: IPC Server 先于首次 CONNECT
 
+    // ---- CR-009: Topic 模板与 route-based 路由投影 ----
+    std::unique_ptr<TopicTemplateResolver> template_resolver_;
+    std::unique_ptr<TopicProjectionBuilder> projection_builder_;
+    std::shared_ptr<const EffectiveRouteTable> route_table_;  // 原子替换的不可变投影
+    std::unique_ptr<RoutePublisher> route_publisher_;  // CR-009 §6
+    std::unique_ptr<DownlinkRouteDispatcher> downlink_dispatcher_;  // CR-009 §7
+    std::unique_ptr<LegacyTopicGuard> legacy_guard_;  // CR-009 §10.2
+
     // CR-007 辅助
     void onSnapshotAccepted(const std::string& owner, bool registration_complete);
     void reconcileSubscriptions();
@@ -169,6 +197,12 @@ private:
                                 uint32_t mandatory_total, const std::string& reason);
     void refreshUpstreamRoutes();
     void checkStartupGate();
+
+    // ---- CR-009: 路由投影 ----
+    PublishResult onPublishRoute(const RoutePublishRequest& req) override;
+    // ---- CR-010 §3: routed downlink 事件订阅 ----
+    std::pair<int32_t, bool> onSubscribeRoutedDownlinkEventChannel(
+        const std::string& owner, int client_fd) override;
 };
 
 } // namespace mqtt

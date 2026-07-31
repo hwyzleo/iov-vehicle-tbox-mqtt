@@ -99,6 +99,18 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/cloud_readiness_gate.cpp
     # CR-008: Application 组合根
     src/mqtt_service/src/mqtt_application.cpp
+    # CR-009: Topic 模板校验/解析
+    src/mqtt_service/src/topic_template_validator.cpp
+    src/mqtt_service/src/topic_template_resolver.cpp
+    # CR-009: 路由投影
+    src/mqtt_service/src/effective_route_table.cpp
+    src/mqtt_service/src/topic_projection_builder.cpp
+    # CR-009: route-based 发布
+    src/mqtt_service/src/route_publisher.cpp
+    # CR-009: 下行路由分发
+    src/mqtt_service/src/downlink_route_dispatcher.cpp
+    # CR-009: Legacy 兼容守卫
+    src/mqtt_service/src/legacy_topic_guard.cpp
 )
 
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})

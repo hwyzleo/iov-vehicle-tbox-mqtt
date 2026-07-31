@@ -24,6 +24,8 @@ enum class ErrorCode : uint32_t {
     MQTT_1009 = 1009,  // PROV 不可用、未绑定或 VIN/SN/ECU UID 不完整/不一致 (CR-006 §8)
     MQTT_1010 = 1010,  // 订阅快照无效、generation/digest 冲突或原子替换失败 (CR-007 §11)
     MQTT_1011 = 1011,  // Mandatory Subscription 未就绪、门闩超时或 Cloud Ready 收敛失败 (CR-007 §11)
+    MQTT_1012 = 1012,  // Topic 模板、变量或运行时实例化失败 (CR-009 §11)
+    MQTT_1013 = 1013,  // Routed downlink SDK 事件缺失、非法、owner 不匹配或 base64 解码失败 (CR-010 §9)
 };
 
 /// 将 ErrorCode 转为可读字符串 (CR-003 §6)
@@ -40,6 +42,8 @@ inline std::string errorCodeToString(ErrorCode code) {
         case ErrorCode::MQTT_1009: return "MQTT-1009";
         case ErrorCode::MQTT_1010: return "MQTT-1010";
         case ErrorCode::MQTT_1011: return "MQTT-1011";
+        case ErrorCode::MQTT_1012: return "MQTT-1012";
+        case ErrorCode::MQTT_1013: return "MQTT-1013";
         default: return "MQTT-UNKNOWN";
     }
 }

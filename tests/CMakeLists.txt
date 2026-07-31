@@ -201,6 +201,30 @@ add_executable(test_mqtt_client
 target_include_directories(test_mqtt_client PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
 target_link_libraries(test_mqtt_client GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
 
+# CR-010 §11.1: Routed downlink SDK 单元测试
+add_executable(test_mqtt_client_routed
+    unit/test_mqtt_client_routed.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_client/src/mqtt_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_retry_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_mqtt_client_routed PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
+target_link_libraries(test_mqtt_client_routed GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
+# CR-010 §11.2: Routed downlink SDK 集成测试
+add_executable(test_mqtt_routed_downlink
+    integration/test_mqtt_routed_downlink.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_client/src/mqtt_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_retry_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_mqtt_routed_downlink PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
+target_link_libraries(test_mqtt_routed_downlink GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
 # Integration tests
 add_executable(test_end_to_end
     integration/test_end_to_end.cpp
@@ -266,6 +290,8 @@ add_test(NAME MqttIpcDispatcherTest COMMAND test_mqtt_ipc_dispatcher)
 add_test(NAME MqttRetryPolicyTest COMMAND test_mqtt_retry_policy)
 add_test(NAME MqttDispatchQueueTest COMMAND test_mqtt_dispatch_queue)
 add_test(NAME MqttClientTest COMMAND test_mqtt_client)
+add_test(NAME MqttClientRoutedTest COMMAND test_mqtt_client_routed)
+add_test(NAME MqttRoutedDownlinkIntegTest COMMAND test_mqtt_routed_downlink)
 add_test(NAME MqttIpcBackpressureTest COMMAND test_mqtt_ipc_backpressure)
 add_test(NAME MqttIpcFaultInjectionTest COMMAND test_mqtt_ipc_fault_injection)
 
@@ -287,6 +313,7 @@ add_test(NAME MqttSubscriptionSnapshotTest COMMAND test_mqtt_subscription_snapsh
 add_executable(test_owner_snapshot_registry
     unit/test_owner_snapshot_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
 )
 target_include_directories(test_owner_snapshot_registry PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_owner_snapshot_registry GTest::gtest_main pthread)
@@ -295,6 +322,7 @@ add_executable(test_effective_subscription_table
     unit/test_effective_subscription_table.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_subscription_table.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
 )
 target_include_directories(test_effective_subscription_table PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_effective_subscription_table GTest::gtest_main pthread)
@@ -338,6 +366,81 @@ add_test(NAME StartupSubscriptionGateTest COMMAND test_startup_subscription_gate
 add_test(NAME AppliedSubscriptionManifestTest COMMAND test_applied_subscription_manifest)
 add_test(NAME CloudReadinessGateTest COMMAND test_cloud_readiness_gate)
 add_test(NAME BrokerSubscriptionReconcilerTest COMMAND test_broker_subscription_reconciler)
+
+# ============================================================
+# CR-009: Topic 模板与 route-based 路由单元测试
+# ============================================================
+
+add_executable(test_topic_template_validator
+    unit/test_topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+)
+target_include_directories(test_topic_template_validator PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_topic_template_validator GTest::gtest_main pthread)
+add_test(NAME TopicTemplateValidatorTest COMMAND test_topic_template_validator)
+
+add_executable(test_topic_template_resolver
+    unit/test_topic_template_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+)
+target_include_directories(test_topic_template_resolver PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_topic_template_resolver GTest::gtest_main pthread)
+add_test(NAME TopicTemplateResolverTest COMMAND test_topic_template_resolver)
+
+add_executable(test_route_projection
+    unit/test_route_projection.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_route_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_projection_builder.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+)
+target_include_directories(test_route_projection PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_route_projection GTest::gtest_main pthread)
+add_test(NAME RouteProjectionTest COMMAND test_route_projection)
+
+add_executable(test_route_publisher
+    unit/test_route_publisher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/route_publisher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_route_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_projection_builder.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_route_publisher PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_route_publisher GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+add_test(NAME RoutePublisherTest COMMAND test_route_publisher)
+
+add_executable(test_downlink_route_dispatcher
+    unit/test_downlink_route_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/downlink_route_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/legacy_topic_guard.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_route_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_projection_builder.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_downlink_route_dispatcher PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_downlink_route_dispatcher GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+add_test(NAME DownlinkRouteDispatcherTest COMMAND test_downlink_route_dispatcher)
+
+# ============================================================
+# CR-009: Route-based 路由投影集成测试
+# ============================================================
+
+add_executable(test_mqtt_route_projection
+    integration/test_mqtt_route_projection.cpp
+)
+target_include_directories(test_mqtt_route_projection PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_directories(test_mqtt_route_projection PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_route_projection mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
+add_test(NAME MqttRouteProjectionTest COMMAND test_mqtt_route_projection)
 
 # ============================================================
 # Log tests (CR-003 §7)
