@@ -95,6 +95,10 @@ public:
     /// 清理当前凭据（清零 CA/cert/key_ref 缓冲）(CR-005 §7 cleanup 顺序)
     void cleanupCredential();
 
+    // CR-008: 取消 credential changed 订阅并 join 回调线程。
+    // 停机时在销毁 MqttService 前调用，避免迟到回调 use-after-free。
+    void cancelCredentialSubscription();
+
     // ---- SEC 连接状态 ----
 
     bool isSecConnected() const;

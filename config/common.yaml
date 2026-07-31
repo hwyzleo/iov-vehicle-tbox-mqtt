@@ -19,10 +19,26 @@ common:
     listen_backlog: 5
 
   # Logging (required by framework-config validator: common.log)
+  # CR-008: 对齐 framework-log schema（Application::buildLogConfig 读取）
   log:
-    level: info
-    max_size_mb: 10
-    max_files: 5
+    level: "info"                       # 默认日志级别（trace/debug/info/warn/error）
+    strict: false                       # strict=true 时初始化失败 fail-closed；false 降级
+    format: "standard"
+    console:
+      enabled: true
+    file:
+      enabled: false                    # 生产部署改 true 并指向 /var/log/tbox
+      root: "/var/log/tbox"
+      max_file_size_mb: 20
+      max_files: 5
+      total_budget_mb: 100
+    async:
+      enabled: true
+      queue_size: 4096
+      flush_interval_ms: 1000
+    redact:
+      identifiers: "mask"
+      raw_payload_max_bytes: 256
 
 # Internal bus address (shared across services)
 bus:

@@ -140,6 +140,17 @@ target_link_directories(test_mqtt_service_integration PRIVATE ${MOSQUITTO_LIBRAR
 target_link_libraries(test_mqtt_service_integration mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
 
 # ============================================================
+# CR-008 MqttApplication lifecycle tests
+# ============================================================
+
+add_executable(test_mqtt_application
+    unit/test_mqtt_application.cpp
+)
+target_include_directories(test_mqtt_application PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_directories(test_mqtt_application PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_application mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
+
+# ============================================================
 # CR-004 IPC tests
 # ============================================================
 
@@ -238,6 +249,7 @@ add_test(NAME OfflineCacheQueueTest COMMAND test_offline_cache_queue)
 add_test(NAME RouteBridgeTest COMMAND test_route_bridge)
 add_test(NAME ConfigManagerTest COMMAND test_config_manager)
 add_test(NAME MqttServiceIntegrationTest COMMAND test_mqtt_service_integration)
+add_test(NAME MqttApplicationTest COMMAND test_mqtt_application)
 
 # CR-006: MqttService PROV integration tests
 add_executable(test_mqtt_service_provision

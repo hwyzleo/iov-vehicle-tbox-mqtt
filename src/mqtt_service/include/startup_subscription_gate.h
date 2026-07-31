@@ -25,8 +25,11 @@ public:
     /// 配置 required owner 与超时 (CR-007 §6)
     void configure(const std::vector<std::string>& required_owners, Duration timeout);
 
-    /// 开始等待计时
+    /// 开始等待计时（幂等：重复调用不重置 start_time_）
     void startWait();
+
+    /// 停止等待并重置状态（gate 解决后调用，重连重入 SUBSCRIPTION_WAIT 时重新计时）
+    void stopWait();
 
     /// 快照接受通知：更新 owner 完成状态 (CR-007 §6)
     /// @param registration_complete 该 owner 最新快照是否 registration_complete

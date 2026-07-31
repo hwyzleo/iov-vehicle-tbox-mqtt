@@ -33,23 +33,36 @@ class ProvisionIdentityManager;
 ///
 /// 拥有 Broker 连接、QoS/PUBACK、离线队列和路由业务状态；
 /// 通过 framework-ipc Server 对外提供 publish/subscribe/route/state 接口。
+///
+/// CR-008: 外部依赖（Store / ProvisionIdentityManager / CredentialManager /
+/// SecTlsKeyAdapter）由 MqttApplication 组合根注入；本类保留 broker 运行时、
+/// 离线队列、订阅子系统与 IPC 栈的内聚所有权。生命周期拆为 initializeLocal()
+/// （本地能力）与 startExternal()（PROV/SEC/TLS/Broker），停机拆为分阶段方法。
 class MqttService : public MqttIpcDispatcher::ServiceHandler, public BrokerOperations {
 public:
-    MqttService();
+    /// CR-008: 构造接收注入的外部依赖（所有权归 MqttApplication）。
+    /// @param store      framework-store（运行时状态/可更新连接参数）
+    /// @param prov_mgr   PROV 身份管理器
+    /// @param cred_mgr   SEC 凭据管理器
+    /// @param tls_adapter SEC TLS key adapter
+    MqttService(std::shared_ptr<hwyz::store::Store> store,
+                ProvisionIdentityManager& prov_mgr,
+                CredentialManager& cred_mgr,
+                SecTlsKeyAdapter& tls_adapter);
     ~MqttService();
 
-    // Initialize service with dependencies and framework paths (设计 §5, CR-004 §4, CR-005 §4.2, CR-006 §4)
-    // CR-005: 使用 CredentialManager 替代 SecCertInterface
-    // CR-006: 使用 ProvisionIdentityManager 获取 PROV 绑定前置
-    bool initialize(std::shared_ptr<ProvisionIdentityManager> prov_mgr,
-                    std::shared_ptr<CredentialManager> cred_mgr,
-                    const std::string& config_root,
-                    const std::string& store_root);
+    // ---- CR-008 分阶段生命周期 ----
+    // initializeLocal: 配置/离线队列/路由/订阅子系统/IPC Server（本地能力先可用）
+    bool initializeLocal();
+    // startExternal: PROV/SEC/TLS/Broker 状态机（外部依赖与云端连接）
+    bool startExternal();
 
-    // Start service (state machine + certificate flow)
-    bool start();
-
-    // Stop service (CR-004 §4: 先拒新请求 -> 停 IPC -> 等 client 线程 -> 停 Broker -> flush)
+    // 分阶段停机（CR-008 §7.1，由 MqttApplication::cleanup 按序调用）
+    void beginShutdown();                  // STOPPING、退出 Cloud Ready、拒绝新请求
+    void stopBrokerAndPersistInflight();   // 停重连/TLS，保存未 PUBACK 消息
+    void stopExternalCallbacks();          // SEC/PROV callback stop + join
+    void shutdown();                       // 停订阅/队列 worker，flush queue，释放 IPC
+    // 便捷停机（测试用，等价于依次调用上述四步）
     void stop();
 
     // ---- IPC Server (CR-004 §2, §4) ----
@@ -122,10 +135,11 @@ private:
     std::unique_ptr<OfflineCacheQueue> cache_queue_;
     std::unique_ptr<RouteBridge> route_bridge_;
     std::unique_ptr<ConfigManager> config_manager_;
-    std::shared_ptr<CredentialManager> cred_mgr_;
-    std::shared_ptr<ProvisionIdentityManager> prov_mgr_;
-    std::unique_ptr<SecTlsKeyAdapter> tls_adapter_;
-    std::shared_ptr<hwyz::store::Store> store_;
+    // CR-008: 外部依赖以引用注入，所有权归 MqttApplication
+    ProvisionIdentityManager& prov_mgr_;
+    CredentialManager& cred_mgr_;
+    SecTlsKeyAdapter& tls_adapter_;
+    std::shared_ptr<hwyz::store::Store> store_;  // 注入（ConfigManager/StateMachine 需 shared_ptr）
 
     // IPC (CR-004 §2)
     std::unique_ptr<::tbox::fw::ipc::Server> ipc_server_;

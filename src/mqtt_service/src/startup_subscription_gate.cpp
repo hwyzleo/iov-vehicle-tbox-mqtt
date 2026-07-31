@@ -14,8 +14,18 @@ void StartupSubscriptionGate::configure(const std::vector<std::string>& required
 
 void StartupSubscriptionGate::startWait() {
     std::lock_guard<std::mutex> lock(mutex_);
-    start_time_ = Clock::now();
-    waiting_ = true;
+    // 幂等：仅在首次进入等待时设置 start_time_。
+    // onSubscriptionGateTimeout 回调会重入 SUBSCRIPTION_WAIT 分支，
+    // 若无条件重置 start_time_ 会导致 isTimedOut() 永远为 false，门闩永不超时。
+    if (!waiting_) {
+        start_time_ = Clock::now();
+        waiting_ = true;
+    }
+}
+
+void StartupSubscriptionGate::stopWait() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    waiting_ = false;
 }
 
 void StartupSubscriptionGate::onSnapshotAccepted(const std::string& owner,

@@ -3,6 +3,8 @@
 #include "credential_manager.h"
 #include "provision_identity_manager.h"
 #include "config.h"
+#include "store.h"
+#include "sec_tls_key_adapter.h"
 #include <thread>
 #include <chrono>
 #include <filesystem>
@@ -75,14 +77,16 @@ protected:
         config_dir = createE2EConfigDir();
         store_dir = createE2EStoreDir();
 
-        service = std::make_unique<MqttService>();
+        hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+        store = std::make_shared<hwyz::store::Store>(
+            hwyz::store::Store::open("mqtt", store_dir));
         cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-
         cred_mgr->simulateReady();
         prov_mgr = createSimulatedProvMgrE2E();
-
-        service->initialize(prov_mgr, cred_mgr, config_dir, store_dir);
-        service->start();
+        tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+        service = std::make_unique<MqttService>(store, *prov_mgr, *cred_mgr, *tls_adapter);
+        service->initializeLocal();
+        service->startExternal();
 
         // Wait for connection
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -95,9 +99,11 @@ protected:
 
     std::string config_dir;
     std::string store_dir;
-    std::unique_ptr<MqttService> service;
+    std::shared_ptr<hwyz::store::Store> store;
     std::shared_ptr<CredentialManager> cred_mgr;
     std::shared_ptr<ProvisionIdentityManager> prov_mgr;
+    std::unique_ptr<SecTlsKeyAdapter> tls_adapter;
+    std::unique_ptr<MqttService> service;
 };
 
 TEST_F(EndToEndTest, PublishAndSubscribe) {
@@ -127,7 +133,7 @@ TEST_F(EndToEndTest, OfflineCaching) {
     EXPECT_TRUE(result.accepted);
 
     // Restart service
-    service->start();
+    service->startExternal();
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
     // Message should be delivered

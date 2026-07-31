@@ -97,6 +97,8 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/applied_subscription_manifest.cpp
     src/mqtt_service/src/broker_subscription_reconciler.cpp
     src/mqtt_service/src/cloud_readiness_gate.cpp
+    # CR-008: Application 组合根
+    src/mqtt_service/src/mqtt_application.cpp
 )
 
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})
@@ -176,7 +178,14 @@ install(FILES
 # ============================================================
 # Main executable
 # ============================================================
-add_executable(tbox_mqtt_service src/main.cpp)
+# CR-008 §9.1: 构建期二选一。ON 编译 MqttApplication 最小入口；
+# OFF 编译旧式手写生命周期（回滚验证）。同一二进制只能存在一套生命周期。
+option(MQTT_USE_FRAMEWORK_APPLICATION "Use hwyz::Application lifecycle" ON)
+if(MQTT_USE_FRAMEWORK_APPLICATION)
+    add_executable(tbox_mqtt_service src/main.cpp)
+else()
+    add_executable(tbox_mqtt_service src/main_legacy.cpp)
+endif()
 set_target_properties(tbox_mqtt_service PROPERTIES OUTPUT_NAME tbox_mqtt)
 target_link_libraries(tbox_mqtt_service mqtt_service_lib)
 

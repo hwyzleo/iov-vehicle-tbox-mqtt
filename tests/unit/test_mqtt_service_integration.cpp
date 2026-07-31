@@ -3,6 +3,8 @@
 #include "credential_manager.h"
 #include "provision_identity_manager.h"
 #include "config.h"
+#include "store.h"
+#include "sec_tls_key_adapter.h"
 #include <filesystem>
 #include <fstream>
 
@@ -70,18 +72,34 @@ std::shared_ptr<ProvisionIdentityManager> createSimulatedProvMgr() {
     mgr->simulateBinding(snapshot);
     return mgr;
 }
+
+struct MqttServiceDeps {
+    std::shared_ptr<hwyz::store::Store> store;
+    std::shared_ptr<ProvisionIdentityManager> prov_mgr;
+    std::shared_ptr<CredentialManager> cred_mgr;
+    std::unique_ptr<SecTlsKeyAdapter> tls_adapter;
+};
+
+MqttServiceDeps createMqttDeps(const std::string& config_dir, const std::string& store_dir) {
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    MqttServiceDeps deps;
+    deps.store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
+    deps.prov_mgr = createSimulatedProvMgr();
+    deps.cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    deps.cred_mgr->simulateReady();
+    deps.tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    return deps;
+}
 } // anonymous namespace
 
 TEST(MqttServiceIntegrationTest, ServiceInitialization) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    cred_mgr->simulateReady();
-    auto prov_mgr = createSimulatedProvMgr();
-
-    EXPECT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    EXPECT_TRUE(service.initializeLocal());
 
     cleanupTempDirs();
 }
@@ -90,13 +108,10 @@ TEST(MqttServiceIntegrationTest, ServiceStartStop) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    cred_mgr->simulateReady();
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
-    EXPECT_TRUE(service.start());
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    EXPECT_TRUE(service.startExternal());
 
     service.stop();
 
@@ -107,13 +122,10 @@ TEST(MqttServiceIntegrationTest, PublishMessage) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    cred_mgr->simulateReady();
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
-    service.start();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    service.startExternal();
 
     std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
     auto result = service.publish("test/topic", payload, QoS::AT_LEAST_ONCE);
@@ -128,13 +140,10 @@ TEST(MqttServiceIntegrationTest, SubscribeToTopic) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    cred_mgr->simulateReady();
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
-    service.start();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    service.startExternal();
 
     auto result = service.subscribe("test/topic", QoS::AT_LEAST_ONCE, "service_diag");
     EXPECT_TRUE(result.status);
@@ -148,11 +157,9 @@ TEST(MqttServiceIntegrationTest, RegisterRoute) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
 
     EXPECT_TRUE(service.registerRoute("service_diag", "vehicle/diag/status",
                                       RouteEntry::Direction::UP));
@@ -164,11 +171,9 @@ TEST(MqttServiceIntegrationTest, GetConnectionState) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
 
     auto state = service.getConnectionState();
     EXPECT_EQ(state.state, ConnectionState::INIT);
@@ -180,11 +185,9 @@ TEST(MqttServiceIntegrationTest, ApplyFactoryConfiguration) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
 
     ConnectionConfig config;
     config.broker_host = "test.mqtt.com";
@@ -201,11 +204,9 @@ TEST(MqttServiceIntegrationTest, ApplyOtaConfiguration) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
-    auto prov_mgr = createSimulatedProvMgr();
-
-    service.initialize(prov_mgr, cred_mgr, config_dir, store_dir);
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
 
     ConnectionConfig config;
     config.broker_host = "ota.mqtt.com";

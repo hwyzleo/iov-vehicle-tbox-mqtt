@@ -4,7 +4,10 @@
 #include "mqtt_service.h"
 #include "credential_manager.h"
 #include "provision_identity_manager.h"
+#include "sec_tls_key_adapter.h"
 #include "mqtt_context.h"
+#include "config.h"
+#include "store.h"
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -97,18 +100,24 @@ SubscriptionItem makeItem(const std::string& id, const std::string& tmpl,
 struct ServiceFixture {
     std::string cfg_dir;
     std::string store_dir;
+    std::shared_ptr<hwyz::store::Store> store;
     std::shared_ptr<ProvisionIdentityManager> prov;
     std::shared_ptr<CredentialManager> cred;
+    std::unique_ptr<SecTlsKeyAdapter> tls;
     std::unique_ptr<MqttService> service;
     void setup() {
         cfg_dir = createTempConfigDir();
         store_dir = createTempStoreDir();
+        hwyz::config::ConfigManager::instance().load("mqtt", cfg_dir);
+        store = std::make_shared<hwyz::store::Store>(
+            hwyz::store::Store::open("mqtt", store_dir));
         prov = createBoundProvMgr();
         cred = std::make_shared<CredentialManager>("", "mqtt");
         cred->simulateReady();
-        service = std::make_unique<MqttService>();
-        ASSERT_TRUE(service->initialize(prov, cred, cfg_dir, store_dir));
-        service->start();
+        tls = std::make_unique<SecTlsKeyAdapter>();
+        service = std::make_unique<MqttService>(store, *prov, *cred, *tls);
+        ASSERT_TRUE(service->initializeLocal());
+        service->startExternal();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     void teardown() {

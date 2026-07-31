@@ -38,6 +38,27 @@ bool ConfigManager::loadFromFramework(const std::string& config_root) {
         return false;
     }
 
+    return readConfigFromSnapshot(config_root);
+}
+
+bool ConfigManager::loadFromGlobal() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // CR-008: Application::run() 已完成 Config::load("mqtt")，此处只取快照。
+    auto& fw_config = hwyz::config::ConfigManager::instance();
+    config_snapshot_ = fw_config.getSnapshot();
+    if (!config_snapshot_) {
+        MqttLogAdapter::ipc().error(
+            "mqtt.config.snapshot_null",
+            "全局配置快照为空（Application 未加载配置？）"
+        );
+        return false;
+    }
+
+    return readConfigFromSnapshot("<global>");
+}
+
+bool ConfigManager::readConfigFromSnapshot(const std::string& config_root) {
     // CR-005 §8: 废弃字段检测 (fail-closed)
     // 量产环境发现废弃字段时 fail-closed；迁移测试环境可给出明确错误
     if (config_snapshot_->has("mqtt.root_ca_ref") ||

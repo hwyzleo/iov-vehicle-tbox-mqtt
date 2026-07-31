@@ -4,6 +4,8 @@
 #include "provision_identity_manager.h"
 #include "mqtt_context.h"
 #include "config.h"
+#include "store.h"
+#include "sec_tls_key_adapter.h"
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -94,13 +96,16 @@ TEST(MqttServiceProvisionTest, StartsInProvWaitWhenUnbound) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createUnboundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     // With unbound PROV, state should be PROV_WAIT (not CERT_WAIT or CONNECTING)
     auto state = service.getConnectionState();
@@ -118,13 +123,16 @@ TEST(MqttServiceProvisionTest, ClientIdDerivedFromVinAndSn) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     // Give state machine time to transition PROV_WAIT -> CERT_WAIT -> CONNECTING
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -148,13 +156,16 @@ TEST(MqttServiceProvisionTest, UsernameDerivedFromEcuUid) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -178,13 +189,16 @@ TEST(MqttServiceProvisionTest, TransitionsToConnectingWhenBoundAndCertReady) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     // Wait for state machine to transition: PROV_WAIT -> CERT_WAIT -> CONNECTING
     // (connection will fail since no real broker, but should reach CONNECTING)
@@ -207,13 +221,16 @@ TEST(MqttServiceProvisionTest, IdentityChangeTriggersProvWait) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -244,13 +261,16 @@ TEST(MqttServiceProvisionTest, OfflineQueueSkipsStaleIdentityMessages) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     // Wait for connection attempt (will fail, service in RECONNECTING or similar)
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -284,13 +304,16 @@ TEST(MqttServiceProvisionTest, LogDoesNotLeakRawIdentity) {
     std::string config_dir = createTempConfigDir();
     std::string store_dir = createTempStoreDir();
 
-    MqttService service;
+    hwyz::config::ConfigManager::instance().load("mqtt", config_dir);
+    auto store = std::make_shared<hwyz::store::Store>(
+        hwyz::store::Store::open("mqtt", store_dir));
     auto prov_mgr = createBoundProvMgr();
-    auto cred_mgr = std::make_shared<CredentialManager>("", "mqtt");
+    auto cred_mgr = std::make_unique<CredentialManager>("", "mqtt");
     cred_mgr->simulateReady();
-
-    ASSERT_TRUE(service.initialize(prov_mgr, cred_mgr, config_dir, store_dir));
-    ASSERT_TRUE(service.start());
+    auto tls_adapter = std::make_unique<SecTlsKeyAdapter>();
+    MqttService service(store, *prov_mgr, *cred_mgr, *tls_adapter);
+    ASSERT_TRUE(service.initializeLocal());
+    ASSERT_TRUE(service.startExternal());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 

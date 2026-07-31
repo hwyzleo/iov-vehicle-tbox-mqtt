@@ -9,9 +9,13 @@
 common:
   store:
     root: "./data"
-  log:
-    level: "info"                        # 日志级别（trace/debug/info/warn/error），覆盖 common.yaml
-    file: "./log/mqtt.log"               # 日志文件路径（落盘目录由此推导）
+  # CR-008: log 配置由 common.yaml 统一提供（framework-log schema）。
+  # 此处不再以标量 file 覆盖 common.log.file（会导致 buildLogConfig 崩溃）。
+  # 如需服务级日志覆盖，使用 framework schema：
+  # log:
+  #   file:
+  #     enabled: true
+  #     root: "./log"
 
 mqtt:
   # --- Connection parameters (defaults; OTA-updatable via framework-store) ---

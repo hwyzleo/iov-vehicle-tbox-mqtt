@@ -302,6 +302,18 @@ void CredentialManager::cleanupCredential() {
     current_credential_.status = tbox::sec::TlsCredentialStatus::NOT_READY;
 }
 
+void CredentialManager::cancelCredentialSubscription() {
+    // CR-008: 取消 credential changed 订阅并 join 回调线程。
+    // 在 MqttApplication::cleanup 销毁 MqttService 前调用，确保迟到回调不会
+    // 访问已销毁的 MqttService 对象。
+    if (subscription_.isActive()) {
+        subscription_.cancel();
+    }
+    // 清空回调，避免后续误调用
+    std::lock_guard<std::mutex> lock(mutex_);
+    changed_callback_ = nullptr;
+}
+
 bool CredentialManager::isSecConnected() const {
     if (simulated_) {
         return true;
