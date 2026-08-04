@@ -306,3 +306,61 @@ iov-vehicle-tbox-mqtt/
 - [ ] 无编译警告
 - [ ] 符合代码规范
 - [ ] 文档已更新（如需要）
+
+## 10. CR-011: TBOX-BUILD Orin 构建接入（v1.0.0+）
+
+### 10.1 CMake 包消费
+```bash
+# 本地 HOST 开发（统一以 CMAKE_PREFIX_PATH 解析已安装 package）
+cmake -B build -DCMAKE_PREFIX_PATH=~/.local -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 完整测试（41 个 suite）
+cd build && ctest --output-on-failure
+```
+
+### 10.2 双 Staging 安装
+```bash
+# SDK（公共头/静态库/CMake package）-> 供业务服务消费
+cmake --install build --component mqtt-sdk --prefix /tmp/staging/sdk
+
+# Runtime（daemon/systemd unit/非秘密默认配置）-> rootfs
+cmake --install build --component mqtt-runtime --prefix /tmp/staging/rootfs
+```
+
+### 10.3 Installed-package Consumer 验证
+```bash
+cmake -S tests/consumer -B build-consumer \
+    -DCMAKE_PREFIX_PATH="/tmp/staging/sdk;$HOME/.local"
+cmake --build build-consumer
+./build-consumer/mqtt_consumer
+# OK: tbox::mqtt_client installed-package consumer compiles/links
+```
+
+### 10.4 Smoke 测试（Orin 生产验证入口）
+```bash
+# Health: 二进制/服务/socket 就绪检查
+tests/smoke/mqtt-health.sh
+
+# Broker/smoke: 安全扫描 + 受控 test Broker 连通性
+# （生产 Brokre 禁止使用；TBOX_MQTT_SMOKE_BROKER_HOST 未设则跳过）
+tests/smoke/mqtt-broker.sh
+```
+
+### 10.5 跨仓库集成验证
+```bash
+# BUILD 仓库整体构建（框架->PROV->SEC->MQTT）
+cd ../iov-vehicle-tbox-build
+python3 -m tbox_build build --set tbox-mqtt-orin --dry-run
+# 生产构建（需 Docker arm64 + mosquitto sha256 填充）
+# ./ci/build-in-docker.sh --set tbox-mqtt-orin
+```
+
+### 10.6 关键变更摘要
+- **CMake**: `find_package(TboxFramework/TboxProvClient/TboxSecClient CONFIG)` 取代兄弟目录 find_library
+- **组件化 install**: `mqtt-sdk`（sdk staging）/ `mqtt-runtime`（rootfs staging），无内部头/库泄漏
+- **依赖回归**: 删除僵尸依赖 protobuf/SQLite3；本地化 base64（移除 framework legacy utils.h）
+- **systemd unit**: `packaging/systemd/tbox-mqtt.service`（NoNewPrivileges/ProtectSystem/ReadWritePaths）
+- **生产安全默认配置**: `config/mqtt.default.yaml`（无生产 Broker 地址/凭据/身份实例值）
+- **INSTALLED export**: `tbox::mqtt_client`, `TboxMqttClientConfig.cmake` + version 文件
+- **Consumer/smoke**: `tests/consumer/` + `tests/smoke/mqtt-health.sh` + `tests/smoke/mqtt-broker.sh`

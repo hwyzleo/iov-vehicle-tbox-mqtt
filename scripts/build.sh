@@ -11,9 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
 
-# 构建环境单一来源：由 framework 仓库提供 TBOX_PREFIX / TBoxFramework_DIR
+# 构建环境单一来源：由 framework 仓库提供 TBOX_PREFIX（framework/PROV/SEC SDK 安装前缀）
 # 切换本地开发与生产环境只需覆盖环境变量，例如：
 #   TBOX_PREFIX=/opt/tbox ./scripts/build.sh
+# CR-011 §6.2: 统一以 CMAKE_PREFIX_PATH 解析 TboxFramework/TboxProvClient/TboxSecClient
+# 已安装 package，不使用大小写敏感的 <Pkg>_DIR 变量（Linux 文件系统大小写敏感）。
 TBOX_ENV_FILE="$PROJECT_DIR/../iov-vehicle-tbox-framework/scripts/tbox-env.sh"
 if [ ! -f "$TBOX_ENV_FILE" ]; then
     echo "[ERROR] 未找到 $TBOX_ENV_FILE" >&2
@@ -69,8 +71,9 @@ mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # 配置 CMake
+# CR-011: TboxFramework/TboxProvClient/TboxSecClient 均从 CMAKE_PREFIX_PATH 解析
 echo "[2/4] 配置 CMake..."
-cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DTBoxFramework_DIR="$TBoxFramework_DIR" ..
+cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_PREFIX_PATH="$TBOX_PREFIX" ..
 
 # 编译
 echo "[3/4] 编译中..."

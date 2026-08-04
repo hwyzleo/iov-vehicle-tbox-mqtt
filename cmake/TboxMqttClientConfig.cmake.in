@@ -2,9 +2,15 @@
 
 include(CMakeFindDependencyMacro)
 
-# framework-ipc is a private dependency of the client library at build time,
-# but the static library archives the symbols. Callers only need the public
-# headers and the client library itself.
+# TBoxFramework: tbox_mqtt_client 静态链接 framework-ipc（PRIVATE），且公开头
+# client.h 引用 framework-ipc 的 Subscription RAII 句柄。静态库的 PRIVATE 依赖
+# 在最终链接时需由消费方解析，故声明 find_dependency。
+# 调用方只面向 MQTT 业务 facade，不直接使用 framework IPC 类型或 socket。
+find_dependency(TboxFramework CONFIG)
+
+# nlohmann_json: tbox_mqtt_client 内部使用（PRIVATE），公开头文件未引用，
+# 但静态库导出目标仍会在链接时引用其符号。
+find_dependency(nlohmann_json CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/TboxMqttClientTargets.cmake")
 

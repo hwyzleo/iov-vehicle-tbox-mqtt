@@ -1,0 +1,70 @@
+# TBOX MQTT Service Configuration (production default)
+#
+# Installed to /etc/tbox/conf.d/mqtt.yaml by the mqtt-runtime install component.
+# Device-local overrides can be placed in the service working directory as
+# ./mqtt.yaml (framework-config layer 3, highest priority).
+#
+# TBOX-MQTT-DSN-CR-011 §12: 默认配置只含非秘密 schema/default。
+# 本文件不含：
+#   - 生产 Broker 地址/凭据（broker_host 默认 localhost；真实地址经 framework-store/OTA 下发）
+#   - VIN/SN/ECU UID 等身份实例值（client_id 由 PROV 绑定在运行时派生）
+#   - TLS 凭据字段（root_ca_path/client_cert_path/private_key_path 等本地凭据字段已禁用，
+#     凭据全部经 SEC tbox::sec_client 获取，见 config_manager 拒绝逻辑）
+
+# 公共配置覆盖（common.yaml 的默认值可在此覆盖）
+common:
+  store:
+    root: "/var/lib/tbox"
+  log:
+    file:
+      enabled: true
+      root: "/var/log/tbox"
+
+mqtt:
+  # --- Connection parameters (defaults; OTA-updatable via framework-store) ---
+  broker_host: localhost
+  broker_port: 8883
+
+  # --- Static connection parameters (read-only) ---
+  identity:
+    client_id_format: "{vin}-{sn}"    # cloud access contract; must reference vin and sn only
+    prov_retry:
+      initial_backoff_ms: 500
+      max_backoff_ms: 30000
+      multiplier: 2.0
+  keepalive: 60                    # seconds
+  clean_start: false
+  session_expiry: 3600             # seconds
+
+  # --- TLS / mTLS (via SEC, CR-005) ---
+  tls:
+    credential_profile: mqtt          # fixed: mqtt (SEC TLS profile)
+    min_version: "1.2"
+    max_version: "1.3"
+    handshake_timeout_ms: 10000
+    credential_poll:
+      initial_backoff_ms: 1000
+      max_backoff_ms: 60000
+
+  # --- Offline cache queue (MQTT self-developed persistence, Design §3) ---
+  # Queue persistence is self-developed by MQTT (SQLite/file ring buffer),
+  # NOT via framework-store. Only config params are specified here.
+  offline_queue:
+    path: /var/tbox/mqtt/queue
+    max_size: 1000
+    drop_policy: drop_oldest        # "drop_oldest" or "drop_lowest_priority"
+
+  # --- Framework-IPC bus config (CR-004 §8) ---
+  ipc:
+    socket_path: /tmp/tbox-mqtt.sock
+    dispatch_queue_size: 1024        # 有界下行分发队列容量
+    subscriber_queue_size: 128       # per-subscriber 有界队列容量
+    slow_subscriber_policy: disconnect  # disconnect / drop / backpressure
+
+  # --- Subscription snapshot & Cloud Readiness (CR-007 §6) ---
+  subscriptions:
+    required_owners: ["tsp"]
+    startup_wait_timeout_ms: 5000    # 门闩等待超时（超时降级连接，不得 Cloud Ready）
+    reconcile_timeout_ms: 10000      # SUBACK 收敛超时
+    suback_retry_max: 3              # SUBACK 重试上限
+    owner_lease_ms: 0                # 0=关闭自动过期，避免进程抖动误删订阅

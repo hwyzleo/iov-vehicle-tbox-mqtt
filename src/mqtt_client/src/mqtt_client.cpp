@@ -1,7 +1,6 @@
 #include "tbox/mqtt/client.h"
 #include "tbox/mqtt/ipc_protocol.h"
 #include "mqtt_retry_policy.h"
-#include "utils.h"
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <chrono>
@@ -59,6 +58,62 @@ static int b64CharVal(unsigned char c) {
     if (c == '+') return 62;
     if (c == '/') return 63;
     return -1;
+}
+
+/// 标准 base64 编码（带填充，无换行）
+/// 本地实现，替代旧式对 framework 遗留头文件 utils.h 的裸名依赖 (CR-011 §7)。
+std::string b64Encode(const std::vector<std::uint8_t>& data) {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 2 < data.size(); i += 3) {
+        uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
+                     (static_cast<uint32_t>(data[i + 1]) << 8) |
+                     static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kAlphabet[(n >> 18) & 0x3f]);
+        out.push_back(kAlphabet[(n >> 12) & 0x3f]);
+        out.push_back(kAlphabet[(n >> 6) & 0x3f]);
+        out.push_back(kAlphabet[n & 0x3f]);
+    }
+    size_t rem = data.size() - i;
+    if (rem == 1) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        out.push_back(kAlphabet[(n >> 18) & 0x3f]);
+        out.push_back(kAlphabet[(n >> 12) & 0x3f]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (rem == 2) {
+        uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
+                     (static_cast<uint32_t>(data[i + 1]) << 8);
+        out.push_back(kAlphabet[(n >> 18) & 0x3f]);
+        out.push_back(kAlphabet[(n >> 12) & 0x3f]);
+        out.push_back(kAlphabet[(n >> 6) & 0x3f]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+/// 宽松 base64 解码（与旧 framework Utils::base64_decode 行为一致：
+/// 接受带/不带填充，忽略非法字符）。调用方已保证输入来自内部协议。
+std::string b64DecodeLenient(const std::string& s) {
+    std::vector<std::uint8_t> buf;
+    buf.reserve(s.size());
+    unsigned int bits = 0;
+    unsigned int acc = 0;
+    for (unsigned char c : s) {
+        if (c == '=') break;
+        int v = b64CharVal(c);
+        if (v < 0) continue;  // 忽略非法字符（换行/空白/异常）
+        acc = (acc << 6) | static_cast<unsigned int>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            buf.push_back(static_cast<std::uint8_t>((acc >> bits) & 0xff));
+        }
+    }
+    return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
 }
 
 /// 严格 base64 解码：校验字母表/填充/长度后解码，失败返回 false 且不产生部分输出 (CR-010 §4)
@@ -338,12 +393,11 @@ public:
     }
 
     std::string b64_encode(const std::vector<uint8_t>& data) {
-        return ::hwyz::Utils::base64_encode(
-            std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+        return b64Encode(data);
     }
 
     std::vector<uint8_t> b64_decode(const std::string& encoded) {
-        std::string decoded = ::hwyz::Utils::base64_decode(encoded);
+        std::string decoded = b64DecodeLenient(encoded);
         return std::vector<uint8_t>(decoded.begin(), decoded.end());
     }
 
@@ -361,7 +415,7 @@ public:
                     std::string b64 = j.value("payload_base64", "");
                     std::vector<uint8_t> payload;
                     if (!b64.empty()) {
-                        std::string decoded = ::hwyz::Utils::base64_decode(b64);
+                        std::string decoded = b64DecodeLenient(b64);
                         payload.assign(decoded.begin(), decoded.end());
                     }
                     if (cb) {

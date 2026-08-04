@@ -20,22 +20,33 @@ pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
 # TBox Framework：统一通过 find_package 消费（自包含 yaml-cpp / spdlog）
 # 查找前缀由 scripts/build.sh 从 iov-vehicle-tbox-framework/scripts/tbox-env.sh
 # 取得的 TBOX_PREFIX 决定，切换本地/生产环境无需改动本文件。
-if(NOT TARGET TBoxFramework::tbox-framework)
-    find_package(TBoxFramework REQUIRED)
+if(NOT TARGET TBoxFramework::config)
+    find_package(TboxFramework CONFIG REQUIRED)
 endif()
-set(FRAMEWORK_LIB TBoxFramework::tbox-framework)
-set(FRAMEWORK_INCLUDE_DIR ${TBoxFramework_INCLUDE_DIRS})
+set(FRAMEWORK_LIB TBoxFramework::config;TBoxFramework::log;TBoxFramework::ipc;TBoxFramework::store;TBoxFramework::application)
+# 注意：不信任 TBoxFrameworkConfig 的 TBoxFramework_INCLUDE_DIRS 变量（framework
+# config.in 的 _tbox_fw_prefix 多跳一级，路径错误）；include 目录从导入 target 提取。
 
-# SEC client SDK (CR-004)
-set(SEC_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-sec)
-set(SEC_INCLUDE_DIR ${SEC_DIR}/include)
-find_library(SEC_CLIENT_LIB tbox_sec_client PATHS ${SEC_DIR}/build NO_DEFAULT_PATH)
-
-# PROV client SDK (CR-006)
-set(PROV_DIR ${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov)
-set(PROV_INCLUDE_DIR ${PROV_DIR}/include)
-find_library(PROV_CLIENT_LIB tbox_prov_client PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
-find_library(PROV_DAEMON_LIB TboxProvLib PATHS ${PROV_DIR}/build NO_DEFAULT_PATH)
+# SEC/PROV client SDK（CR-011 §6.2: 已安装 package 消费，禁止 build-tree library）
+if(NOT TARGET tbox::sec_client)
+    find_package(TboxSecClient CONFIG REQUIRED)
+endif()
+if(NOT TARGET tbox::prov_client)
+    find_package(TboxProvClient CONFIG REQUIRED)
+endif()
+# include 目录取自导入目标的 INTERFACE_INCLUDE_DIRECTORIES（与安装 package 一致）
+function(_tbox_import_include_dirs _out _tgt)
+    get_target_property(_incs ${_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+    if(NOT _incs)
+        set(_incs "")
+    endif()
+    set(${_out} "${_incs}" PARENT_SCOPE)
+endfunction()
+_tbox_import_include_dirs(FRAMEWORK_INCLUDE_DIR TBoxFramework::config)
+_tbox_import_include_dirs(SEC_INCLUDE_DIR tbox::sec_client)
+_tbox_import_include_dirs(PROV_INCLUDE_DIR tbox::prov_client)
+set(SEC_CLIENT_LIB tbox::sec_client)
+set(PROV_CLIENT_LIB tbox::prov_client)
 
 # yaml-cpp 头文件随 TBoxFramework 一起安装在 ${FRAMEWORK_INCLUDE_DIR} 下，
 # 不再探测 brew / conda 路径。
@@ -262,7 +273,7 @@ add_executable(test_provision_identity_manager
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_provision_identity_manager PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_provision_identity_manager GTest::gtest_main ${FRAMEWORK_LIB} ${PROV_CLIENT_LIB} ${PROV_DAEMON_LIB} pthread)
+target_link_libraries(test_provision_identity_manager GTest::gtest_main ${FRAMEWORK_LIB} ${PROV_CLIENT_LIB} pthread)
 
 add_test(NAME ProvisionIdentityManagerTest COMMAND test_provision_identity_manager)
 add_test(NAME CredentialManagerTest COMMAND test_credential_manager)

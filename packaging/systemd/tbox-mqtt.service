@@ -1,0 +1,28 @@
+[Unit]
+Description=TBOX MQTT Service
+Documentation=https://app.notion.com/TBOX-MQTT-SPEC
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tbox_mqtt
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 不启用 PrivateTmp（代码事实，TBOX-MQTT-DSN-CR-011 §12）：
+#   MQTT 是 IPC 枢纽——自身创建 /tmp/tbox-mqtt.sock 供业务服务（TSP/DIAG）连接，
+#   并作为 client 连接 /tmp/tbox-prov.sock 与 /tmp/tbox-sec.sock。
+#   PrivateTmp 会为单元挂载私有 /tmp，隔离这些跨进程 socket 的可见性。
+ReadWritePaths=/var/tbox /var/lib/tbox /var/log/tbox /tmp
+
+# Resource limits
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

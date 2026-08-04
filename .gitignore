@@ -43,6 +43,9 @@
 build/
 Build/
 build-*/
+build-consumer/
+build-consumer
+/.idea/
 
 # CMake generated files
 CMakeFiles/
