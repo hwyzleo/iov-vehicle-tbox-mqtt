@@ -1022,7 +1022,7 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                 {"retry_count", tbox::fw::log::FieldValue::makeInt(
                     static_cast<int64_t>(state_info.retry_count))},
                 {"next_retry_ms", tbox::fw::log::FieldValue::makeInt(
-                    static_cast<int64_t>(std::max(0LL, delay.count())))},
+                    static_cast<int64_t>(std::max<int64_t>(0, delay.count())))},
                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1003")}
             }
         );

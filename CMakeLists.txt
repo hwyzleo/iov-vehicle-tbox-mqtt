@@ -167,8 +167,13 @@ target_link_libraries(mqtt_cli PRIVATE tbox_mqtt_client TBoxFramework::ipc)
 # ===========================================================================
 # Tests (HOST only; BUILD 目标构建仅构建 declared targets，不编译测试)
 # ===========================================================================
-enable_testing()
-add_subdirectory(tests)
+# 测试（HOST/隔离 test profile 使用，不进入量产 package；BUILD Orin 构建默认关闭，
+# 避免 FetchContent googletest 的跨机器 .cache 缓存冲突）
+option(BUILD_TESTS "Build tests" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 # ===========================================================================
 # Install rules — 两个显式 component (CR-011 §9)
