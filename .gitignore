@@ -90,3 +90,5 @@ mqtt_config.json.example
 *.csr
 *.der
 *.pem
+
+data/mqtt/*.dat
