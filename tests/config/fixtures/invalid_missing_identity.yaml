@@ -1,0 +1,8 @@
+# invalid: missing required 'identity' section
+mqtt:
+  broker_host: localhost
+  broker_port: 8883
+  keepalive: 60
+  tls:
+    credential_profile: mqtt
+    min_version: "1.2"

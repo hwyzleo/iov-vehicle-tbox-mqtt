@@ -1,0 +1,10 @@
+# invalid: broker_host looks like a VIN instance value (17-char identifier)
+mqtt:
+  broker_host: "JT1BURHE30G012345"
+  broker_port: 8883
+  identity:
+    client_id_format: "{vin}-{sn}"
+  keepalive: 60
+  tls:
+    credential_profile: mqtt
+    min_version: "1.2"

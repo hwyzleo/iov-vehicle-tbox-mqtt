@@ -1,0 +1,14 @@
+# invalid: offline_queue path contains '..' (traversal)
+mqtt:
+  broker_host: localhost
+  broker_port: 8883
+  identity:
+    client_id_format: "{vin}-{sn}"
+  keepalive: 60
+  tls:
+    credential_profile: mqtt
+    min_version: "1.2"
+  offline_queue:
+    path: /var/tbox/mqtt/../../etc/passwd
+    max_size: 1000
+    drop_policy: drop_oldest

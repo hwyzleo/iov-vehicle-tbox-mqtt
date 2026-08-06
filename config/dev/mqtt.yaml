@@ -1,16 +1,34 @@
-# TBOX MQTT Service Configuration (framework-config layer 1: conf.d/mqtt.yaml)
-# This file contains MQTT-specific static configuration (read-only).
-# Placed at: /etc/tbox/conf.d/mqtt.yaml
+# =============================================================================
+# DEVELOPMENT-ONLY — 仅供本地调试/单元/集成测试显式引用
+# =============================================================================
+# TBOX-MQTT-DSN-CR-012 §3 / §17.1 / §17.5: config/dev/mqtt.yaml 不由
+# mqtt-runtime 安装，不进入生产包。正式 /etc/tbox/conf.d/mqtt.yaml 由
+# mqtt-runtime 安装 mqtt.default.yaml 生成，并由 BUILD Orin overlay 覆盖。
 #
+# 本文件用于本地调试/测试运行目录：可配置测试 Broker、mock endpoint、
+# 临时 queue/store 目录或故障注入。使用方式：
+#   - 显式以 config_root=config/dev/ 启动（framework 以 <root>/mqtt.yaml 加载）；
+#   - 或复制为工作目录 ./mqtt.yaml（framework-config 第三层、最高优先级覆盖）。
+#
+# 允许清单（allowlist）约束（REQ-001/§17.5）：
+#   - 不得包含真实生产 credential、设备身份或生产 Topic；
+#   - production profile 拒绝本地 CA/cert/key 回退、测试 credential、
+#     mock PROV/SEC、测试 fixture 和不受控路径；
+#   - 不得改变 framework-store 允许运行时更新参数的事实来源；
+#   - 不得改变 queue schema/format 或静默丢弃 accepted 消息。
+# =============================================================================
+
+# TBOX MQTT Service Configuration (development override)
 # Configuration is loaded via framework-config layered merge:
 #   common.yaml -> conf.d/mqtt.yaml -> ./mqtt.yaml (deep merge, typed, fail-closed)
 # All values are read-only at runtime. OTA-updatable params (broker_host, broker_port)
 # are persisted via framework-store, not this file.
+
+# 开发环境 store 路径（避免污染系统目录）
 common:
   store:
     root: "./data"
   # CR-008: log 配置由 common.yaml 统一提供（framework-log schema）。
-  # 此处不再以标量 file 覆盖 common.log.file（会导致 buildLogConfig 崩溃）。
   # 如需服务级日志覆盖，使用 framework schema：
   # log:
   #   file:
@@ -19,6 +37,7 @@ common:
 
 mqtt:
   # --- Connection parameters (defaults; OTA-updatable via framework-store) ---
+  # 测试 Broker 主机（非生产 credential；production profile 不得引用此值）
   broker_host: vagw.openiov.top
   broker_port: 8883
 

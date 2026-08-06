@@ -1,0 +1,10 @@
+# invalid: TLS min_version not in allowed enum
+mqtt:
+  broker_host: localhost
+  broker_port: 8883
+  identity:
+    client_id_format: "{vin}-{sn}"
+  keepalive: 60
+  tls:
+    credential_profile: mqtt
+    min_version: "1.0"

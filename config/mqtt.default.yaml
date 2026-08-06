@@ -1,28 +1,25 @@
 # TBOX MQTT Service Configuration (production default)
 #
+# TBOX-MQTT-DSN-CR-012 §17.3: 唯一发布默认模板。
 # Installed to /etc/tbox/conf.d/mqtt.yaml by the mqtt-runtime install component.
 # Device-local overrides can be placed in the service working directory as
-# ./mqtt.yaml (framework-config layer 3, highest priority).
+# ./mqtt.yaml (framework-config layer 3, highest priority) -- test/dev only.
 #
-# TBOX-MQTT-DSN-CR-011 §12: 默认配置只含非秘密 schema/default。
-# 本文件不含：
-#   - 生产 Broker 地址/凭据（broker_host 默认 localhost；真实地址经 framework-store/OTA 下发）
-#   - VIN/SN/ECU UID 等身份实例值（client_id 由 PROV 绑定在运行时派生）
-#   - TLS 凭据字段（root_ca_path/client_cert_path/private_key_path 等本地凭据字段已禁用，
-#     凭据全部经 SEC tbox::sec_client 获取，见 config_manager 拒绝逻辑）
-
-# 公共配置覆盖（common.yaml 的默认值可在此覆盖）
-common:
-  store:
-    root: "/var/lib/tbox"
-  log:
-    file:
-      enabled: true
-      root: "/var/log/tbox"
+# 边界（REQ-002 / §17.3）：
+#   - 不含顶层 common:（正式 common 由 BUILD configs/orin/rootfs/etc/tbox/common.yaml
+#     唯一提供；本模板只消费）；
+#   - 不含生产 Broker 地址/凭据（broker_host 默认 localhost；真实地址经
+#     framework-store/OTA 下发）；
+#   - 不含 VIN/SN/ECU UID 等身份实例值（client_id 由 PROV 绑定在运行时派生）；
+#   - 不含 TLS 凭据字段（root_ca_path/client_cert_path/private_key_path 等本地凭据
+#     字段已禁用，凭据全部经 SEC tbox::sec_client 获取，见 config_manager 拒绝逻辑）；
+#   - 不含私钥/Token/用户名/密码/TLS secret/HSM handle/private_key_ref、
+#     测试 CA/client key 或生产 Broker credential。
+# broker_host/port 等允许运行时更新参数继续遵循 framework-store 既有优先级。
 
 mqtt:
   # --- Connection parameters (defaults; OTA-updatable via framework-store) ---
-  broker_host: localhost
+  broker_host: vagw.openiov.top
   broker_port: 8883
 
   # --- Static connection parameters (read-only) ---

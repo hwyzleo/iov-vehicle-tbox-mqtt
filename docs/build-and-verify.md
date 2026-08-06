@@ -361,6 +361,7 @@ python3 -m tbox_build build --set tbox-mqtt-orin --dry-run
 - **组件化 install**: `mqtt-sdk`（sdk staging）/ `mqtt-runtime`（rootfs staging），无内部头/库泄漏
 - **依赖回归**: 删除僵尸依赖 protobuf/SQLite3；本地化 base64（移除 framework legacy utils.h）
 - **systemd unit**: `packaging/systemd/tbox-mqtt.service`（NoNewPrivileges/ProtectSystem/ReadWritePaths）
-- **生产安全默认配置**: `config/mqtt.default.yaml`（无生产 Broker 地址/凭据/身份实例值）
+- **生产安全默认配置**: `config/mqtt.default.yaml`（无生产 Broker 地址/凭据/身份实例值，无顶层 `common:`）
+- **配置分层（CR-012）**: `config/dev/`（调试，不安装）/ `config/schema/mqtt.schema.yaml`（声明式 schema）/ `config/mqtt.default.yaml`（唯一发布模板）；纯校验命令 `tools/mqtt-config-check.py`（schema + production/test profile，无副作用）
 - **INSTALLED export**: `tbox::mqtt_client`, `TboxMqttClientConfig.cmake` + version 文件
 - **Consumer/smoke**: `tests/consumer/` + `tests/smoke/mqtt-health.sh` + `tests/smoke/mqtt-broker.sh`

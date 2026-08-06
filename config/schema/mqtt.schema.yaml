@@ -1,0 +1,143 @@
+# =============================================================================
+# TBOX-MQTT-DSN-CR-012 §17.6: MQTT 配置声明式 schema
+# =============================================================================
+# 描述 /etc/tbox/conf.d/mqtt.yaml 的合法字段结构、类型、范围、必填性、
+# 允许值与禁止字段。由 tools/mqtt-config-check.py 加载并驱动校验。
+#
+# 本文件不由 mqtt-runtime 安装到 rootfs；供 BUILD metadata 引用与 BUILD
+# staging 阶段校验使用。target 为逻辑安装路径。
+# =============================================================================
+
+schema_version: 1
+target: /etc/tbox/conf.d/mqtt.yaml
+
+# --- 顶层允许的键（conf.d/mqtt.yaml 文件本身） ---
+# common 在结构上允许（./mqtt.yaml 开发覆盖可含 common 覆盖）；
+# production profile 下禁止（见 production_forbidden_top_level），因为正式
+# conf.d/mqtt.yaml 不得内联顶层 common:（REQ-004 / §17.3）。
+top_level_allowed:
+  - mqtt
+  - common
+
+# --- production profile 下禁止的顶层键 ---
+# common 由 BUILD configs/orin/rootfs/etc/tbox/common.yaml 唯一提供；
+# 正式 conf.d/mqtt.yaml 不得内联顶层 common:（REQ-002 / REQ-004 / §17.3）。
+# test profile 允许 common（./mqtt.yaml 开发覆盖可设置 common.store.root 等）。
+production_forbidden_top_level:
+  - common
+
+# --- 字段结构（递归） ---
+# 每个 field 可声明: type, required, min, max, enum, path_safe
+# type: string | integer | number | boolean | map | string_list
+fields:
+  mqtt:
+    type: map
+    fields:
+      broker_host:
+        type: string
+        # 允许 framework-store 覆盖；默认模板提供 factory fallback
+      broker_port:
+        type: integer
+        min: 1
+        max: 65535
+      identity:
+        type: map
+        required: true
+        fields:
+          client_id_format:
+            type: string
+            required: true
+            # v1 云端接入契约：只允许 {vin}-{sn}（不含 ECU UID 实例）
+            enum:
+              - "{vin}-{sn}"
+          prov_retry:
+            type: map
+            fields:
+              initial_backoff_ms: {type: integer, min: 1}
+              max_backoff_ms: {type: integer, min: 1}
+              multiplier: {type: number, min: 1.0}
+      keepalive:
+        type: integer
+        required: true
+        min: 1
+      clean_start:
+        type: boolean
+      session_expiry:
+        type: integer
+        min: 0
+      tls:
+        type: map
+        required: true
+        fields:
+          credential_profile:
+            type: string
+            required: true
+            enum: [mqtt]
+          min_version:
+            type: string
+            required: true
+            enum: ["1.2", "1.3"]
+          max_version:
+            type: string
+            enum: ["1.2", "1.3"]
+          handshake_timeout_ms:
+            type: integer
+            min: 1
+          credential_poll:
+            type: map
+            fields:
+              initial_backoff_ms: {type: integer, min: 1}
+              max_backoff_ms: {type: integer, min: 1}
+      offline_queue:
+        type: map
+        fields:
+          path:
+            type: string
+            path_safe: true
+          max_size:
+            type: integer
+            min: 1
+          drop_policy:
+            type: string
+            enum: [drop_oldest, drop_lowest_priority]
+      ipc:
+        type: map
+        fields:
+          socket_path:
+            type: string
+            path_safe: true
+          dispatch_queue_size: {type: integer, min: 1}
+          subscriber_queue_size: {type: integer, min: 1}
+          slow_subscriber_policy:
+            type: string
+            enum: [disconnect, drop, backpressure]
+      subscriptions:
+        type: map
+        fields:
+          required_owners:
+            type: string_list
+          startup_wait_timeout_ms: {type: integer, min: 0}
+          reconcile_timeout_ms: {type: integer, min: 0}
+          suback_retry_max: {type: integer, min: 0}
+          owner_lease_ms: {type: integer, min: 0}
+
+# --- 禁止字段（任何 profile 下出现即失败） ---
+# 本地 TLS credential 回退 / secret / 身份字段（REQ-002 / §17.3 / CR-005 §8）
+forbidden_fields:
+  - mqtt.root_ca_path
+  - mqtt.client_cert_path
+  - mqtt.private_key_path
+  - mqtt.root_ca_ref
+  - mqtt.tls_cert_ref
+  - mqtt.tls_key_ref
+  - mqtt.key_source
+  - mqtt.username
+  - mqtt.password
+  - mqtt.token
+  - mqtt.tls_secret
+  - mqtt.hsm_handle
+  - mqtt.private_key_ref
+  - mqtt.ca_cert
+  - mqtt.client_key
+  - mqtt.cert_path
+  - mqtt.key_path

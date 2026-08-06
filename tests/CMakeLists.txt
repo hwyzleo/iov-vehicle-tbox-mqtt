@@ -510,3 +510,10 @@ add_test(NAME MqttLogContextTest COMMAND test_mqtt_log_context)
 add_test(NAME MqttLogRedactionTest COMMAND test_mqtt_log_redaction)
 add_test(NAME MqttLogSecurityTest COMMAND test_mqtt_log_security)
 add_test(NAME MqttLogFaultTest COMMAND test_mqtt_log_fault)
+
+# ============================================================
+# CR-012: MQTT 配置 schema/profile 校验测试
+# 纯 bash+python3 脚本，无 gtest 依赖；python3/PyYAML 缺失时 SKIP(exit 0)。
+# ============================================================
+add_test(NAME ConfigSchemaTest
+    COMMAND bash ${CMAKE_SOURCE_DIR}/tests/config/test_config_schema.sh)

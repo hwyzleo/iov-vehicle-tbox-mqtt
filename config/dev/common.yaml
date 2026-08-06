@@ -1,7 +1,22 @@
+# =============================================================================
+# DEVELOPMENT-ONLY — 仅供本地调试/单元/集成测试显式引用
+# =============================================================================
+# TBOX-MQTT-DSN-CR-012 §3 / §17.1: config/dev/** 不由 mqtt-runtime 安装，
+# 不进入 BUILD staging 或正式包，也不被 framework-config 作为正式 common 来源。
+#
+# 正式 /etc/tbox/common.yaml 由 BUILD configs/orin/rootfs/etc/tbox/common.yaml
+# 唯一提供；本文件仅在显式以 config_root=config/dev/ 启动或本地调试时生效。
+#
+# 允许清单（allowlist）约束（REQ-001）：
+#   - 不得包含生产 CA/client key、私钥、Token、用户名/密码、TLS secret、
+#     private_key_ref、HSM handle；
+#   - 不得包含 VIN/SN/ECU UID 实例、client_id 实例、完整生产 Topic 或
+#     生产 Broker credential；
+#   - 测试值必须为明确占位值并受 allowlist 管理。
+# =============================================================================
+
 # TBOX Common Configuration (framework-config layer 0: common.yaml)
 # This file contains settings shared across all TBOX services.
-# Placed at: /etc/tbox/common.yaml
-#
 # framework-config requires a 'common.log' map (validated).
 # 所有公共配置统一收敛到 common 命名空间下，与代码读取的 common.* 键一致。
 

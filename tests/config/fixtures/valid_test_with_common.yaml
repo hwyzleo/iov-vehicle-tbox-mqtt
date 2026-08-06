@@ -1,0 +1,15 @@
+# valid test-profile config with top-level common (dev override semantics)
+common:
+  store:
+    root: /tmp/tbox_mqtt_test_store
+mqtt:
+  broker_host: test.mqtt.example
+  broker_port: 8883
+  identity:
+    client_id_format: "{vin}-{sn}"
+  keepalive: 30
+  tls:
+    credential_profile: mqtt
+    min_version: "1.2"
+  ipc:
+    socket_path: /tmp/tbox-mqtt-test.sock

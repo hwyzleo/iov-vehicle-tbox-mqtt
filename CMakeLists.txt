@@ -195,6 +195,12 @@ install(FILES packaging/systemd/tbox-mqtt.service
 )
 
 # --- mqtt-runtime: default config（生产安全：无生产 Broker 地址/凭据/身份实例值） ---
+# TBOX-MQTT-DSN-CR-012 §17.2: 精确安装 mqtt.default.yaml 为
+#   逻辑路径 /etc/tbox/conf.d/mqtt.yaml（构建机物理路径为
+#   <DESTDIR>/etc/tbox/conf.d/mqtt.yaml，不写构建机真实 /etc）。
+# config/dev/**（调试）、config/schema/（校验 schema）、config/README.md
+# 不由 mqtt-runtime 安装，不进入 rootfs；正式 common 由 BUILD 唯一提供，
+# MQTT 不安装 /etc/tbox/common.yaml；禁止 install(DIRECTORY config/ ...)。
 install(FILES config/mqtt.default.yaml
     DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/tbox/conf.d
     RENAME mqtt.yaml
