@@ -72,6 +72,8 @@ run_case "$FIXTURES/invalid_path_traversal.yaml"            production 2 "path t
 run_case "$FIXTURES/invalid_pem_secret.yaml"                production 2 "PEM private key marker in value"
 run_case "$FIXTURES/invalid_vin_instance.yaml"              production 2 "VIN instance value detected"
 run_case "$FIXTURES/invalid_mock_broker_production.yaml"    production 2 "mock broker host in production"
+run_case "$FIXTURES/invalid_ipc_socket_path.yaml"           production 2 "ipc socket_path not the MQTT endpoint (fW contract)"
+run_case "$FIXTURES/invalid_ipc_socket_path.yaml"           test       0 "ipc socket_path allowed in test profile"
 
 # --- 用法错误 (exit 3) ---
 out=$(python3 "$CHECKER" --profile production "/nonexistent/file.yaml" 2>&1)

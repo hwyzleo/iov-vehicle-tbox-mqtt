@@ -142,8 +142,10 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
 
     // Build SSL_CTX from SEC credential (CR-005 §5.1)
     // root CA bundle -> X509_STORE, client cert chain -> SSL_CTX, private key -> ECDSA_METHOD
+    // broker_host -> hostname verification (CR-013 §10.2): SAN/CN 绑定当前 broker_host，fail-closed
     SSL_CTX* ssl_ctx = tls_adapter_->buildTlsContext(
-        credential, *cred_mgr_, config.min_tls_version, config.max_tls_version);
+        credential, *cred_mgr_, config.broker_host,
+        config.min_tls_version, config.max_tls_version);
     if (!ssl_ctx) {
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start_time);

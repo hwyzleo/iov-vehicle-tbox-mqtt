@@ -25,7 +25,7 @@ mqtt:
     max_size: 1000
     drop_policy: drop_oldest
   ipc:
-    socket_path: /run/tbox/mqtt.sock
+    socket_path: /tmp/tbox-mqtt.sock
     dispatch_queue_size: 1024
     subscriber_queue_size: 128
     slow_subscriber_policy: disconnect

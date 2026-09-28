@@ -3,11 +3,13 @@
 #include "mqtt_context.h"
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/ssl.h>
 #include <openssl/evp.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
+#include <arpa/inet.h>
 #include <cstring>
 
 namespace tbox {
@@ -215,6 +217,7 @@ bool SecTlsKeyAdapter::sign(tbox::sec::SignatureAlgorithm algorithm,
 
 SSL_CTX* SecTlsKeyAdapter::buildTlsContext(const ActiveTlsCredential& credential,
                                            CredentialManager& cred_mgr,
+                                           const std::string& broker_host,
                                            TlsVersion min_tls,
                                            TlsVersion max_tls) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -268,6 +271,15 @@ SSL_CTX* SecTlsKeyAdapter::buildTlsContext(const ActiveTlsCredential& credential
     SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_PEER, nullptr);
     SSL_CTX_set_verify_depth(ssl_ctx_, 4);
 
+    // Bind server certificate identity to current broker_host (CR-013 §10.2)
+    // hostname verification 挂到 SSL_CTX verify param，所有连接继承；
+    // 链合法但 SAN/CN 与 broker_host 不匹配时握手失败（MQTT-1001），fail-closed。
+    if (!setServerHostnameVerification(ssl_ctx_, broker_host)) {
+        SSL_CTX_free(ssl_ctx_);
+        ssl_ctx_ = nullptr;
+        return nullptr;
+    }
+
     MqttLogAdapter::tls().info(
         "mqtt.tls.context_built",
         "TLS context 构建完成（SEC 凭据）",
@@ -279,6 +291,45 @@ SSL_CTX* SecTlsKeyAdapter::buildTlsContext(const ActiveTlsCredential& credential
     );
 
     return ssl_ctx_;
+}
+
+bool SecTlsKeyAdapter::setServerHostnameVerification(SSL_CTX* ctx,
+                                                     const std::string& broker_host) {
+    if (broker_host.empty()) {
+        last_error_ = "broker_host is empty, cannot configure hostname verification";
+        return false;
+    }
+
+    X509_VERIFY_PARAM* param = SSL_CTX_get0_param(ctx);
+    if (!param) {
+        last_error_ = "SSL_CTX_get0_param failed";
+        return false;
+    }
+
+    // RFC 6125：仅允许最左标签完整 '*'，禁止部分通配符（如 www*.example.com）。
+    // 如量产证书策略确认不使用通配符，可进一步收紧为 X509_CHECK_FLAG_NO_WILDCARDS。
+    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+
+    struct in_addr addr4{};
+    struct in6_addr addr6{};
+    const bool is_ip =
+        (inet_pton(AF_INET, broker_host.c_str(), &addr4) == 1) ||
+        (inet_pton(AF_INET6, broker_host.c_str(), &addr6) == 1);
+
+    if (is_ip) {
+        // IP 地址：仅接受匹配的 IP SAN，不以 DNS SAN 或 CN 代替 (CR-013 §10.2)
+        if (X509_VERIFY_PARAM_set1_ip_asc(param, broker_host.c_str()) != 1) {
+            last_error_ = "X509_VERIFY_PARAM_set1_ip_asc failed";
+            return false;
+        }
+    } else {
+        // 域名：按 SAN 优先、兼容 CN 的 RFC 6125/OpenSSL 规则匹配
+        if (X509_VERIFY_PARAM_set1_host(param, broker_host.c_str(), 0) != 1) {
+            last_error_ = "X509_VERIFY_PARAM_set1_host failed";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool SecTlsKeyAdapter::loadRootCaBundle(SSL_CTX* ctx,

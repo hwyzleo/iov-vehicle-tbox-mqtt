@@ -106,6 +106,9 @@ fields:
           socket_path:
             type: string
             path_safe: true
+            # §17.6: *.ipc.socket_path 遵循 framework-ipc 统一契约，MQTT 必须为精确 /tmp/tbox-mqtt.sock；
+            # 与 offline_queue.path（持久化路径，production 禁止 /tmp）区分。
+            ipc_socket: true
           dispatch_queue_size: {type: integer, min: 1}
           subscriber_queue_size: {type: integer, min: 1}
           slow_subscriber_policy:

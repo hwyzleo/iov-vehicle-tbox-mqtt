@@ -1,0 +1,30 @@
+# invalid: ipc socket_path 非本服务端点（§17.6 契约：MQTT 必须为 /tmp/tbox-mqtt.sock）
+mqtt:
+  broker_host: localhost
+  broker_port: 8883
+  identity:
+    client_id_format: "{vin}-{sn}"
+    prov_retry:
+      initial_backoff_ms: 500
+      max_backoff_ms: 30000
+      multiplier: 2.0
+  keepalive: 60
+  clean_start: false
+  session_expiry: 3600
+  tls:
+    credential_profile: mqtt
+    min_version: "1.2"
+    max_version: "1.3"
+    handshake_timeout_ms: 10000
+    credential_poll:
+      initial_backoff_ms: 1000
+      max_backoff_ms: 60000
+  offline_queue:
+    path: /var/tbox/mqtt/queue
+    max_size: 1000
+    drop_policy: drop_oldest
+  ipc:
+    socket_path: /tmp/other-service.sock
+    dispatch_queue_size: 1024
+    subscriber_queue_size: 128
+    slow_subscriber_policy: disconnect

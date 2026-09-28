@@ -80,9 +80,19 @@ RE_MOCK = re.compile(r"\bmock\b", re.I)
 # 不受控 / 个人 / build tree 路径前缀
 UNCONTROLLED_PATH_PREFIXES = ("/home/", "/Users/", "~/", "../", "..\\", "/build/")
 
+# IPC socket_path 契约（DSN §17.6 / FW CR-005 §9.5）：
+# framework-ipc 统一服务端点，MQTT 必须为精确 /tmp/tbox-mqtt.sock；
+# 拒绝 .. 、路径模板逃逸及非本服务 endpoint。
+IPC_SOCKET_ENDPOINT = "/tmp/tbox-mqtt.sock"
 
-def path_is_safe(value: str, profile: str) -> list[str]:
-    """路径规范化校验，返回违规原因列表（空列表=安全）。"""
+
+def path_is_safe(value: str, profile: str, is_ipc_socket: bool = False) -> list[str]:
+    """路径规范化校验，返回违规原因列表（空列表=安全）。
+
+    is_ipc_socket=True 时按 framework-ipc 契约校验（§17.6）：
+    production 仅允许精确 /tmp/tbox-mqtt.sock，拒绝其他 /tmp 路径；
+    否则（持久化路径）沿用 production 禁止 /tmp 的规则。
+    """
     reasons: list[str] = []
     if not value:
         return reasons
@@ -93,12 +103,21 @@ def path_is_safe(value: str, profile: str) -> list[str]:
     for bad in UNCONTROLLED_PATH_PREFIXES:
         if value.startswith(bad) or ("/" + bad.strip("/") + "/") in ("/" + value + "/"):
             reasons.append(f"path under uncontrolled/personal/build tree ({bad})")
-    # production 禁止相对路径与 /tmp（不受控临时位置）
+    # production 禁止相对路径
     if profile == "production":
         if value.startswith("./") or value == "." or (not value.startswith("/")):
             reasons.append("relative path not allowed in production")
-        if value.startswith("/tmp/") or value == "/tmp":
-            reasons.append("path under /tmp not allowed in production (uncontrolled)")
+        if is_ipc_socket:
+            # §17.6: 仅允许精确服务 endpoint /tmp/tbox-mqtt.sock，非本服务端点视为逃逸
+            if value != IPC_SOCKET_ENDPOINT:
+                reasons.append(
+                    f"ipc socket_path must be exactly {IPC_SOCKET_ENDPOINT} "
+                    "(framework-ipc contract, §17.6)"
+                )
+        else:
+            # 持久化路径（queue/store）：production 禁止 /tmp（不受控临时位置）
+            if value.startswith("/tmp/") or value == "/tmp":
+                reasons.append("path under /tmp not allowed in production (uncontrolled)")
     return reasons
 
 
@@ -179,7 +198,7 @@ class SchemaValidator:
             if "enum" in spec and value not in spec["enum"]:
                 self._err(f"{path}: value not in allowed enum {spec['enum']}")
             if "path_safe" in spec and spec["path_safe"]:
-                reasons = path_is_safe(value, self.profile)
+                reasons = path_is_safe(value, self.profile, spec.get("ipc_socket", False))
                 for r in reasons:
                     self._perr(f"{path}: path safety violation: {r}")
             # 安全扫描：string 值

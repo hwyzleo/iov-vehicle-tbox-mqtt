@@ -38,11 +38,13 @@ public:
     /// 基于 SEC 凭据构建 SSL_CTX (CR-005 §5.1)
     /// @param credential 当前活跃凭据快照
     /// @param cred_mgr CredentialManager 引用（用于 signTls 委托）
+    /// @param broker_host 当前生效的 broker_host（TCP 目标 + hostname verification 唯一依据, CR-013 §10.2）
     /// @param min_tls 最低 TLS 版本
     /// @param max_tls 最高 TLS 版本
     /// @return 非 nullptr 表示成功；调用方通过 SSL_CTX_free 或 destroyContext 释放
     SSL_CTX* buildTlsContext(const ActiveTlsCredential& credential,
                              CredentialManager& cred_mgr,
+                             const std::string& broker_host,
                              TlsVersion min_tls,
                              TlsVersion max_tls);
 
@@ -78,6 +80,16 @@ private:
 
     /// 设置 TLS 版本范围
     void setTlsVersionRange(SSL_CTX* ctx, TlsVersion min_tls, TlsVersion max_tls);
+
+    /// 配置服务器证书主机名校验 (CR-013 §10.2)
+    ///
+    /// hostname verification 挂到 SSL_CTX verify param，所有基于该 context 的连接继承。
+    /// - 域名：X509_VERIFY_PARAM_set1_host + X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS（RFC 6125，
+    ///   仅允许最左标签完整 *，禁止部分通配符）
+    /// - IP 地址：X509_VERIFY_PARAM_set1_ip_asc（仅 IP SAN，不以 DNS SAN/CN 代替）
+    /// - broker_host 为空：fail-closed，拒绝构建
+    /// @return true 设置成功；false 设置失败（调用方应终止构建）
+    bool setServerHostnameVerification(SSL_CTX* ctx, const std::string& broker_host);
 
     /// 注册 ENGINE 远程签名私钥 (CR-005 §5.1)
     bool registerRemoteKey(SSL_CTX* ctx,
