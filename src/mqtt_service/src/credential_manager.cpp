@@ -31,8 +31,13 @@ bool CredentialManager::initialize() {
         return true;
     }
 
-    sec_client_ = std::make_unique<tbox::sec::SecClient>(sec_socket_path_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    sec_client_ = std::make_shared<tbox::sec::SecClient>(sec_socket_path_);
+    sec_client_generation_++;
+    sec_retry_.client_generation = sec_client_generation_;
     if (!sec_client_->connect()) {
+        sec_ipc_state_ = IpcState::DISCONNECTED;
+        last_error_ = "sec_connect_failed";
         MqttLogAdapter::tls().warn(
             "mqtt.sec.transport_failed",
             "SEC client 连接失败，云端连接保持 CERT_WAIT",
@@ -47,6 +52,7 @@ bool CredentialManager::initialize() {
         return true;
     }
 
+    sec_ipc_state_ = IpcState::CONNECTED;
     MqttLogAdapter::tls().info(
         "mqtt.sec.connected",
         "SEC client 已连接",
@@ -55,21 +61,170 @@ bool CredentialManager::initialize() {
     return true;
 }
 
-bool CredentialManager::getTlsCredential(ActiveTlsCredential& credential) {
-    std::lock_guard<std::mutex> lock(mutex_);
+// ============================================================
+// CR-016 §4: SEC IPC transport 自动恢复
+// ============================================================
 
+bool CredentialManager::ensureConnected() {
     if (simulated_) {
-        credential = current_credential_;
-        return credential.ready;
+        return true;
     }
 
-    if (!sec_client_ || !sec_client_->is_connected()) {
-        last_error_ = "SEC client not connected";
-        return false;
+    // 同一依赖最多一个 connect attempt（设计 §6/§7）
+    std::lock_guard<std::mutex> recovery_lock(recovery_mutex_);
+
+    // 1. 探测：健康连接直接复用，不递增计数
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (sec_client_ && sec_client_->is_connected() &&
+            sec_ipc_state_ == IpcState::CONNECTED) {
+            sec_retry_.timer_armed = false;
+            return true;
+        }
+        // 2. 进入一次实际恢复尝试：retry_count/total_attempts 递增（设计 §6）
+        sec_retry_.timer_armed = true;
+        sec_retry_.retry_count++;
+        sec_retry_.total_attempts++;
+        sec_retry_.next_backoff = computeDependencyBackoff(
+            sec_retry_.retry_count > 0 ? sec_retry_.retry_count - 1 : 0,
+            credential_poll_config_.initial_backoff,
+            credential_poll_config_.max_backoff,
+            sec_rng_);
+        sec_ipc_state_ = IpcState::CONNECTING;
     }
 
+    logDependencyEvent("mqtt_dependency_ipc_connect_attempt",
+                       "sec_connect_failed", "MQTT-1001", 0);
+
+    // 取消旧订阅（可能在读线程中回调，须在锁外 join，避免与回调争锁死锁）
+    if (subscription_.isActive()) {
+        subscription_.cancel();
+    }
+
+    // 3. 销毁旧 transport，按 generation 重建（设计 §4/§7）
+    std::shared_ptr<tbox::sec::SecClient> client;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (sec_client_) {
+            sec_client_->disconnect();
+        }
+        sec_client_ = std::make_shared<tbox::sec::SecClient>(sec_socket_path_);
+        sec_client_generation_++;
+        sec_retry_.client_generation = sec_client_generation_;
+        client = sec_client_;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    bool ok = client->connect();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    // 4. 提交连接结果，并按需重建 credential changed 订阅
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ok) {
+            sec_ipc_state_ = IpcState::CONNECTED;
+            sec_retry_.timer_armed = false;
+            if (changed_callback_) {
+                establishSubscriptionLocked();
+            }
+        } else {
+            sec_ipc_state_ = IpcState::DISCONNECTED;
+            last_error_ = "sec_connect_failed";
+        }
+    }
+
+    if (ok) {
+        logDependencyEvent("mqtt_dependency_ipc_connected",
+                           "", "", static_cast<uint64_t>(elapsed.count()));
+    } else {
+        logDependencyEvent("mqtt_dependency_ipc_connect_failed",
+                           "sec_connect_failed", "MQTT-1001",
+                           static_cast<uint64_t>(elapsed.count()));
+    }
+    return ok;
+}
+
+RetryState CredentialManager::getRetryState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sec_retry_;
+}
+
+void CredentialManager::markDependencyReady() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 成功离开等待态：连续 retry_count 重置，total_attempts 保持累计（设计 §6）
+    sec_retry_.retry_count = 0;
+    sec_retry_.next_backoff = Duration(0);
+    sec_retry_.timer_armed = false;
+    sec_retry_.cycle_id++;
+    last_error_.clear();
+}
+
+void CredentialManager::setCredentialPollConfig(const CredentialPollConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    credential_poll_config_ = config;
+}
+
+uint64_t CredentialManager::getClientGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sec_client_generation_;
+}
+
+IpcState CredentialManager::getIpcState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sec_ipc_state_;
+}
+
+bool CredentialManager::isClientGenerationCurrent(uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generation == sec_client_generation_;
+}
+
+void CredentialManager::setPreCommitHookForTest(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pre_commit_hook_for_test_ = std::move(hook);
+}
+
+void CredentialManager::invalidateTransportForTest() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sec_ipc_state_ = IpcState::DISCONNECTED;
+    sec_client_generation_++;
+    sec_retry_.client_generation = sec_client_generation_;
+}
+
+// ============================================================
+// SEC facade 封装
+// ============================================================
+
+bool CredentialManager::getTlsCredential(ActiveTlsCredential& credential) {
+    std::shared_ptr<tbox::sec::SecClient> client;
+    uint64_t gen = 0;
+    std::string profile;
+    std::function<void()> pre_commit_hook;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (simulated_) {
+            credential = current_credential_;
+            return credential.ready;
+        }
+        if (!sec_client_ || !sec_client_->is_connected() ||
+            sec_ipc_state_ != IpcState::CONNECTED) {
+            last_error_ = "sec_not_connected";
+            sec_ipc_state_ = IpcState::DISCONNECTED;
+            logDependencyEvent("mqtt_dependency_query_failed",
+                               "sec_not_connected", "MQTT-1001", 0);
+            return false;
+        }
+        client = sec_client_;
+        gen = sec_client_generation_;
+        profile = profile_;
+        pre_commit_hook = pre_commit_hook_for_test_;
+    }
+
+    // CR-016 §7.4: IPC 调用在锁外进行（framework-ipc 内部自带一次重连）
     tbox::sec::TlsCredentialBundle bundle;
-    auto rc = sec_client_->get_tls_credential(profile_, bundle);
+    auto start = std::chrono::steady_clock::now();
+    auto rc = client->get_tls_credential(profile, bundle);
 
     // 传输失败允许单次重试 (CR-005 §4.1)
     if (rc != tbox::sec::ErrorCode::SUCCESS && isTransportError(rc)) {
@@ -77,21 +232,44 @@ bool CredentialManager::getTlsCredential(ActiveTlsCredential& credential) {
             "mqtt.sec.transport_failed",
             "getTlsCredential 传输失败，单次重试",
             {
-                {"profile", tbox::fw::log::FieldValue::makeString(profile_)},
+                {"profile", tbox::fw::log::FieldValue::makeString(profile)},
                 {"reason_code", tbox::fw::log::FieldValue::makeString(secErrorToReasonCode(rc))}
             }
         );
-        rc = sec_client_->get_tls_credential(profile_, bundle);
+        rc = client->get_tls_credential(profile, bundle);
+    }
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    // 测试钩子：模拟迟到回调（生产路径为 nullptr）
+    if (pre_commit_hook) {
+        pre_commit_hook();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // CR-016 §7.2: 提交结果前核对 generation，旧结果丢弃
+    if (gen != sec_client_generation_) {
+        logDependencyEvent("mqtt_dependency_stale_callback_dropped",
+                           "sec_credential_not_ready", "", 0);
+        return false;
     }
 
     if (rc != tbox::sec::ErrorCode::SUCCESS) {
-        last_error_ = secErrorToReasonCode(rc);
+        last_error_ = isTransportError(rc) ? "dependency_query_transport_failed"
+                                           : secErrorToReasonCode(rc);
+        if (isTransportError(rc)) {
+            // 连接类错误：销毁坏 transport，下一次 ensureConnected 重建
+            sec_ipc_state_ = IpcState::DISCONNECTED;
+        }
         MqttLogAdapter::tls().warn(
             secErrorToMqttEvent(rc),
             "getTlsCredential 失败",
             {
                 {"profile", tbox::fw::log::FieldValue::makeString(profile_)},
-                {"reason_code", tbox::fw::log::FieldValue::makeString(secErrorToReasonCode(rc))},
+                {"reason_code", tbox::fw::log::FieldValue::makeString(last_error_)},
+                {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(sec_retry_.retry_count))},
                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
             }
         );
@@ -110,6 +288,7 @@ bool CredentialManager::getTlsCredential(ActiveTlsCredential& credential) {
     current_credential_ = credential;
 
     if (credential.ready) {
+        last_error_.clear();
         MqttLogAdapter::tls().info(
             "mqtt.certificate.ready",
             "SEC 凭据就绪",
@@ -121,36 +300,52 @@ bool CredentialManager::getTlsCredential(ActiveTlsCredential& credential) {
                     static_cast<int64_t>(generation_))}
             }
         );
+    } else {
+        last_error_ = "sec_credential_not_ready";
+        logDependencyEvent("mqtt_dependency_not_ready",
+                           "sec_credential_not_ready", "MQTT-1001",
+                           static_cast<uint64_t>(elapsed.count()));
     }
 
     return credential.ready;
 }
 
 bool CredentialManager::getTlsCredentialState(tbox::sec::TlsCredentialState& state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (simulated_) {
-        state.credential_id = current_credential_.credential_id;
-        state.version = current_credential_.version;
-        state.status = current_credential_.status;
-        state.reason_code = 0;
-        return true;
+    std::shared_ptr<tbox::sec::SecClient> client;
+    std::string profile;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (simulated_) {
+            state.credential_id = current_credential_.credential_id;
+            state.version = current_credential_.version;
+            state.status = current_credential_.status;
+            state.reason_code = 0;
+            return true;
+        }
+        if (!sec_client_ || !sec_client_->is_connected() ||
+            sec_ipc_state_ != IpcState::CONNECTED) {
+            last_error_ = "sec_not_connected";
+            sec_ipc_state_ = IpcState::DISCONNECTED;
+            return false;
+        }
+        client = sec_client_;
+        profile = profile_;
     }
 
-    if (!sec_client_ || !sec_client_->is_connected()) {
-        last_error_ = "SEC client not connected";
-        return false;
-    }
-
-    auto rc = sec_client_->get_tls_credential_state(profile_, state);
+    auto rc = client->get_tls_credential_state(profile, state);
 
     // 传输失败允许单次重试 (CR-005 §4.1)
     if (rc != tbox::sec::ErrorCode::SUCCESS && isTransportError(rc)) {
-        rc = sec_client_->get_tls_credential_state(profile_, state);
+        rc = client->get_tls_credential_state(profile, state);
     }
 
+    std::lock_guard<std::mutex> lock(mutex_);
     if (rc != tbox::sec::ErrorCode::SUCCESS) {
-        last_error_ = secErrorToReasonCode(rc);
+        last_error_ = isTransportError(rc) ? "dependency_query_transport_failed"
+                                           : secErrorToReasonCode(rc);
+        if (isTransportError(rc)) {
+            sec_ipc_state_ = IpcState::DISCONNECTED;
+        }
         return false;
     }
 
@@ -163,31 +358,37 @@ bool CredentialManager::signTls(const tbox::sec::TlsSignRequest& request,
     // 超时或响应丢失为 unknown outcome，调用方终止本次握手
 
     if (simulated_) {
-        // 模拟签名：返回固定签名数据
         signature = {0x30, 0x45, 0x02, 0x21, 0x00, 0xAB, 0xCD};
         return true;
     }
 
-    if (!sec_client_ || !sec_client_->is_connected()) {
-        last_error_ = "SEC client not connected";
-        MqttLogAdapter::tls().error(
-            "mqtt.tls.sign_failed",
-            "signTls 失败：SEC client 未连接",
-            {
-                {"profile", tbox::fw::log::FieldValue::makeString(profile_)},
-                {"reason_code", tbox::fw::log::FieldValue::makeString("sec_not_connected")},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
-            }
-        );
-        return false;
+    std::shared_ptr<tbox::sec::SecClient> client;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!sec_client_ || !sec_client_->is_connected() ||
+            sec_ipc_state_ != IpcState::CONNECTED) {
+            last_error_ = "sec_not_connected";
+            MqttLogAdapter::tls().error(
+                "mqtt.tls.sign_failed",
+                "signTls 失败：SEC client 未连接",
+                {
+                    {"profile", tbox::fw::log::FieldValue::makeString(profile_)},
+                    {"reason_code", tbox::fw::log::FieldValue::makeString("sec_not_connected")},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+                }
+            );
+            return false;
+        }
+        client = sec_client_;
     }
 
     auto start = std::chrono::steady_clock::now();
-    auto rc = sec_client_->sign_tls(request, signature);
+    auto rc = client->sign_tls(request, signature);
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
 
     if (rc != tbox::sec::ErrorCode::SUCCESS) {
+        std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = secErrorToReasonCode(rc);
         MqttLogAdapter::tls().error(
             secErrorToMqttEvent(rc),
@@ -223,7 +424,16 @@ bool CredentialManager::subscribeTlsCredentialChanged(CredentialChangedCallback 
     }
 
     if (!sec_client_ || !sec_client_->is_connected()) {
-        last_error_ = "SEC client not connected";
+        last_error_ = "sec_not_connected";
+        // SEC 尚未连接：保留 callback，由 ensureConnected() 在恢复后重建订阅
+        return false;
+    }
+
+    return establishSubscriptionLocked();
+}
+
+bool CredentialManager::establishSubscriptionLocked() {
+    if (!sec_client_ || !sec_client_->is_connected()) {
         return false;
     }
 
@@ -233,13 +443,11 @@ bool CredentialManager::subscribeTlsCredentialChanged(CredentialChangedCallback 
     subscription_ = sec_client_->subscribe_tls_credential_changed(
         profile_,
         [cb_ptr, this](const tbox::sec::TlsCredentialChangedEvent& /*event*/) {
-            // 收到变化事件：先标记 generation 失效，再通知上层重新获取凭据 (CR-005 §7)
             MqttLogAdapter::tls().info(
                 "mqtt.credential.changed",
                 "收到 SEC 凭据变化事件",
                 {{"profile", tbox::fw::log::FieldValue::makeString(profile_)}}
             );
-            // 注意：不在此处直接替换凭据，仅触发上层重新调用 getTlsCredential()
             CredentialChangedCallback cb;
             {
                 std::lock_guard<std::mutex> inner_lock(mutex_);
@@ -304,12 +512,9 @@ void CredentialManager::cleanupCredential() {
 
 void CredentialManager::cancelCredentialSubscription() {
     // CR-008: 取消 credential changed 订阅并 join 回调线程。
-    // 在 MqttApplication::cleanup 销毁 MqttService 前调用，确保迟到回调不会
-    // 访问已销毁的 MqttService 对象。
     if (subscription_.isActive()) {
         subscription_.cancel();
     }
-    // 清空回调，避免后续误调用
     std::lock_guard<std::mutex> lock(mutex_);
     changed_callback_ = nullptr;
 }
@@ -318,12 +523,49 @@ bool CredentialManager::isSecConnected() const {
     if (simulated_) {
         return true;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     return sec_client_ && sec_client_->is_connected();
 }
 
 std::string CredentialManager::getLastError() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return last_error_;
+}
+
+// ============================================================
+// CR-016 §8: 依赖恢复事件
+// ============================================================
+
+void CredentialManager::logDependencyEvent(const char* event,
+                                           const std::string& reason_code,
+                                           const std::string& error_code,
+                                           uint64_t elapsed_ms) {
+    MqttLogAdapter::dependency().info(
+        event,
+        "SEC IPC 依赖恢复事件",
+        {
+            {"dependency", tbox::fw::log::FieldValue::makeString(dependencyName(Dependency::SEC))},
+            {"state", tbox::fw::log::FieldValue::makeString(ipcStateName(sec_ipc_state_))},
+            {"cycle_id", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_retry_.cycle_id))},
+            {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_retry_.retry_count))},
+            {"total_attempts", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_retry_.total_attempts))},
+            {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_retry_.next_backoff.count()))},
+            {"client_generation", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_client_generation_))},
+            {"reason_code", tbox::fw::log::FieldValue::makeString(reason_code)},
+            {"error_code", tbox::fw::log::FieldValue::makeString(error_code)},
+            {"elapsed_ms", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(elapsed_ms))}
+        }
+    );
+    // CR-016 §10: 仅关键 warn/error 路径集中落盘
+    if (isCriticalDependencyEvent(event)) {
+        MqttLogAdapter::flushCritical();
+    }
 }
 
 // ============================================================

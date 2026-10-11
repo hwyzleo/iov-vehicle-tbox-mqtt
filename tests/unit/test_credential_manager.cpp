@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "credential_manager.h"
+#include <unistd.h>
 
 using namespace tbox::mqtt;
 using namespace tbox::sec;
@@ -203,4 +204,77 @@ TEST(CredentialManagerTest, SimulateReadyWithCustomCredential) {
     EXPECT_EQ(snap.credential_id, "custom-cred");
     EXPECT_EQ(snap.version, 42u);
     EXPECT_TRUE(snap.ready);
+}
+
+// ============================================================
+// CR-016 §4/§6/§7: SEC IPC transport 自动恢复与计数
+// ============================================================
+
+namespace {
+std::string cr016SecSock() {
+    return "/tmp/tbox_cr016_sec_nonexistent_" +
+           std::to_string(static_cast<long>(::getpid())) + ".sock";
+}
+} // namespace
+
+TEST(CredentialManagerTest, CR016EnsureConnectedCountsFailedAttempts) {
+    CredentialManager mgr(cr016SecSock(), "mqtt");
+    CredentialPollConfig cfg;
+    cfg.initial_backoff = Duration(10);
+    cfg.max_backoff = Duration(50);
+    mgr.setCredentialPollConfig(cfg);
+
+    EXPECT_FALSE(mgr.ensureConnected());
+    EXPECT_EQ(mgr.getIpcState(), IpcState::DISCONNECTED);
+    auto rs1 = mgr.getRetryState();
+    EXPECT_EQ(rs1.retry_count, 1u);
+    EXPECT_EQ(rs1.total_attempts, 1u);
+    EXPECT_GT(rs1.client_generation, 0u);
+    EXPECT_FALSE(mgr.getLastError().empty());
+
+    EXPECT_FALSE(mgr.ensureConnected());
+    auto rs2 = mgr.getRetryState();
+    EXPECT_EQ(rs2.retry_count, 2u);
+    EXPECT_EQ(rs2.total_attempts, 2u);
+}
+
+TEST(CredentialManagerTest, CR016MarkDependencyReadyResetsRetryCount) {
+    CredentialManager mgr(cr016SecSock(), "mqtt");
+    mgr.setCredentialPollConfig(CredentialPollConfig{});
+    ASSERT_FALSE(mgr.ensureConnected());
+    ASSERT_FALSE(mgr.ensureConnected());
+    ASSERT_EQ(mgr.getRetryState().retry_count, 2u);
+
+    mgr.markDependencyReady();
+    auto rs = mgr.getRetryState();
+    EXPECT_EQ(rs.retry_count, 0u);
+    EXPECT_GE(rs.total_attempts, 2u);  // 累计仍在
+    EXPECT_EQ(rs.next_backoff.count(), 0);
+    EXPECT_GT(rs.cycle_id, 0u);
+}
+
+TEST(CredentialManagerTest, CR016NotConnectedDistinguishesReason) {
+    CredentialManager mgr(cr016SecSock(), "mqtt");
+    ActiveTlsCredential cred;
+    EXPECT_FALSE(mgr.getTlsCredential(cred));
+    EXPECT_EQ(mgr.getLastError(), "sec_not_connected");
+}
+
+TEST(CredentialManagerTest, CR016GenerationGuardPrimitive) {
+    CredentialManager mgr(cr016SecSock(), "mqtt");
+    ASSERT_FALSE(mgr.ensureConnected());
+
+    uint64_t gen = mgr.getClientGeneration();
+    EXPECT_TRUE(mgr.isClientGenerationCurrent(gen));
+
+    mgr.invalidateTransportForTest();
+    EXPECT_FALSE(mgr.isClientGenerationCurrent(gen));
+    EXPECT_GT(mgr.getClientGeneration(), gen);
+}
+
+TEST(CredentialManagerTest, CR016EnsureConnectedSimulatedIsHealthy) {
+    CredentialManager mgr;
+    mgr.simulateReady();
+    EXPECT_TRUE(mgr.ensureConnected());
+    EXPECT_EQ(mgr.getRetryState().retry_count, 0u);
 }

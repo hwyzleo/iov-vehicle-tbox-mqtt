@@ -49,8 +49,13 @@ bool ProvisionIdentityManager::initialize() {
         return true;
     }
 
-    prov_client_ = std::make_unique<tbox::prov::ProvClient>(prov_socket_path_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    prov_client_ = std::make_shared<tbox::prov::ProvClient>(prov_socket_path_);
+    prov_client_generation_++;
+    prov_retry_.client_generation = prov_client_generation_;
     if (!prov_client_->connect()) {
+        prov_ipc_state_ = IpcState::DISCONNECTED;
+        last_error_ = "prov_connect_failed";
         MqttLogAdapter::provision().warn(
             "mqtt.provision.waiting",
             "PROV client 连接失败，云端连接保持 PROV_WAIT",
@@ -67,6 +72,7 @@ bool ProvisionIdentityManager::initialize() {
         return true;
     }
 
+    prov_ipc_state_ = IpcState::CONNECTED;
     MqttLogAdapter::provision().info(
         "mqtt.provision.connected",
         "PROV client 已连接",
@@ -74,6 +80,129 @@ bool ProvisionIdentityManager::initialize() {
     );
     initialized_ = true;
     return true;
+}
+
+// ============================================================
+// CR-016 §5: PROV IPC transport 自动恢复
+// ============================================================
+
+bool ProvisionIdentityManager::ensureConnected() {
+    if (simulated_) {
+        return true;
+    }
+
+    // 同一依赖最多一个 connect attempt（设计 §6/§7）
+    std::lock_guard<std::mutex> recovery_lock(recovery_mutex_);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (prov_client_ && prov_client_->is_connected() &&
+            prov_ipc_state_ == IpcState::CONNECTED) {
+            prov_retry_.timer_armed = false;
+            return true;
+        }
+        prov_retry_.timer_armed = true;
+        prov_retry_.retry_count++;
+        prov_retry_.total_attempts++;
+        prov_retry_.next_backoff = computeDependencyBackoff(
+            prov_retry_.retry_count > 0 ? prov_retry_.retry_count - 1 : 0,
+            provision_retry_config_.initial_backoff,
+            provision_retry_config_.max_backoff,
+            prov_rng_);
+        prov_ipc_state_ = IpcState::CONNECTING;
+    }
+
+    logDependencyEvent("mqtt_dependency_ipc_connect_attempt",
+                       "prov_connect_failed", "MQTT-1009", 0);
+
+    std::shared_ptr<tbox::prov::ProvClient> client;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (prov_client_) {
+            prov_client_->disconnect();
+        }
+        prov_client_ = std::make_shared<tbox::prov::ProvClient>(prov_socket_path_);
+        prov_client_generation_++;
+        prov_retry_.client_generation = prov_client_generation_;
+        client = prov_client_;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    bool ok = client->connect();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ok) {
+            prov_ipc_state_ = IpcState::CONNECTED;
+            prov_retry_.timer_armed = false;
+        } else {
+            prov_ipc_state_ = IpcState::DISCONNECTED;
+            last_error_ = "prov_connect_failed";
+        }
+    }
+
+    if (ok) {
+        logDependencyEvent("mqtt_dependency_ipc_connected",
+                           "", "", static_cast<uint64_t>(elapsed.count()));
+    } else {
+        logDependencyEvent("mqtt_dependency_ipc_connect_failed",
+                           "prov_connect_failed", "MQTT-1009",
+                           static_cast<uint64_t>(elapsed.count()));
+    }
+    return ok;
+}
+
+RetryState ProvisionIdentityManager::getRetryState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prov_retry_;
+}
+
+void ProvisionIdentityManager::markDependencyReady() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prov_retry_.retry_count = 0;
+    prov_retry_.next_backoff = Duration(0);
+    prov_retry_.timer_armed = false;
+    prov_retry_.cycle_id++;
+    last_error_.clear();
+}
+
+void ProvisionIdentityManager::setProvisionRetryConfig(const ProvisionRetryConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    provision_retry_config_ = config;
+}
+
+uint64_t ProvisionIdentityManager::getClientGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prov_client_generation_;
+}
+
+IpcState ProvisionIdentityManager::getIpcState() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prov_ipc_state_;
+}
+
+bool ProvisionIdentityManager::isClientGenerationCurrent(uint64_t generation) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generation == prov_client_generation_;
+}
+
+std::string ProvisionIdentityManager::getLastError() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_error_;
+}
+
+void ProvisionIdentityManager::setPreCommitHookForTest(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pre_commit_hook_for_test_ = std::move(hook);
+}
+
+void ProvisionIdentityManager::invalidateTransportForTest() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prov_ipc_state_ = IpcState::DISCONNECTED;
+    prov_client_generation_++;
+    prov_retry_.client_generation = prov_client_generation_;
 }
 
 bool ProvisionIdentityManager::readBinding() {
@@ -86,20 +215,60 @@ bool ProvisionIdentityManager::readBinding() {
                !current_snapshot_.sn.empty();
     }
 
-    if (!prov_client_ || !prov_client_->is_connected()) {
-        MqttLogAdapter::provision().warn(
-            "mqtt.provision.waiting",
-            "PROV client 未连接，无法读取绑定",
-            {
-                {"binding_state", tbox::fw::log::FieldValue::makeString("NONE")},
-                {"reason_code", tbox::fw::log::FieldValue::makeString("prov_not_connected")},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
-            }
-        );
-        return false;
+    // CR-016 §5/§7.4: 探测 transport 后于锁外执行查询
+    std::shared_ptr<tbox::prov::ProvClient> client;
+    uint64_t gen = 0;
+    std::function<void()> pre_commit_hook;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!prov_client_ || !prov_client_->is_connected() ||
+            prov_ipc_state_ != IpcState::CONNECTED) {
+            last_error_ = "prov_not_connected";
+            prov_ipc_state_ = IpcState::DISCONNECTED;
+            logDependencyEvent("mqtt_dependency_query_failed",
+                               "prov_not_connected", "MQTT-1009", 0);
+            return false;
+        }
+        client = prov_client_;
+        gen = prov_client_generation_;
+        pre_commit_hook = pre_commit_hook_for_test_;
     }
 
-    auto binding = prov_client_->read_binding();
+    auto start = std::chrono::steady_clock::now();
+    auto binding = client->read_binding();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    // 测试钩子：模拟迟到回调（生产路径为 nullptr）
+    if (pre_commit_hook) {
+        pre_commit_hook();
+    }
+
+    // CR-016 §7.2: 提交结果前核对 generation，旧结果丢弃
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (gen != prov_client_generation_) {
+            logDependencyEvent("mqtt_dependency_stale_callback_dropped",
+                               "prov_binding_not_ready", "", 0);
+            return false;
+        }
+    }
+
+    // CR-016 §5: PROV 查询无独立错误码（read_binding 返回默认值）；
+    // 以 client 连接状态区分业务 NOT_BOUND 与连接类传输故障。
+    if (!client->is_connected()) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (gen == prov_client_generation_) {
+                prov_ipc_state_ = IpcState::DISCONNECTED;
+                last_error_ = "dependency_query_transport_failed";
+            }
+        }
+        logDependencyEvent("mqtt_dependency_query_failed",
+                           "dependency_query_transport_failed", "MQTT-1009",
+                           static_cast<uint64_t>(elapsed.count()));
+        return false;
+    }
 
     if (!validate(binding)) {
         // CR-006 §5.2: 校验失败，更新快照（可能 state 变化）并记录
@@ -114,6 +283,11 @@ bool ProvisionIdentityManager::readBinding() {
             reason = "ecu_uid_empty";
         } else {
             reason = "validation_failed";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_ = "prov_binding_not_ready";
         }
 
         updateSnapshot(binding);
@@ -139,11 +313,18 @@ bool ProvisionIdentityManager::readBinding() {
                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
             }
         );
+        logDependencyEvent("mqtt_dependency_not_ready",
+                           "prov_binding_not_ready", "MQTT-1009",
+                           static_cast<uint64_t>(elapsed.count()));
         return false;
     }
 
     // 绑定有效：更新快照
     updateSnapshot(binding);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_error_.clear();
+    }
 
     ProvisionIdentitySnapshot snap;
     {
@@ -263,7 +444,45 @@ bool ProvisionIdentityManager::isProvConnected() const {
     if (simulated_) {
         return true;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     return prov_client_ && prov_client_->is_connected();
+}
+
+// ============================================================
+// CR-016 §8: 依赖恢复事件
+// ============================================================
+
+void ProvisionIdentityManager::logDependencyEvent(const char* event,
+                                                  const std::string& reason_code,
+                                                  const std::string& error_code,
+                                                  uint64_t elapsed_ms) {
+    MqttLogAdapter::dependency().info(
+        event,
+        "PROV IPC 依赖恢复事件",
+        {
+            {"dependency", tbox::fw::log::FieldValue::makeString(
+                dependencyName(Dependency::PROV))},
+            {"state", tbox::fw::log::FieldValue::makeString(ipcStateName(prov_ipc_state_))},
+            {"cycle_id", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(prov_retry_.cycle_id))},
+            {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(prov_retry_.retry_count))},
+            {"total_attempts", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(prov_retry_.total_attempts))},
+            {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(prov_retry_.next_backoff.count()))},
+            {"client_generation", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(prov_client_generation_))},
+            {"reason_code", tbox::fw::log::FieldValue::makeString(reason_code)},
+            {"error_code", tbox::fw::log::FieldValue::makeString(error_code)},
+            {"elapsed_ms", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(elapsed_ms))}
+        }
+    );
+    // CR-016 §10: 仅关键 warn/error 路径集中落盘
+    if (isCriticalDependencyEvent(event)) {
+        MqttLogAdapter::flushCritical();
+    }
 }
 
 // ============================================================

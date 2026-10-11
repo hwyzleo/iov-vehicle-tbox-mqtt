@@ -574,3 +574,45 @@ add_test(NAME MqttLogFaultTest COMMAND test_mqtt_log_fault)
 # ============================================================
 add_test(NAME ConfigSchemaTest
     COMMAND bash ${CMAKE_SOURCE_DIR}/tests/config/test_config_schema.sh)
+
+# ============================================================
+# CR-016: SEC/PROV IPC client 自动恢复、计数与 flush 测试
+# ============================================================
+
+# 退避/计数工具（header-only）
+add_executable(test_dependency_recovery
+    unit/test_dependency_recovery.cpp
+)
+target_include_directories(test_dependency_recovery PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_dependency_recovery GTest::gtest_main pthread)
+add_test(NAME DependencyRecoveryTest COMMAND test_dependency_recovery)
+
+# 关键 warn/error 集中 flush（独立进程，单独初始化 Logger 文件 sink）
+add_executable(test_mqtt_dependency_flush
+    unit/test_mqtt_dependency_flush.cpp
+    ${LOG_TEST_SOURCES}
+)
+target_include_directories(test_mqtt_dependency_flush PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_mqtt_dependency_flush GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+add_test(NAME MqttDependencyFlushTest COMMAND test_mqtt_dependency_flush)
+
+# SEC/PROV 晚启动/首连失败/对端重启/迟到回调（真实 framework-ipc socket + stub server）
+add_executable(test_mqtt_dependency_recovery
+    integration/test_mqtt_dependency_recovery.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/credential_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/provision_identity_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_mqtt_dependency_recovery PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(test_mqtt_dependency_recovery GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} pthread)
+add_test(NAME MqttDependencyRecoveryIntegTest COMMAND test_mqtt_dependency_recovery)
+
+# MqttService 级 PROV 晚启动恢复（真实 PROV client + stub server，无需重启 daemon）
+add_executable(test_mqtt_dependency_service_recovery
+    integration/test_mqtt_dependency_service_recovery.cpp
+)
+target_include_directories(test_mqtt_dependency_service_recovery PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/tests)
+target_link_directories(test_mqtt_dependency_service_recovery PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_dependency_service_recovery mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
+add_test(NAME MqttDependencyServiceRecoveryTest COMMAND test_mqtt_dependency_service_recovery)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "dependency_recovery.h"
 #include "tbox/sec/client.h"
 #include "tbox/sec/types.h"
 #include "tbox/sec/errors.h"
@@ -10,11 +11,12 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <random>
 
 namespace tbox {
 namespace mqtt {
 
-/// CredentialManager (CR-005 §4, §7)
+/// CredentialManager (CR-005 §4, §7; CR-016 §4 §6 §7)
 ///
 /// 替代旧 SecCertInterface，使用 tbox::sec_client 的 get/state/sign/subscribe
 /// facade 获取 TLS 凭据和远程签名能力。
@@ -26,6 +28,8 @@ namespace mqtt {
 /// - 经 subscribeTlsCredentialChanged("mqtt") 监听凭据变化（独立 IPC 连接）
 /// - 维护 credential generation（版本变化/SEC 重启时递增）
 /// - 提供线程安全快照访问（网络线程、TLS callback、SEC event callback 共用）
+/// - CR-016: 维护 SEC IPC transport 生命周期：探测/重建连接、client_generation
+///   防旧回调、retry_count/total_attempts 可观测。
 ///
 /// 不直接接触 SEC socket、method_id 或 JSON (CR-005 §2)。
 class CredentialManager {
@@ -47,6 +51,23 @@ public:
     /// SEC client 不可用时 MQTT 服务仍可启动内部 IPC 与离线队列，
     /// 但云端连接保持 CERT_WAIT (CR-005 §4.2)。
     bool initialize();
+
+    // ---- CR-016 §4: SEC IPC transport 自动恢复 ----
+
+    /// 探测并恢复 SEC IPC transport（设计 §4）。
+    /// 未连接或连接类错误时销毁旧 transport、递增 client_generation 并按退避重连，
+    /// 连接成功后按需重建 credential changed 订阅。
+    /// @return true 表示当前 transport 健康
+    bool ensureConnected();
+
+    /// 获取当前 SEC 依赖恢复状态（线程安全，含 retry_count/total_attempts/backoff）
+    RetryState getRetryState() const;
+
+    /// 依赖恢复成功（credential READY）后重置连续失败计数（设计 §6）
+    void markDependencyReady();
+
+    /// 设置 CERT_WAIT 退避配置（供 ensureConnected 记录 backoff_ms）
+    void setCredentialPollConfig(const CredentialPollConfig& config);
 
     // ---- SEC facade 封装 (CR-005 §4.1) ----
 
@@ -104,6 +125,23 @@ public:
     bool isSecConnected() const;
     std::string getLastError() const;
 
+    // ---- CR-016 §7: client generation ----
+
+    /// 当前 SEC IPC client generation（每次 transport 重建递增）
+    uint64_t getClientGeneration() const;
+    /// 当前 SEC IPC transport 状态
+    IpcState getIpcState() const;
+    /// 给定 generation 是否仍是当前 generation（防旧回调覆盖新状态）
+    bool isClientGenerationCurrent(uint64_t generation) const;
+
+    // ---- 测试钩子 (CR-016 §11) ----
+
+    /// 在 IPC 查询返回与 generation 提交校验之间执行，用于模拟迟到回调。
+    /// 生产路径为 nullptr。
+    void setPreCommitHookForTest(std::function<void()> hook);
+    /// 强制失效当前 transport（测试用，递增 client_generation）
+    void invalidateTransportForTest();
+
     // ---- 错误映射 (CR-005 §9) ----
 
     /// 将 SEC 错误码映射为 MQTT 事件名 (CR-005 §9)
@@ -131,17 +169,37 @@ private:
     void mapBundleToCredential(const tbox::sec::TlsCredentialBundle& bundle,
                                ActiveTlsCredential& credential);
 
+    /// 建立 credential changed 订阅（调用方须持有 mutex_）
+    bool establishSubscriptionLocked();
+
+    /// 记录 mqtt_dependency_* 事件 (CR-016 §8)
+    void logDependencyEvent(const char* event,
+                            const std::string& reason_code,
+                            const std::string& error_code,
+                            uint64_t elapsed_ms);
+
     std::string sec_socket_path_;
     std::string profile_;
-    std::unique_ptr<tbox::sec::SecClient> sec_client_;
+    // CR-016 §7: shared_ptr 使 IPC 调用可在锁外进行（禁止持锁调用可能回调的 IPC）
+    std::shared_ptr<tbox::sec::SecClient> sec_client_;
     tbox::sec::TlsCredentialSubscription subscription_;
 
     mutable std::mutex mutex_;
+    // CR-016 §7: 串行化 transport 重建，保证同一依赖最多一个 connect attempt
+    std::mutex recovery_mutex_;
     ActiveTlsCredential current_credential_;
     uint64_t generation_ = 0;
     bool simulated_ = false;
     std::string last_error_;
     CredentialChangedCallback changed_callback_;
+
+    // ---- CR-016: SEC 依赖恢复状态 ----
+    IpcState sec_ipc_state_ = IpcState::DISCONNECTED;
+    RetryState sec_retry_;
+    uint64_t sec_client_generation_ = 0;
+    CredentialPollConfig credential_poll_config_;
+    std::mt19937 sec_rng_{std::random_device{}()};
+    std::function<void()> pre_commit_hook_for_test_;
 };
 
 } // namespace mqtt

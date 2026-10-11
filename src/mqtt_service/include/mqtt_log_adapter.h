@@ -19,6 +19,8 @@ namespace mqtt {
  * - offline_queue: 离线缓存入队/丢弃
  * - router:       下行路由、路由失败
  * - ipc:          内部总线消息、IPC
+ * - provision:    PROV 绑定、身份
+ * - dependency:   SEC/PROV IPC 依赖恢复事件 (CR-016 §8)
  */
 class MqttLogAdapter {
 public:
@@ -37,9 +39,16 @@ public:
     static tbox::fw::log::Logger router();
     static tbox::fw::log::Logger ipc();
     static tbox::fw::log::Logger provision();
+    // CR-016 §8: SEC/PROV IPC 依赖恢复事件（mqtt_dependency_*）
+    static tbox::fw::log::Logger dependency();
 
     // 获取 service 级别 Logger（用于初始化成功等生命周期事件）
     static tbox::fw::log::Logger service();
+
+    // CR-016 §10: 关键 warn/error 路径集中落盘。
+    // 只使用 framework-log 公开 API（共享 sink 的 flush），不直接访问私有 sink；
+    // 调用点集中在依赖连接失败、长期等待等少数路径，禁止零散刷盘。
+    static void flushCritical();
 
 private:
     static bool s_initialized;

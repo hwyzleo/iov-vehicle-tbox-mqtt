@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "dependency_recovery.h"
 #include "tbox/prov/client.h"
 #include "tbox/prov/types.h"
 #include "tbox/prov/errors.h"
@@ -8,6 +9,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <functional>
+#include <random>
 #include <string_view>
 
 namespace tbox {
@@ -44,6 +47,37 @@ public:
     /// PROV 不可用时 MQTT 服务仍可启动内部 IPC 与离线队列，
     /// 但云端连接保持 PROV_WAIT (CR-006 §4)。
     bool initialize();
+
+    // ---- CR-016 §5: PROV IPC transport 自动恢复 ----
+
+    /// 探测并恢复 PROV IPC transport（设计 §5）。
+    /// 未连接或连接类错误时销毁旧 transport、递增 client_generation 并按退避重连。
+    /// @return true 表示当前 transport 健康
+    bool ensureConnected();
+
+    /// 获取当前 PROV 依赖恢复状态（线程安全）
+    RetryState getRetryState() const;
+
+    /// 依赖恢复成功（绑定 BOUND）后重置连续失败计数（设计 §6）
+    void markDependencyReady();
+
+    /// 设置 PROV_WAIT 退避配置（供 ensureConnected 记录 backoff_ms）
+    void setProvisionRetryConfig(const ProvisionRetryConfig& config);
+
+    /// 当前 PROV IPC client generation / transport 状态
+    uint64_t getClientGeneration() const;
+    IpcState getIpcState() const;
+    bool isClientGenerationCurrent(uint64_t generation) const;
+
+    /// 最后稳定 reason（sec/prov 未连接、连接失败、未就绪等）
+    std::string getLastError() const;
+
+    // ---- 测试钩子 (CR-016 §11) ----
+
+    /// 在 IPC 查询返回与 generation 提交校验之间执行，用于模拟迟到回调。
+    void setPreCommitHookForTest(std::function<void()> hook);
+    /// 强制失效当前 transport（测试用，递增 client_generation）
+    void invalidateTransportForTest();
 
     // ---- PROV 绑定访问 (CR-006 §5) ----
 
@@ -113,14 +147,32 @@ private:
     /// 从 VehicleBinding 更新快照，必要时递增 generation (CR-006 §3, §7)
     void updateSnapshot(const tbox::prov::VehicleBinding& binding);
 
+    /// 记录 mqtt_dependency_* 事件 (CR-016 §8)
+    void logDependencyEvent(const char* event,
+                            const std::string& reason_code,
+                            const std::string& error_code,
+                            uint64_t elapsed_ms);
+
     std::string prov_socket_path_;
-    std::unique_ptr<tbox::prov::ProvClient> prov_client_;
+    // CR-016 §7: shared_ptr 使 IPC 调用可在锁外进行
+    std::shared_ptr<tbox::prov::ProvClient> prov_client_;
     std::string client_id_format_ = "{vin}-{sn}";
 
     mutable std::mutex mutex_;
+    // CR-016 §7: 串行化 transport 重建，保证同一依赖最多一个 connect attempt
+    std::mutex recovery_mutex_;
     ProvisionIdentitySnapshot current_snapshot_;
     bool simulated_ = false;
     bool initialized_ = false;
+
+    // ---- CR-016: PROV 依赖恢复状态 ----
+    IpcState prov_ipc_state_ = IpcState::DISCONNECTED;
+    RetryState prov_retry_;
+    uint64_t prov_client_generation_ = 0;
+    ProvisionRetryConfig provision_retry_config_;
+    std::mt19937 prov_rng_{std::random_device{}()};
+    std::function<void()> pre_commit_hook_for_test_;
+    std::string last_error_;
 };
 
 } // namespace mqtt

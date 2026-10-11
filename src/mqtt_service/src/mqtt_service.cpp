@@ -245,6 +245,7 @@ bool MqttService::startExternal() {
                 prov_config.multiplier =
                     prov_retry_section->getDouble("multiplier", 2.0);
                 state_machine_->setProvisionRetryConfig(prov_config);
+                prov_mgr_.setProvisionRetryConfig(prov_config);
             }
         }
     }
@@ -269,6 +270,7 @@ bool MqttService::startExternal() {
         }
     }
     state_machine_->setCredentialPollConfig(poll_config);
+    cred_mgr_.setCredentialPollConfig(poll_config);
 
     // CR-005 §4.2: 建立 credential change subscription (在首次获取前)
     // CR-005 §7: payload 仅用于触发，不直接替换凭据；MQTT 必须重新调用 getTlsCredential()
@@ -871,7 +873,11 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
 
     // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
     if (new_state == ConnectionState::PROV_WAIT) {
+        // CR-016 §5: 先恢复 IPC transport，再查询绑定；
+        // 首次连接失败不再永久自锁，无需重启 daemon。
+        prov_mgr_.ensureConnected();
         if (prov_mgr_.readBinding()) {
+            prov_mgr_.markDependencyReady();
             // CR-009 §5: 身份变化后更新 ecu_uid 用于 Topic 展开
             uint64_t prev_gen = template_resolver_->identityGeneration();
             effective_table_->setEcuUid(prov_mgr_.getEcuUid());
@@ -896,33 +902,58 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             rebuildRouteProjection();
             state_machine_->onProvisionReady();
         } else {
-            auto state_info = state_machine_->getStateInfo();
+            auto retry = prov_mgr_.getRetryState();
+            std::string reason = prov_mgr_.getLastError();
+            if (reason.empty()) {
+                reason = "prov_binding_not_ready";
+            }
             MqttLogAdapter::provision().info(
                 "mqtt.provision.waiting",
                 "PROV 绑定未就绪，保持 PROV_WAIT 退避重试",
                 {
+                    {"reason_code", tbox::fw::log::FieldValue::makeString(reason)},
                     {"retry_count", tbox::fw::log::FieldValue::makeInt(
-                        static_cast<int64_t>(state_info.retry_count))},
+                        static_cast<int64_t>(retry.retry_count))},
+                    {"total_attempts", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.total_attempts))},
+                    {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.next_backoff.count()))},
+                    {"client_generation", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.client_generation))},
                     {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
                 }
             );
         }
     } else if (new_state == ConnectionState::CERT_WAIT) {
+        // CR-016 §4: 先恢复 SEC IPC transport，再查询凭据
+        cred_mgr_.ensureConnected();
         ActiveTlsCredential credential;
         if (cred_mgr_.getTlsCredential(credential) && credential.ready) {
+            cred_mgr_.markDependencyReady();
             MqttLogAdapter::connection().info(
                 "mqtt.certificate.ready",
                 "SEC 凭据就绪，进入连接流程"
             );
             state_machine_->onCertificateReady();
         } else {
-            auto state_info = state_machine_->getStateInfo();
+            auto retry = cred_mgr_.getRetryState();
+            std::string reason = cred_mgr_.getLastError();
+            if (reason.empty()) {
+                reason = "sec_credential_not_ready";
+            }
             MqttLogAdapter::connection().info(
                 "mqtt.certificate.waiting",
                 "SEC 凭据尚未就绪，保持 CERT_WAIT 退避查询",
                 {
+                    {"reason_code", tbox::fw::log::FieldValue::makeString(reason)},
                     {"retry_count", tbox::fw::log::FieldValue::makeInt(
-                        static_cast<int64_t>(state_info.retry_count))},
+                        static_cast<int64_t>(retry.retry_count))},
+                    {"total_attempts", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.total_attempts))},
+                    {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.next_backoff.count()))},
+                    {"client_generation", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(retry.client_generation))},
                     {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
                 }
             );
@@ -968,6 +999,8 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                     {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1002")}
                 }
             );
+            // CR-016 §10: 连接失败关键路径集中落盘
+            MqttLogAdapter::flushCritical();
             state_machine_->onConnectionFailure("Failed to initiate MQTT connection");
         } else {
             // CR-014 §4.1: TLS context 已建立，固化本次会话证书身份到快照权威对象。

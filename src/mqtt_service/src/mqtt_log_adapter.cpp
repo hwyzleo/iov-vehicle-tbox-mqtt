@@ -48,6 +48,16 @@ tbox::fw::log::Logger MqttLogAdapter::provision() {
     return tbox::fw::log::Logger::get("provision");
 }
 
+tbox::fw::log::Logger MqttLogAdapter::dependency() {
+    return tbox::fw::log::Logger::get("dependency");
+}
+
+void MqttLogAdapter::flushCritical() {
+    // framework-log 的 sink（console/file）在 LoggerRegistry 内共享；
+    // 通过任意 Logger 的公开 flush() 触发 dispatcher drain + sink flush。
+    tbox::fw::log::Logger::get("dependency").flush();
+}
+
 tbox::fw::log::Logger MqttLogAdapter::service() {
     return tbox::fw::log::Logger::get("service");
 }

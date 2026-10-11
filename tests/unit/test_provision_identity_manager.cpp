@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "provision_identity_manager.h"
 #include "mqtt_context.h"
+#include <unistd.h>
 
 using namespace tbox::mqtt;
 using namespace tbox::prov;
@@ -374,4 +375,73 @@ TEST(ProvisionIdentityManagerTest, TopicDoesNotUseClientId) {
     // Topic should contain ecu_uid, not client_id
     EXPECT_NE(topic.find("ECU123456789ABCD"), std::string::npos);
     EXPECT_EQ(topic.find(client_id), std::string::npos);
+}
+
+// ============================================================
+// CR-016 §5/§6/§7: PROV IPC transport 自动恢复与计数
+// ============================================================
+
+namespace {
+std::string cr016ProvSock() {
+    return "/tmp/tbox_cr016_prov_nonexistent_" +
+           std::to_string(static_cast<long>(::getpid())) + ".sock";
+}
+} // namespace
+
+TEST(ProvisionIdentityManagerTest, CR016EnsureConnectedCountsFailedAttempts) {
+    ProvisionIdentityManager mgr(cr016ProvSock());
+    ProvisionRetryConfig cfg;
+    cfg.initial_backoff = Duration(10);
+    cfg.max_backoff = Duration(50);
+    mgr.setProvisionRetryConfig(cfg);
+
+    EXPECT_FALSE(mgr.ensureConnected());
+    EXPECT_EQ(mgr.getIpcState(), IpcState::DISCONNECTED);
+    auto rs1 = mgr.getRetryState();
+    EXPECT_EQ(rs1.retry_count, 1u);
+    EXPECT_EQ(rs1.total_attempts, 1u);
+    EXPECT_GT(rs1.client_generation, 0u);
+    EXPECT_FALSE(mgr.getLastError().empty());
+
+    EXPECT_FALSE(mgr.ensureConnected());
+    EXPECT_EQ(mgr.getRetryState().retry_count, 2u);
+}
+
+TEST(ProvisionIdentityManagerTest, CR016ReadBindingNotConnectedDistinguishesReason) {
+    ProvisionIdentityManager mgr(cr016ProvSock());
+    EXPECT_FALSE(mgr.readBinding());
+    EXPECT_EQ(mgr.getLastError(), "prov_not_connected");
+}
+
+TEST(ProvisionIdentityManagerTest, CR016MarkDependencyReadyResetsRetryCount) {
+    ProvisionIdentityManager mgr(cr016ProvSock());
+    mgr.setProvisionRetryConfig(ProvisionRetryConfig{});
+    ASSERT_FALSE(mgr.ensureConnected());
+    ASSERT_FALSE(mgr.ensureConnected());
+    ASSERT_EQ(mgr.getRetryState().retry_count, 2u);
+
+    mgr.markDependencyReady();
+    auto rs = mgr.getRetryState();
+    EXPECT_EQ(rs.retry_count, 0u);
+    EXPECT_GE(rs.total_attempts, 2u);
+    EXPECT_GT(rs.cycle_id, 0u);
+}
+
+TEST(ProvisionIdentityManagerTest, CR016GenerationGuardPrimitive) {
+    ProvisionIdentityManager mgr(cr016ProvSock());
+    ASSERT_FALSE(mgr.ensureConnected());
+
+    uint64_t gen = mgr.getClientGeneration();
+    EXPECT_TRUE(mgr.isClientGenerationCurrent(gen));
+
+    mgr.invalidateTransportForTest();
+    EXPECT_FALSE(mgr.isClientGenerationCurrent(gen));
+    EXPECT_GT(mgr.getClientGeneration(), gen);
+}
+
+TEST(ProvisionIdentityManagerTest, CR016EnsureConnectedSimulatedIsHealthy) {
+    ProvisionIdentityManager mgr;
+    mgr.simulateUnbound();
+    EXPECT_TRUE(mgr.ensureConnected());
+    EXPECT_EQ(mgr.getRetryState().retry_count, 0u);
 }
