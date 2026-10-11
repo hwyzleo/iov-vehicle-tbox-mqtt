@@ -224,6 +224,18 @@ add_executable(test_mqtt_client_routed
 target_include_directories(test_mqtt_client_routed PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
 target_link_libraries(test_mqtt_client_routed GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
 
+# CR-014 §5: Cloud Ready 快照/事件 SDK 单元测试
+add_executable(test_mqtt_client_readiness
+    unit/test_mqtt_client_readiness.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_client/src/mqtt_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_retry_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_mqtt_client_readiness PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
+target_link_libraries(test_mqtt_client_readiness GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
 # CR-010 §11.2: Routed downlink SDK 集成测试
 add_executable(test_mqtt_routed_downlink
     integration/test_mqtt_routed_downlink.cpp
@@ -235,6 +247,13 @@ add_executable(test_mqtt_routed_downlink
 )
 target_include_directories(test_mqtt_routed_downlink PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
 target_link_libraries(test_mqtt_routed_downlink GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+
+# CR-014 §8: Cloud Ready 契约集成测试（daemon 组件 -> IPC -> SDK）
+add_executable(test_mqtt_cloud_readiness
+    integration/test_mqtt_cloud_readiness.cpp
+)
+target_include_directories(test_mqtt_cloud_readiness PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_mqtt_cloud_readiness mqtt_service_lib tbox_mqtt_client GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json OpenSSL::SSL OpenSSL::Crypto pthread)
 
 # Integration tests
 add_executable(test_end_to_end
@@ -302,7 +321,9 @@ add_test(NAME MqttRetryPolicyTest COMMAND test_mqtt_retry_policy)
 add_test(NAME MqttDispatchQueueTest COMMAND test_mqtt_dispatch_queue)
 add_test(NAME MqttClientTest COMMAND test_mqtt_client)
 add_test(NAME MqttClientRoutedTest COMMAND test_mqtt_client_routed)
+add_test(NAME MqttClientReadinessTest COMMAND test_mqtt_client_readiness)
 add_test(NAME MqttRoutedDownlinkIntegTest COMMAND test_mqtt_routed_downlink)
+add_test(NAME MqttCloudReadinessIntegTest COMMAND test_mqtt_cloud_readiness)
 add_test(NAME MqttIpcBackpressureTest COMMAND test_mqtt_ipc_backpressure)
 add_test(NAME MqttIpcFaultInjectionTest COMMAND test_mqtt_ipc_fault_injection)
 

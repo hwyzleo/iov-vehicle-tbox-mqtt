@@ -193,8 +193,7 @@ private:
     void onSnapshotAccepted(const std::string& owner, bool registration_complete);
     void reconcileSubscriptions();
     void evaluateCloudReadiness();
-    void publishCloudReadyEvent(bool ready, uint32_t mandatory_active,
-                                uint32_t mandatory_total, const std::string& reason);
+    void publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot);
     void refreshUpstreamRoutes();
     void checkStartupGate();
 
@@ -203,6 +202,8 @@ private:
     // ---- CR-010 §3: routed downlink 事件订阅 ----
     std::pair<int32_t, bool> onSubscribeRoutedDownlinkEventChannel(
         const std::string& owner, int client_fd) override;
+    // ---- CR-014 §5: Cloud Ready 事件订阅 ----
+    std::pair<int32_t, bool> onSubscribeCloudReadinessEventChannel(int client_fd) override;
 };
 
 } // namespace mqtt

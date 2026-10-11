@@ -9,6 +9,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
+#include <openssl/sha.h>
 #include <arpa/inet.h>
 #include <chrono>
 #include <vector>
@@ -35,6 +36,19 @@ std::vector<uint8_t> x509ToDer(X509* cert) {
     std::vector<uint8_t> der(buf, buf + len);
     OPENSSL_free(buf);
     return der;
+}
+
+std::string sha256Hex(const unsigned char* data, size_t len) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(data, len, digest);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(SHA256_DIGEST_LENGTH * 2);
+    for (unsigned char c : digest) {
+        out.push_back(kHex[c >> 4]);
+        out.push_back(kHex[c & 0x0F]);
+    }
+    return out;
 }
 
 /// Create a self-signed ECDSA P-256 test certificate
@@ -358,6 +372,39 @@ TEST(SecTlsKeyAdapterTest, BuildTlsContextWithValidCert) {
 
     adapter.destroyContext();
     EXPECT_FALSE(adapter.isContextValid());
+}
+
+// CR-014 §4.1: leaf 证书指纹来自实际写入 SSL_CTX 的 leaf DER（SHA-256）
+TEST(SecTlsKeyAdapterTest, LeafFingerprintMatchesSha256OfLeafDer) {
+    auto tc = createTestCert("test-mqtt-client");
+
+    CredentialManager mgr;
+    ActiveTlsCredential cred;
+    cred.credential_id = "test-cred";
+    cred.version = 1;
+    cred.status = TlsCredentialStatus::READY;
+    cred.root_ca_bundle = tc.der;
+    cred.client_cert_chain = tc.der;
+    cred.private_key_ref.data = {0x00, 0x01, 0x02, 0x03};
+    cred.key_algorithm = KeyAlgorithm::ECDSA_P256;
+    cred.ready = true;
+    mgr.simulateReady(cred);
+
+    SecTlsKeyAdapter adapter;
+    SSL_CTX* ctx = adapter.buildTlsContext(cred, mgr, "broker.example.com",
+        TlsVersion::TLS_1_2, TlsVersion::TLS_1_3);
+    ASSERT_NE(ctx, nullptr);
+
+    const std::string expected = "sha256:" + sha256Hex(tc.der.data(), tc.der.size());
+    EXPECT_EQ(adapter.getLeafFingerprint(), expected);
+
+    // 不同证书产生不同指纹
+    auto tc2 = createTestCert("test-mqtt-client-2");
+    EXPECT_NE(adapter.getLeafFingerprint(),
+              "sha256:" + sha256Hex(tc2.der.data(), tc2.der.size()));
+
+    adapter.destroyContext();
+    EXPECT_TRUE(adapter.getLeafFingerprint().empty());
 }
 
 TEST(SecTlsKeyAdapterTest, DestroyContextClearsState) {

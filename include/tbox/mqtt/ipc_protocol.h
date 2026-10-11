@@ -27,6 +27,8 @@ enum class MethodId : uint32_t {
     GET_ROUTE_PROJECTION_STATUS      = 10, // getRouteProjectionStatus -> 投影状态诊断
     // CR-010 §3: route-aware 下行事件订阅（握手携 owner，不触发 Broker SUBSCRIBE）
     SUBSCRIBE_ROUTED_DOWNLINK        = 11, // subscribeRoutedDownlink -> 登记 fd->owner 事件通道
+    // CR-014 §5: Cloud Ready 事件订阅（仅登记 fd 到 CLOUD_READY_CHANGED，不触发 Broker 操作）
+    SUBSCRIBE_CLOUD_READINESS        = 12, // subscribeCloudReadinessChanged -> 登记 fd 事件通道
 };
 
 /// MQTT IPC 事件类型（与 framework-ipc EventHeader.event_type 一致, CR-004 §6）

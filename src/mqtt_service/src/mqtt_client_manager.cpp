@@ -75,6 +75,11 @@ bool MqttClientManager::initialize(CredentialManager& cred_mgr,
     return true;
 }
 
+TlsSessionIdentity MqttClientManager::getTlsSessionIdentity() const {
+    std::lock_guard<std::mutex> lock(tls_session_mutex_);
+    return tls_session_;
+}
+
 bool MqttClientManager::connect(const ConnectionConfig& config) {
     auto start_time = std::chrono::steady_clock::now();
 
@@ -180,6 +185,23 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
             }
         );
         return false;
+    }
+
+    // DSN-CR-014 §4.1: TLS context 建立成功，固化不可复用的客户端证书会话身份。
+    // device_identity_digest/certificate_ref 来自实际写入 SSL_CTX 的 leaf 证书，
+    // 不重新查询 SEC 当前 credential。
+    {
+        std::lock_guard<std::mutex> lock(tls_session_mutex_);
+        ++cert_session_generation_;
+        tls_session_ = TlsSessionIdentity{};
+        tls_session_.cert_session_generation = cert_session_generation_;
+        tls_session_.credential_id = credential.credential_id;
+        tls_session_.credential_version = credential.version;
+        tls_session_.certificate_ref = tls_adapter_->getLeafFingerprint();
+        // 初始 device_identity_digest 与 certificate_ref 使用同一摘要；
+        // 后续若引入域分离必须版本化算法标识，不得静默改变 (CR-014 §3)。
+        tls_session_.device_identity_digest = tls_session_.certificate_ref;
+        tls_session_.valid = !tls_session_.certificate_ref.empty();
     }
 
     // Set username from client certificate CN for broker authentication

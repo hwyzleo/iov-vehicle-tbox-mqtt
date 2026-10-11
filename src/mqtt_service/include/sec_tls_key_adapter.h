@@ -71,6 +71,10 @@ public:
     /// 获取最后错误
     std::string getLastError() const { return last_error_; }
 
+    /// 获取本次 TLS context 实际装载的 leaf 客户端证书指纹 (DSN-CR-014 §4.1)
+    /// 规范 DER 的 SHA-256，格式 "sha256:<hex>"；无 leaf 时为空字符串。
+    const std::string& getLeafFingerprint() const { return leaf_fingerprint_; }
+
 private:
     /// 解析 DER root CA bundle 并装入 X509_STORE (CR-005 §5.1)
     bool loadRootCaBundle(SSL_CTX* ctx, const std::vector<uint8_t>& der_bundle);
@@ -98,6 +102,8 @@ private:
 
     SSL_CTX* ssl_ctx_ = nullptr;
     std::string last_error_;
+    // DSN-CR-014 §4.1: 实际写入 SSL_CTX 的 leaf 证书指纹 "sha256:<hex>"
+    std::string leaf_fingerprint_;
 
     // 持有当前凭据快照和 CredentialManager 指针，供 ENGINE sign callback 使用
     // 注意：ENGINE callback 是 C 函数，通过 ex_data 或全局指针访问此对象

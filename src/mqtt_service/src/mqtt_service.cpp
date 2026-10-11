@@ -28,6 +28,13 @@ std::string b64_encode(const std::vector<uint8_t>& data) {
         std::string(reinterpret_cast<const char*>(data.data()), data.size()));
 }
 
+// CR-014 §8: 指纹仅截断输出，禁止完整指纹/证书原文进入日志
+std::string fingerprintPrefix(const std::string& ref) {
+    constexpr size_t kKeep = 7 + 16;  // "sha256:" + 16 hex
+    if (ref.size() <= kKeep) return ref;
+    return ref.substr(0, kKeep) + "...";
+}
+
 } // anonymous namespace
 
 MqttService::MqttService(std::shared_ptr<hwyz::store::Store> store,
@@ -179,11 +186,12 @@ bool MqttService::initializeLocal() {
             }
         });
 
-    // CR-007 §10: CloudReadinessGate 回调 -> 发布事件 + 状态机
+    // CR-007 §10 / CR-014 §4.2: CloudReadinessGate 回调 -> 发布完整快照事件 + 状态机
     cloud_ready_gate_->setCallback(
-        [this](bool ready, uint32_t ma, uint32_t mt, const std::string& reason) {
-            publishCloudReadyEvent(ready, ma, mt, reason);
-            if (ready && state_machine_->getCurrentState() == ConnectionState::SUBSCRIBING) {
+        [this](const CloudReadinessSnapshot& snapshot) {
+            publishCloudReadyEvent(snapshot);
+            if (snapshot.cloud_ready &&
+                state_machine_->getCurrentState() == ConnectionState::SUBSCRIBING) {
                 state_machine_->onSubscriptionsReady();
             }
         });
@@ -256,7 +264,12 @@ bool MqttService::startExternal() {
 
     // CR-005 §4.2: 建立 credential change subscription (在首次获取前)
     // CR-005 §7: payload 仅用于触发，不直接替换凭据；MQTT 必须重新调用 getTlsCredential()
+    // CR-014 §4.2: 先提交并发布旧 generation 的 cloud_ready=false（带旧身份），再销毁旧 context
     cred_mgr_.subscribeTlsCredentialChanged([this]() {
+        // 先撤销旧会话 Cloud Ready，保证调用方精确失效旧 generation
+        if (cloud_ready_gate_) {
+            cloud_ready_gate_->revokeSession("credential_changed");
+        }
         // CR-005 §7 cleanup 顺序: 标记 generation 失效 -> 清理旧 TLS context -> 状态机转 CERT_WAIT
         cred_mgr_.invalidateCredential();
         tls_adapter_.destroyContext();
@@ -660,6 +673,24 @@ std::pair<int32_t, bool> MqttService::onSubscribeRoutedDownlinkEventChannel(
     return {0, true};
 }
 
+// CR-014 §5: Cloud Ready 事件通道（仅登记 fd 到 CLOUD_READY_CHANGED，不触发 Broker 操作）
+std::pair<int32_t, bool> MqttService::onSubscribeCloudReadinessEventChannel(int client_fd) {
+    bool ok = false;
+    if (ipc_server_) {
+        ok = ipc_server_->add_subscription(
+            client_fd, static_cast<uint32_t>(ipc::EventType::CLOUD_READY_CHANGED));
+    }
+    if (!ok) {
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.cloud_readiness_failed",
+            "Cloud Ready 事件订阅登记失败",
+            {tbox::fw::log::Field("error_code", tbox::fw::log::FieldValue::makeString("MQTT-1008"))}
+        );
+        return {static_cast<int32_t>(ErrorCode::MQTT_1008), false};
+    }
+    return {0, true};
+}
+
 std::pair<int32_t, bool> MqttService::onUnsubscribe(int client_fd) {
     if (ipc_server_) {
         ipc_server_->remove_subscription(
@@ -800,6 +831,12 @@ void MqttService::onMessageReceived(const std::string& topic,
 // ============================================================
 
 void MqttService::onConnectionStateChanged(ConnectionState new_state) {
+    // CR-014 §3/§4.2: 快照权威对象跟踪连接状态与 connection_generation
+    if (cloud_ready_gate_) {
+        cloud_ready_gate_->onConnectionState(
+            new_state, state_machine_->getConnectionGeneration());
+    }
+
     // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
     if (new_state == ConnectionState::PROV_WAIT) {
         if (prov_mgr_.readBinding()) {
@@ -900,8 +937,27 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                 }
             );
             state_machine_->onConnectionFailure("Failed to initiate MQTT connection");
+        } else {
+            // CR-014 §4.1: TLS context 已建立，固化本次会话证书身份到快照权威对象。
+            // 仅当后续握手/CONNACK/Mandatory SUBACK 全部成功且 generation 未变时才 cloud_ready=true。
+            if (cloud_ready_gate_) {
+                auto identity = client_manager_->getTlsSessionIdentity();
+                if (identity.valid) {
+                    identity.connection_generation = state_machine_->getConnectionGeneration();
+                    cloud_ready_gate_->setTlsSessionIdentity(identity);
+                }
+            }
         }
     } else if (new_state == ConnectionState::CONNECTED) {
+        // CR-014 §4.1: 兑底确保快照权威对象持有本次 TLS 会话身份（与 CONNECTING 分支竞态）。
+        // 同一 identity 重复设置幂等；新会话才重置 subscriptions_ready。
+        if (cloud_ready_gate_) {
+            auto identity = client_manager_->getTlsSessionIdentity();
+            if (identity.valid) {
+                identity.connection_generation = state_machine_->getConnectionGeneration();
+                cloud_ready_gate_->setTlsSessionIdentity(identity);
+            }
+        }
         // CR-006 §7: Verify identity generation hasn't changed since CONNECT
         if (prov_mgr_.hasIdentityChanged(connect_identity_generation_)) {
             MqttLogAdapter::provision().warn(
@@ -1190,24 +1246,27 @@ void MqttService::evaluateCloudReadiness() {
     cloud_ready_gate_->onSubscriptionsReady(ready, ma, mt);
 }
 
-void MqttService::publishCloudReadyEvent(bool ready, uint32_t mandatory_active,
-                                         uint32_t mandatory_total, const std::string& reason) {
+void MqttService::publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot) {
     if (ipc_server_) {
-        nlohmann::json j;
-        j["ready"] = ready;
-        j["mandatory_count"] = mandatory_total;
-        j["mandatory_active"] = mandatory_active;
-        j["reason_code"] = reason;
         ipc_server_->push_event(
-            static_cast<uint32_t>(ipc::EventType::CLOUD_READY_CHANGED), j.dump());
+            static_cast<uint32_t>(ipc::EventType::CLOUD_READY_CHANGED),
+            cloudReadinessToJson(snapshot));
     }
     MqttLogAdapter::connection().info(
         "mqtt.cloud_ready.changed",
-        ready ? "Cloud Ready 达成" : "Cloud Ready 丢失",
-        {{"ready", tbox::fw::log::FieldValue::makeBool(ready)},
-         {"mandatory_count", tbox::fw::log::FieldValue::makeInt(
-             static_cast<int64_t>(mandatory_total))},
-         {"reason_code", tbox::fw::log::FieldValue::makeString(reason)}}
+        snapshot.cloud_ready ? "Cloud Ready 达成" : "Cloud Ready 丢失",
+        {{"ready", tbox::fw::log::FieldValue::makeBool(snapshot.cloud_ready)},
+         {"connection_generation", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(snapshot.connection_generation))},
+         {"cert_session_generation", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(snapshot.cert_session_generation))},
+         {"credential_version", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(snapshot.credential_version))},
+         {"certificate_ref_prefix", tbox::fw::log::FieldValue::makeString(
+             fingerprintPrefix(snapshot.certificate_ref))},
+         {"event_sequence", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(snapshot.event_sequence))},
+         {"reason_code", tbox::fw::log::FieldValue::makeString(snapshot.reason_code)}}
     );
 }
 

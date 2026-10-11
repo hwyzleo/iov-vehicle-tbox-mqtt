@@ -48,6 +48,30 @@ Priority parse_priority(int v) {
 
 } // anonymous namespace
 
+std::string cloudReadinessToJson(const CloudReadinessSnapshot& r) {
+    nlohmann::json j;
+    j["cloud_ready"] = r.cloud_ready;
+    j["connection_generation"] = r.connection_generation;
+    j["cert_session_generation"] = r.cert_session_generation;
+    j["credential_id"] = r.credential_id;
+    j["credential_version"] = r.credential_version;
+    j["device_identity_digest"] = r.device_identity_digest;
+    j["certificate_ref"] = r.certificate_ref;
+    j["reason_code"] = r.reason_code;
+    j["event_sequence"] = r.event_sequence;
+    j["contract_version"] = kCloudReadinessContractVersion;
+    j["subscriptions_ready"] = r.subscriptions_ready;
+    j["connected"] = r.connected;
+    nlohmann::json gens = nlohmann::json::object();
+    for (const auto& [owner, gen] : r.owner_generations) {
+        gens[owner] = gen;
+    }
+    j["owner_generations"] = gens;
+    j["mandatory_count"] = r.mandatory_count;
+    j["mandatory_active"] = r.mandatory_active;
+    return j.dump();
+}
+
 MqttIpcDispatcher::MqttIpcDispatcher(ServiceHandler* service)
     : service_(service) {
 }
@@ -102,6 +126,10 @@ std::string MqttIpcDispatcher::dispatch(uint32_t method_id,
             // CR-010 §3: routed downlink 事件订阅
             case ipc::MethodId::SUBSCRIBE_ROUTED_DOWNLINK:
                 result = handleSubscribeRoutedDownlink(params_json, client_fd);
+                break;
+            // CR-014 §5: Cloud Ready 事件订阅
+            case ipc::MethodId::SUBSCRIBE_CLOUD_READINESS:
+                result = handleSubscribeCloudReadiness(client_fd);
                 break;
             default:
                 MqttLogAdapter::ipc().warn(
@@ -410,21 +438,8 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetSubscriptionSnapshot
 
 std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetSubscriptionReadiness() {
     auto r = service_->onGetSubscriptionReadiness();
-
-    nlohmann::json resp;
-    resp["cloud_ready"] = r.cloud_ready;
-    resp["subscriptions_ready"] = r.subscriptions_ready;
-    resp["connected"] = r.connected;
-    resp["connection_generation"] = r.connection_generation;
-    nlohmann::json gens = nlohmann::json::object();
-    for (const auto& [owner, gen] : r.owner_generations) {
-        gens[owner] = gen;
-    }
-    resp["owner_generations"] = gens;
-    resp["mandatory_count"] = r.mandatory_count;
-    resp["mandatory_active"] = r.mandatory_active;
-    resp["reason_code"] = r.reason_code;
-    return {0, resp.dump()};
+    // CR-014 §3/§4.2/§5: 与 CLOUD_READY_CHANGED 事件共用同一序列化，字段集一致
+    return {0, cloudReadinessToJson(r)};
 }
 
 // ============================================================
@@ -547,6 +562,24 @@ std::vector<int> MqttIpcDispatcher::getRoutedFdsForOwner(const std::string& owne
     auto it = routed_owner_fds_.find(owner);
     if (it == routed_owner_fds_.end()) return {};
     return std::vector<int>(it->second.begin(), it->second.end());
+}
+
+// ============================================================
+// CR-014 §5: Cloud Ready 事件订阅 handler
+// ============================================================
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleSubscribeCloudReadiness(int client_fd) {
+    auto [status, ok] = service_->onSubscribeCloudReadinessEventChannel(client_fd);
+
+    MqttLogAdapter::ipc().info(
+        "mqtt.ipc.cloud_readiness_subscribed",
+        "Cloud Ready event channel subscribed",
+        {tbox::fw::log::Field("peer", tbox::fw::log::FieldValue::makeInt(client_fd)),
+         tbox::fw::log::Field("ok", tbox::fw::log::FieldValue::makeBool(ok))}
+    );
+
+    nlohmann::json resp;
+    resp["ok"] = ok;
+    return {status, resp.dump()};
 }
 
 } // namespace mqtt

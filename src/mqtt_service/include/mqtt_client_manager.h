@@ -66,6 +66,11 @@ public:
     // CR-007 §8: CONNACK session_present
     bool getSessionPresent() const { return session_present_; }
 
+    // DSN-CR-014 §4.1: 本次 TLS context 固化的客户端证书会话身份
+    // （cert_session_generation + credential 元数据 + leaf 证书指纹）。
+    // 仅成功建立 TLS context 后有效；从未建立时 valid=false。
+    TlsSessionIdentity getTlsSessionIdentity() const;
+
     // Set LWT configuration (Design §3)
     void setLwtConfig(const LwtConfig& lwt_config);
 
@@ -95,6 +100,11 @@ private:
     std::map<int, std::string> pending_subscribe_mids_;
     std::map<int, std::string> pending_unsubscribe_mids_;
     bool session_present_ = false;  // CONNACK session_present
+
+    // DSN-CR-014 §4.1: cert_session_generation 每次成功建立 TLS context 递增，不可复用
+    mutable std::mutex tls_session_mutex_;
+    uint64_t cert_session_generation_ = 0;
+    TlsSessionIdentity tls_session_;
 };
 
 } // namespace mqtt

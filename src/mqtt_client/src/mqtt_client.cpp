@@ -202,6 +202,54 @@ bool parseRoutedEvent(std::string_view payload_json,
     return true;
 }
 
+/// 解析 Cloud Readiness JSON -> CloudReadinessSnapshot (CR-014 §3, §5, §7)
+/// contract_version 缺失或与 kCloudReadinessContractVersion 不一致时标记
+/// contract_supported=false，绝不伪造空证书身份后宣告可用。
+CloudReadinessSnapshot parseCloudReadinessJson(std::string_view payload_json) {
+    CloudReadinessSnapshot r;
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(payload_json);
+    } catch (...) {
+        r.contract_supported = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    if (!j.is_object()) {
+        r.contract_supported = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    const uint32_t version = j.value("contract_version", 0u);
+    r.contract_version = version;
+    if (version != kCloudReadinessContractVersion) {
+        r.contract_supported = false;
+        r.cloud_ready = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    r.contract_supported = true;
+    r.cloud_ready = j.value("cloud_ready", false);
+    r.connection_generation = j.value("connection_generation", 0ULL);
+    r.cert_session_generation = j.value("cert_session_generation", 0ULL);
+    r.credential_id = j.value("credential_id", "");
+    r.credential_version = j.value("credential_version", 0ULL);
+    r.device_identity_digest = j.value("device_identity_digest", "");
+    r.certificate_ref = j.value("certificate_ref", "");
+    r.reason_code = j.value("reason_code", "");
+    r.event_sequence = j.value("event_sequence", 0ULL);
+    r.subscriptions_ready = j.value("subscriptions_ready", false);
+    r.connected = j.value("connected", false);
+    r.mandatory_count = j.value("mandatory_count", 0u);
+    r.mandatory_active = j.value("mandatory_active", 0u);
+    if (j.contains("owner_generations") && j["owner_generations"].is_object()) {
+        for (auto it = j["owner_generations"].begin(); it != j["owner_generations"].end(); ++it) {
+            r.owner_generations[it.key()] = it.value().get<uint64_t>();
+        }
+    }
+    return r;
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -330,6 +378,136 @@ private:
 };
 
 // ============================================================
+// CR-014 §5: SubscriptionHandle::Impl
+// 独立 dispatcher 线程 + 有界队列解耦 IPC 读取与业务 callback；
+// sequence 缺口/回退（daemon 重启）时自动重查快照补投，实现最终收敛。
+// ============================================================
+class SubscriptionHandle::Impl
+    : public std::enable_shared_from_this<SubscriptionHandle::Impl> {
+public:
+    Impl(CloudReadinessCallback callback, size_t queue_capacity)
+        : callback_(std::move(callback)), queue_capacity_(queue_capacity) {}
+
+    ~Impl() { cancel(); }
+
+    void start(::tbox::fw::ipc::Client* fw_client,
+               std::function<CloudReadinessSnapshot()> resync) {
+        resync_ = std::move(resync);
+        auto self = shared_from_this();
+        fw_sub_ = fw_client->subscribe(
+            static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_CLOUD_READINESS),
+            static_cast<uint32_t>(ipc::EventType::CLOUD_READY_CHANGED),
+            [self](uint32_t /*ev_type*/, std::string_view payload_json) {
+                self->onEvent(payload_json);
+            });
+        dispatcher_ = std::thread(&Impl::dispatchLoop, this);
+    }
+
+    void cancel() {
+        bool expected = true;
+        if (!active_.compare_exchange_strong(expected, false)) return;
+        queue_cv_.notify_all();
+        if (dispatcher_.joinable()) dispatcher_.join();
+        fw_sub_.cancel();
+    }
+
+    bool isActive() const {
+        return active_.load() && fw_sub_.isActive();
+    }
+
+private:
+    void onEvent(std::string_view payload_json) {
+        if (!active_.load()) return;
+        CloudReadinessSnapshot snap = parseCloudReadinessJson(payload_json);
+        if (!snap.contract_supported) {
+            // 不兼容契约：投递一次 unsupported 快照，不更新 sequence
+            enqueue(std::move(snap));
+            return;
+        }
+        bool need_resync = false;
+        {
+            std::lock_guard<std::mutex> lock(seq_mutex_);
+            if (have_sequence_ && snap.event_sequence <= last_sequence_) {
+                need_resync = true;  // daemon 重启/sequence 回退：全量重读
+            } else if (have_sequence_ && snap.event_sequence > last_sequence_ + 1) {
+                need_resync = true;  // 事件缺口
+            }
+            if (!need_resync) {
+                last_sequence_ = snap.event_sequence;
+                have_sequence_ = true;
+            }
+        }
+        if (need_resync && resync_) {
+            // 事件丢失/重启：重查快照收敛，以较大 sequence 为准 (CR-014 §5)
+            CloudReadinessSnapshot fresh = resync_();
+            if (fresh.contract_supported) {
+                std::lock_guard<std::mutex> lock(seq_mutex_);
+                if (fresh.event_sequence > last_sequence_) {
+                    last_sequence_ = fresh.event_sequence;
+                }
+                have_sequence_ = true;
+            }
+            enqueue(std::move(fresh));
+        } else {
+            enqueue(std::move(snap));
+        }
+    }
+
+    void enqueue(CloudReadinessSnapshot snap) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (queue_.size() >= queue_capacity_) {
+                return;  // 有界：丢弃最新；readiness 可经重查收敛
+            }
+            queue_.push_back(std::move(snap));
+        }
+        queue_cv_.notify_one();
+    }
+
+    void dispatchLoop() {
+        while (true) {
+            CloudReadinessSnapshot snap;
+            bool have = false;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_cv_.wait(lock, [this] {
+                    return !active_.load() || !queue_.empty();
+                });
+                if (!active_.load()) return;
+                if (!queue_.empty()) {
+                    snap = std::move(queue_.front());
+                    queue_.pop_front();
+                    have = true;
+                }
+            }
+            if (have && callback_) {
+                try {
+                    callback_(snap);
+                } catch (...) {
+                    // 捕获业务异常，继续投递 (CR-014 §5)
+                }
+            }
+        }
+    }
+
+    CloudReadinessCallback callback_;
+    std::function<CloudReadinessSnapshot()> resync_;
+    size_t queue_capacity_;
+
+    std::deque<CloudReadinessSnapshot> queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+
+    std::mutex seq_mutex_;
+    uint64_t last_sequence_ = 0;
+    bool have_sequence_ = false;
+
+    std::atomic<bool> active_{true};
+    ::tbox::fw::ipc::Subscription fw_sub_;
+    std::thread dispatcher_;
+};
+
+// ============================================================
 // Client::Impl
 // ============================================================
 class Client::Impl {
@@ -340,7 +518,9 @@ public:
     }
 
     ~Impl() {
-        cancelAllRouted();  // CR-010 §6: 先取消 routed 订阅（join reader/dispatcher），再断 fw_client
+        // CR-010 §6 / CR-014 §5: 先取消订阅句柄（join reader/dispatcher），再断 fw_client
+        cancelAllReadiness();
+        cancelAllRouted();
         disconnect();
     }
 
@@ -390,6 +570,19 @@ public:
             // JSON parse failure, keep biz_status = 0
         }
         return {true, biz_status, response_json};
+    }
+
+    // CR-014 §5: Cloud Ready 快照查询（与事件共享同一状态对象）
+    CloudReadinessSnapshot fetchCloudReadiness() {
+        auto [ok, status, response_json] = send_request(
+            static_cast<uint32_t>(ipc::MethodId::GET_SUBSCRIPTION_READINESS), "{}");
+        if (!ok) {
+            CloudReadinessSnapshot r;
+            r.contract_supported = false;
+            r.reason_code = "transport_failed";
+            return r;
+        }
+        return parseCloudReadinessJson(response_json);
     }
 
     std::string b64_encode(const std::vector<uint8_t>& data) {
@@ -469,6 +662,33 @@ public:
         for (auto& sp : live) sp->cancel();  // join reader/dispatcher
     }
 
+    // CR-014 §5: Cloud Ready 事件订阅（独立执行器，不阻塞 IPC 读线程）
+    std::shared_ptr<SubscriptionHandle::Impl>
+    subscribeCloudReadiness(CloudReadinessCallback callback) {
+        if (!callback) return nullptr;
+        auto impl = std::make_shared<SubscriptionHandle::Impl>(
+            std::move(callback), kRoutedDispatchQueueSize);
+        impl->start(fw_client_.get(), [this]() { return fetchCloudReadiness(); });
+        {
+            std::lock_guard<std::mutex> lock(readiness_mutex_);
+            readiness_registry_.push_back(impl);
+        }
+        return impl;
+    }
+
+    void cancelAllReadiness() {
+        std::vector<std::shared_ptr<SubscriptionHandle::Impl>> live;
+        {
+            std::lock_guard<std::mutex> lock(readiness_mutex_);
+            live.reserve(readiness_registry_.size());
+            for (auto& weak : readiness_registry_) {
+                if (auto sp = weak.lock()) live.push_back(std::move(sp));
+            }
+            readiness_registry_.clear();
+        }
+        for (auto& sp : live) sp->cancel();
+    }
+
 private:
     std::string socket_path_;
     std::unique_ptr<::tbox::fw::ipc::Client> fw_client_;
@@ -476,6 +696,10 @@ private:
     // CR-010 §7: owner -> routed 订阅注册表（互斥 + 析构批量取消）
     std::map<std::string, std::weak_ptr<RoutedSubscription::Impl>> routed_registry_;
     std::mutex routed_mutex_;
+
+    // CR-014 §5: Cloud Ready 订阅句柄注册表（析构批量取消）
+    std::vector<std::weak_ptr<SubscriptionHandle::Impl>> readiness_registry_;
+    std::mutex readiness_mutex_;
 };
 
 // ============================================================
@@ -498,6 +722,29 @@ void RoutedSubscription::cancel() {
 }
 
 bool RoutedSubscription::isActive() const {
+    return impl_ && impl_->isActive();
+}
+
+// ============================================================
+// CR-014 §5: SubscriptionHandle facade
+// ============================================================
+SubscriptionHandle::SubscriptionHandle() = default;
+
+SubscriptionHandle::~SubscriptionHandle() {
+    if (impl_) impl_->cancel();
+}
+
+SubscriptionHandle::SubscriptionHandle(SubscriptionHandle&&) noexcept = default;
+SubscriptionHandle& SubscriptionHandle::operator=(SubscriptionHandle&&) noexcept = default;
+
+SubscriptionHandle::SubscriptionHandle(std::shared_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+void SubscriptionHandle::cancel() {
+    if (impl_) impl_->cancel();
+}
+
+bool SubscriptionHandle::isActive() const {
     return impl_ && impl_->isActive();
 }
 
@@ -782,28 +1029,16 @@ SnapshotStatusResult Client::getSubscriptionSnapshotStatus(
     return r;
 }
 
-SubscriptionReadiness Client::getSubscriptionReadiness() {
-    auto [ok, status, response_json] = impl_->send_request(
-        static_cast<uint32_t>(ipc::MethodId::GET_SUBSCRIPTION_READINESS), "{}");
+CloudReadinessSnapshot Client::getSubscriptionReadiness() {
+    return impl_->fetchCloudReadiness();
+}
 
-    SubscriptionReadiness r;
-    if (!ok) return r;
-    try {
-        auto j = nlohmann::json::parse(response_json);
-        r.cloud_ready = j.value("cloud_ready", false);
-        r.subscriptions_ready = j.value("subscriptions_ready", false);
-        r.connected = j.value("connected", false);
-        r.connection_generation = j.value("connection_generation", 0ULL);
-        r.mandatory_count = j.value("mandatory_count", 0);
-        r.mandatory_active = j.value("mandatory_active", 0);
-        r.reason_code = j.value("reason_code", "");
-        if (j.contains("owner_generations") && j["owner_generations"].is_object()) {
-            for (auto it = j["owner_generations"].begin(); it != j["owner_generations"].end(); ++it) {
-                r.owner_generations[it.key()] = it.value().get<uint64_t>();
-            }
-        }
-    } catch (...) {}
-    return r;
+SubscriptionHandle Client::subscribeCloudReadinessChanged(CloudReadinessCallback callback) {
+    auto impl = impl_->subscribeCloudReadiness(std::move(callback));
+    if (!impl) {
+        return SubscriptionHandle{};  // 参数非法：空句柄
+    }
+    return SubscriptionHandle(std::move(impl));
 }
 
 } // namespace mqtt

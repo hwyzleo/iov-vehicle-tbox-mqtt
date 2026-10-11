@@ -9,6 +9,7 @@
 #include <openssl/evp.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
+#include <openssl/sha.h>
 #include <arpa/inet.h>
 #include <cstring>
 
@@ -32,6 +33,20 @@ int getEcKeyExIndex() {
         g_ec_key_ex_index = EC_KEY_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
     }
     return g_ec_key_ex_index;
+}
+
+/// 计算 SHA-256 并输出小写 hex (DSN-CR-014 §3: 规范 DER 指纹)
+std::string sha256Hex(const unsigned char* data, size_t len) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(data, len, digest);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(SHA256_DIGEST_LENGTH * 2);
+    for (unsigned char c : digest) {
+        out.push_back(kHex[c >> 4]);
+        out.push_back(kHex[c & 0x0F]);
+    }
+    return out;
 }
 
 /// ECDSA sign callback: OpenSSL CertificateVerify -> SEC signTls (CR-005 §5.2)
@@ -154,6 +169,8 @@ void SecTlsKeyAdapter::destroyContext() {
     current_credential_.client_cert_chain.shrink_to_fit();
     current_credential_.private_key_ref.data.clear();
     current_credential_.private_key_ref.data.shrink_to_fit();
+    // CR-014 §4.2: 旧会话指纹不跨 context 复用（已由 gate 固化为快照）
+    leaf_fingerprint_.clear();
     cred_mgr_ = nullptr;
 }
 
@@ -398,6 +415,19 @@ bool SecTlsKeyAdapter::loadClientCertChain(SSL_CTX* ctx,
         if (index == 0) {
             // Leaf cert: set as the client certificate
             // CR-005 §5.1: 校验有效期、EKU、算法和链完整性
+            // CR-014 §4.1: 固化实际写入 SSL_CTX 的 leaf 证书身份（规范 DER SHA-256）
+            int der_len = i2d_X509(cert, nullptr);
+            if (der_len > 0) {
+                std::vector<unsigned char> der(static_cast<size_t>(der_len));
+                unsigned char* der_ptr = der.data();
+                if (i2d_X509(cert, &der_ptr) == der_len) {
+                    leaf_fingerprint_ = "sha256:" + sha256Hex(der.data(), der.size());
+                }
+            }
+            if (leaf_fingerprint_.empty()) {
+                // 回退：直接对输入 DER 片段求指纹（保证身份仍可用，不阻断连接）
+                leaf_fingerprint_ = "sha256:" + sha256Hex(p, consumed);
+            }
             if (SSL_CTX_use_certificate(ctx, cert) != 1) {
                 last_error_ = "SSL_CTX_use_certificate failed for leaf cert";
                 X509_free(cert);
@@ -443,6 +473,25 @@ void SecTlsKeyAdapter::setTlsVersionRange(SSL_CTX* ctx, TlsVersion min_tls, TlsV
 
     SSL_CTX_set_min_proto_version(ctx, min_ver);
     SSL_CTX_set_max_proto_version(ctx, max_ver);
+
+    // CR-005 §5.2: SEC 仅允许 ecdsa_secp256r1_sha256（digest 必须为 32 字节）。
+    // 不约束 sigalgs 时 TLS 1.2 下 OpenSSL 可能协商 ECDSA+SHA384/SHA512，导致
+    // 远程签名回调收到 48/64 字节摘要，SEC 以 SEC-1013 fail-closed 拒绝并中止握手。
+    // 这里把客户端可用签名算法收敛到唯一允许项，使协商结果与 SEC 约束一致。
+    if (SSL_CTX_set1_sigalgs_list(ctx, "ECDSA+SHA256") != 1) {
+        MqttLogAdapter::tls().warn(
+            "mqtt.tls.sigalgs_restrict_failed",
+            "签名算法列表约束失败，可能协商到 SEC 不允许的摘要算法",
+            {{"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}}
+        );
+    }
+    if (SSL_CTX_set1_client_sigalgs_list(ctx, "ECDSA+SHA256") != 1) {
+        MqttLogAdapter::tls().warn(
+            "mqtt.tls.client_sigalgs_restrict_failed",
+            "客户端签名算法列表约束失败",
+            {{"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}}
+        );
+    }
 }
 
 bool SecTlsKeyAdapter::registerRemoteKey(SSL_CTX* ctx,

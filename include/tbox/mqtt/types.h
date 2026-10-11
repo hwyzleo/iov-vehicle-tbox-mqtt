@@ -209,7 +209,8 @@ using RoutedDownlinkCallback =
     std::function<void(const RoutedDownlinkEvent&)>;
 
 // ============================================================
-// 订阅快照与 Cloud Readiness (CR-007 §3, §4, §10; 对齐 TSP DSN-CR-004 §3, §5)
+// 订阅快照与 Cloud Readiness (CR-007 §3, §4, §10; CR-014 §3, §5;
+// 对齐 TSP DSN-CR-004 §3, §5)
 // ============================================================
 // 本组 DTO 由 daemon (MqttIpcDispatcher) 与 client SDK (tbox::mqtt::Client) 共享，
 // 构成双方快照 IPC contract。TSP 等业务服务经 client SDK 提交完整版本化快照。
@@ -298,19 +299,46 @@ struct SnapshotStatusResult {
     bool registration_complete = false;
 };
 
-/// Cloud Readiness / 订阅就绪查询返回 (CR-007 §4, §10)
-/// TSP 不消费此接口（用本地 RegistrationState 做业务门闩）；供诊断与事件联动。
-/// CLOUD_READY = connected && subscriptions_ready。
-struct SubscriptionReadiness {
+/// Cloud Readiness 契约版本 (DSN-CR-014 §7)
+/// daemon 与 SDK 通过 IPC 传递该版本号；SDK 遇到缺失或不兼容版本时返回
+/// UNSUPPORTED_CONTRACT_VERSION，不得伪造空证书身份后宣告可用。
+constexpr uint32_t kCloudReadinessContractVersion = 2;
+
+/// Cloud Readiness 权威快照 (DSN-CR-014 §3, §5, §12.5)
+///
+/// 由 MQTT daemon 生成，client 只读。cloud_ready 与本次 TLS context 实际装载的
+/// leaf 客户端证书身份绑定：cert_session_generation/device_identity_digest/
+/// certificate_ref 均来自固化到 TLS context 的 leaf 证书，调用方不得提供或覆盖。
+///
+/// 兼容策略 (DSN-CR-014 §5)：在 CR-007 诊断字段基础上扩展；旧调用方忽略新增字段。
+struct CloudReadinessSnapshot {
+    // ---- CR-014 §3: Cloud Ready 权威状态 ----
     bool cloud_ready = false;               // CLOUD_READY 综合态
+    uint64_t connection_generation = 0;     // 连接 generation
+    uint64_t cert_session_generation = 0;   // 本次 TLS 会话不可复用 generation
+    std::string credential_id;              // 审计/轮换关联（非秘密）
+    uint64_t credential_version = 0;        // credential 版本
+    std::string device_identity_digest;     // sha256(leaf DER)
+    std::string certificate_ref;            // sha256:<hex fingerprint>
+    std::string reason_code;                // 非 ready 时的原因（MQTT-1011 等）
+    uint64_t event_sequence = 0;            // daemon 生命周期内单调递增，用于发现事件缺口
+    // ---- CR-007 兼容诊断字段（旧调用方忽略）----
     bool subscriptions_ready = false;       // Mandatory 全部 ACTIVE
     bool connected = false;                 // CONNACK 成功（含 SUBSCRIBING/CLOUD_READY/DEGRADED）
-    uint64_t connection_generation = 0;     // 连接 generation
     std::map<std::string, uint64_t> owner_generations;  // owner -> 最新已接受 generation
     uint32_t mandatory_count = 0;           // 当前 mandatory 项总数
     uint32_t mandatory_active = 0;          // 已 SUBACK ACTIVE 的 mandatory 项数
-    std::string reason_code;                // 非 ready 时的原因（MQTT-1011 等）
+    // ---- CR-014 §7: 契约版本兼容 ----
+    uint32_t contract_version = 0;          // daemon 声明的契约版本（0=旧 daemon 未提供）
+    bool contract_supported = true;         // false = UNSUPPORTED_CONTRACT_VERSION
 };
+
+/// 源兼容别名：既有调用方仍可使用 SubscriptionReadiness。
+using SubscriptionReadiness = CloudReadinessSnapshot;
+
+/// Cloud Readiness 事件回调 (DSN-CR-014 §5)
+/// 在独立执行器（非 IPC 读线程）中调用，携带完整快照。
+using CloudReadinessCallback = std::function<void(const CloudReadinessSnapshot&)>;
 
 } // namespace mqtt
 } // namespace tbox

@@ -14,6 +14,10 @@
 namespace tbox {
 namespace mqtt {
 
+/// 序列化 CloudReadinessSnapshot 为 IPC 契约 JSON (CR-014 §3/§4.2/§5)。
+/// daemon 的快照查询响应与 CLOUD_READY_CHANGED 事件共用此实现，保证字段集一致。
+std::string cloudReadinessToJson(const CloudReadinessSnapshot& snapshot);
+
 class MqttService;
 
 /// MqttIpcDispatcher 依赖的业务接口 (CR-004 §3)
@@ -53,7 +57,7 @@ public:
         virtual SnapshotStatusResult onGetSubscriptionSnapshotStatus(
             const std::string& owner, uint64_t generation) = 0;
         /// getSubscriptionReadiness：Cloud Ready 诊断
-        virtual SubscriptionReadiness onGetSubscriptionReadiness() = 0;
+        virtual CloudReadinessSnapshot onGetSubscriptionReadiness() = 0;
         // ---- CR-009 §6.1: route-based 发布 ----
         /// publishRoute：按 owner/route_id 发布
         virtual PublishResult onPublishRoute(const RoutePublishRequest& req) = 0;
@@ -62,6 +66,11 @@ public:
         /// 默认实现返回成功（便于既有 stub 不破纲）。
         virtual std::pair<int32_t, bool> onSubscribeRoutedDownlinkEventChannel(
             const std::string& owner, int client_fd) { (void)owner; (void)client_fd; return {0, true}; }
+        // ---- CR-014 §5: Cloud Ready 事件订阅 ----
+        /// 登记 fd 到 CLOUD_READY_CHANGED 事件通道（不触发 Broker 操作）。
+        virtual std::pair<int32_t, bool> onSubscribeCloudReadinessEventChannel(int client_fd) {
+            (void)client_fd; return {0, true};
+        }
     };
 
     explicit MqttIpcDispatcher(ServiceHandler* service);
@@ -101,6 +110,8 @@ private:
     std::pair<int32_t, std::string> handlePublishRoute(std::string_view params);
     // CR-010 §3
     std::pair<int32_t, std::string> handleSubscribeRoutedDownlink(std::string_view params, int client_fd);
+    // CR-014 §5
+    std::pair<int32_t, std::string> handleSubscribeCloudReadiness(int client_fd);
 
     // per-fd 订阅集合（client 断连时清理，CR-004 §4）
     std::map<int, std::unordered_set<std::string>> fd_subscriptions_;

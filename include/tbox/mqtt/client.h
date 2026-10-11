@@ -50,6 +50,35 @@ private:
     explicit RoutedSubscription(std::shared_ptr<Impl> impl);
 };
 
+/// Cloud Ready 订阅 RAII 句柄 (CR-014 §5)
+///
+/// 由 Client::subscribeCloudReadinessChanged 返回。move-only；析构幂等 cancel()，
+/// 等待内部 dispatcher 线程有界退出。callback 投递到独立执行器（非 IPC 读线程）；
+/// 检测到 event_sequence 缺口/回退（daemon 重启）时自动重查快照并补投，实现最终收敛。
+class SubscriptionHandle {
+public:
+    SubscriptionHandle();
+    ~SubscriptionHandle();
+
+    SubscriptionHandle(SubscriptionHandle&&) noexcept;
+    SubscriptionHandle& operator=(SubscriptionHandle&&) noexcept;
+
+    SubscriptionHandle(const SubscriptionHandle&) = delete;
+    SubscriptionHandle& operator=(const SubscriptionHandle&) = delete;
+
+    /// 幂等取消：停止读取线程与 dispatcher 线程，等待在途 callback 完成。
+    void cancel();
+
+    /// 是否仍在活跃接收事件。
+    bool isActive() const;
+
+private:
+    class Impl;
+    std::shared_ptr<Impl> impl_;
+    friend class Client;
+    explicit SubscriptionHandle(std::shared_ptr<Impl> impl);
+};
+
 /// MQTT 客户端 facade (CR-004 §7.1)
 class Client {
 public:
@@ -116,8 +145,17 @@ public:
     /// 查询指定 owner/generation 的接受状态（响应丢失后幂等收敛）
     SnapshotStatusResult getSubscriptionSnapshotStatus(const std::string& owner, uint64_t generation);
 
-    /// Cloud Ready 诊断查询
-    SubscriptionReadiness getSubscriptionReadiness();
+    /// Cloud Ready 权威快照查询 (CR-014 §5)
+    /// 返回与 CLOUD_READY_CHANGED 事件一致的完整 CloudReadinessSnapshot。
+    /// daemon 未提供或不兼容 contract_version 时返回 contract_supported=false，
+    /// 不得使用空证书身份宣告 ready。
+    CloudReadinessSnapshot getSubscriptionReadiness();
+
+    /// 订阅 Cloud Ready 进入/退出及 generation/证书身份变化事件 (CR-014 §5)
+    /// 仅建立 IPC CLOUD_READY_CHANGED 事件通道，不触发 Broker 操作。
+    /// @param callback  在 SDK 内部独立执行器中调用（非 IPC 读线程）
+    /// @return 活跃 SubscriptionHandle；参数非法返回 isActive()==false 的空句柄。
+    SubscriptionHandle subscribeCloudReadinessChanged(CloudReadinessCallback callback);
 
 private:
     class Impl;

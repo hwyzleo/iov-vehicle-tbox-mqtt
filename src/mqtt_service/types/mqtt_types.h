@@ -109,6 +109,22 @@ struct ActiveTlsCredential {
     bool ready = false;      // status == READY 且 bundle 完整
 };
 
+/// TLS 会话身份快照 (DSN-CR-014 §3, §4.1, §12.5)
+///
+/// 每次创建 TLS context 时固化：cert_session_generation 不可复用；
+/// device_identity_digest/certificate_ref 来自实际写入 SSL_CTX 的 leaf 客户端证书
+/// （规范 DER 的 SHA-256），不依赖重新查询 SEC 当前 credential。
+/// 仅存在于 MQTT 进程内存，不持久化、不写入日志原文。
+struct TlsSessionIdentity {
+    uint64_t cert_session_generation = 0;
+    uint64_t connection_generation = 0;
+    std::string credential_id;
+    uint64_t credential_version = 0;
+    std::string device_identity_digest;  // sha256(leaf DER)
+    std::string certificate_ref;         // sha256:<hex fingerprint>
+    bool valid = false;                  // 是否已成功固化 leaf 身份
+};
+
 /// 凭据轮询退避配置 (CR-005 §8)
 struct CredentialPollConfig {
     Duration initial_backoff{1000};   // ms
