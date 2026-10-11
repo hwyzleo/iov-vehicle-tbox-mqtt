@@ -66,11 +66,48 @@ public:
     /// 返回与事件一致的最新已提交快照（含 identity 与 event_sequence）。
     CloudReadinessSnapshot getReadiness() const;
 
+    // ---- CR-015 §18.3: capability-scoped readiness ----
+    /// capability 变更回调（在锁外调用，携带完整 CapabilityReadiness）
+    using CapabilityChangeCallback = std::function<void(const CapabilityReadiness&)>;
+    void setCapabilityCallback(CapabilityChangeCallback cb);
+
+    /// 更新 capability 期望状态（enabled/contract/snapshot/uplink/generation）。
+    /// ready 由 cloud_ready + 各标志综合计算；输入不满足时记录稳定 reason。
+    void setCapabilityState(const std::string& capability,
+                            bool enabled,
+                            bool contract_supported,
+                            bool snapshot_accepted,
+                            bool uplink_ready,
+                            uint64_t owner_generation);
+
+    /// 更新 capability 下行 SUBACK 就绪状态
+    /// @param rejected true 表示 SUBACK 失败/拒绝（区分于 pending）
+    void setCapabilityDownlinkReady(const std::string& capability, bool ready,
+                                    bool rejected = false);
+
+    /// 查询单个 capability readiness（与事件读取同一原子状态）
+    CapabilityReadiness getCapabilityReadiness(const std::string& capability) const;
+
+    /// 查询全部 capability readiness（快照副本）
+    std::map<std::string, CapabilityReadiness> getCapabilities() const;
+
 private:
     bool evaluateLocked(const std::string& reason, CloudReadinessSnapshot& out);
     CloudReadinessSnapshot buildSnapshotLocked(bool ready, const std::string& reason) const;
     static bool snapshotChanged(const CloudReadinessSnapshot& a,
                                 const CloudReadinessSnapshot& b);
+
+    /// 重算全部 capability ready；发生变化时递增各自 event_sequence 并收集事件
+    void reevaluateCapabilitiesLocked(std::vector<CapabilityReadiness>& events);
+    static bool capabilityChanged(const CapabilityReadiness& a,
+                                  const CapabilityReadiness& b);
+    static std::string capabilityReasonFor(const std::string& cap,
+                                           bool enabled,
+                                           bool contract_supported,
+                                           bool snapshot_accepted,
+                                           bool uplink_ready,
+                                           bool downlink_suback_ready,
+                                           bool downlink_rejected);
 
     static bool isConnectedState(ConnectionState s) {
         return s == ConnectionState::CONNECTED ||
@@ -96,6 +133,12 @@ private:
     uint64_t event_sequence_ = 0;
     bool has_committed_ = false;
     CloudReadinessSnapshot committed_;
+
+    // CR-015: capability-scoped readiness（独立于全局 cloud_ready）
+    CapabilityChangeCallback capability_callback_;
+    std::map<std::string, CapabilityReadiness> capabilities_;
+    std::map<std::string, uint64_t> capability_sequences_;
+    std::map<std::string, bool> capability_downlink_rejected_;
 };
 
 } // namespace mqtt

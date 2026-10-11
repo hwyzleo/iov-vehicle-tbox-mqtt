@@ -127,3 +127,104 @@ TEST(OwnerSnapshotRegistryTest, Clear) {
     EXPECT_EQ(reg.ownerCount(), 0u);
     EXPECT_FALSE(reg.hasRegistrationComplete("tsp"));
 }
+
+// ============================================================
+// CR-015: catalog-governed route / enabled / contract 语义
+// ============================================================
+
+namespace {
+SubscriptionItem makeCatalogItem(const std::string& route_id) {
+    SubscriptionItem it;  // 只引用 route_id：模板/方向/QoS/target 留空
+    it.route_id = route_id;
+    return it;
+}
+}
+
+TEST(OwnerSnapshotRegistryTest, CatalogKeyprovFieldsFrozen) {
+    OwnerSnapshotRegistry reg;
+    auto snap = makeSnap("tsp", 1, "d1", true,
+        {makeCatalogItem(kKeyprovDownlinkRouteId)});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    auto r = reg.replaceSnapshot(snap);
+    ASSERT_EQ(r.status, SnapshotAcceptStatus::ACCEPTED);
+
+    auto stored = reg.getLatestSnapshot("tsp");
+    ASSERT_TRUE(stored != nullptr);
+    ASSERT_EQ(stored->items.size(), 1u);
+    const auto& item = stored->items[0];
+    EXPECT_EQ(item.topic_template, "vehicle/{ecu_uid}/down/keyprov");
+    EXPECT_EQ(item.direction, SnapshotDirection::DOWN);
+    EXPECT_EQ(item.qos, 1u);
+    EXPECT_EQ(item.target, "tsp.keyprov");
+    EXPECT_EQ(item.readiness_scope, kCapabilitySecurityKeyprov);
+    EXPECT_EQ(item.criticality, SubscriptionCriticality::CAPABILITY_MANDATORY);
+    // capability-gated route 未显式 enabled -> false
+    ASSERT_TRUE(item.enabled.has_value());
+    EXPECT_FALSE(item.enabled.value());
+}
+
+TEST(OwnerSnapshotRegistryTest, CatalogUplinkEmptyTargetAccepted) {
+    OwnerSnapshotRegistry reg;
+    auto snap = makeSnap("tsp", 1, "d1", true,
+        {makeCatalogItem(kKeyprovUplinkRouteId)});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    auto r = reg.replaceSnapshot(snap);
+    ASSERT_EQ(r.status, SnapshotAcceptStatus::ACCEPTED);
+    auto stored = reg.getLatestSnapshot("tsp");
+    EXPECT_EQ(stored->items[0].target, "");
+    EXPECT_EQ(stored->items[0].direction, SnapshotDirection::UP);
+}
+
+TEST(OwnerSnapshotRegistryTest, CatalogRouteRejectsArbitraryTemplate) {
+    OwnerSnapshotRegistry reg;
+    SubscriptionItem it = makeCatalogItem(kKeyprovDownlinkRouteId);
+    it.topic_template = "vehicle/{ecu_uid}/down/evil";
+    auto snap = makeSnap("tsp", 1, "d1", true, {it});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    auto r = reg.replaceSnapshot(snap);
+    EXPECT_EQ(r.status, SnapshotAcceptStatus::REJECTED);
+    EXPECT_EQ(r.reason_code, "catalog_template_mismatch");
+}
+
+TEST(OwnerSnapshotRegistryTest, CatalogRouteRejectsScopeOverride) {
+    OwnerSnapshotRegistry reg;
+    SubscriptionItem it = makeCatalogItem(kKeyprovDownlinkRouteId);
+    it.readiness_scope = "security.other";
+    auto snap = makeSnap("tsp", 1, "d1", true, {it});
+    auto r = reg.replaceSnapshot(snap);
+    EXPECT_EQ(r.status, SnapshotAcceptStatus::REJECTED);
+    EXPECT_EQ(r.reason_code, "catalog_scope_mismatch");
+}
+
+TEST(OwnerSnapshotRegistryTest, CatalogEnabledExplicitTrue) {
+    OwnerSnapshotRegistry reg;
+    SubscriptionItem it = makeCatalogItem(kKeyprovDownlinkRouteId);
+    it.enabled = true;
+    auto snap = makeSnap("tsp", 1, "d1", true, {it});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    ASSERT_EQ(reg.replaceSnapshot(snap).status, SnapshotAcceptStatus::ACCEPTED);
+    auto stored = reg.getLatestSnapshot("tsp");
+    ASSERT_TRUE(stored->items[0].enabled.has_value());
+    EXPECT_TRUE(stored->items[0].enabled.value());
+    EXPECT_EQ(stored->contract_version, kSubscriptionCatalogContractVersion);
+}
+
+TEST(OwnerSnapshotRegistryTest, UnknownScopedRouteRejected) {
+    OwnerSnapshotRegistry reg;
+    SubscriptionItem it = makeItem("custom.route", "t", SnapshotDirection::UP, 1, "tgt", false);
+    it.readiness_scope = "security.custom";
+    auto r = reg.replaceSnapshot(makeSnap("tsp", 1, "d1", true, {it}));
+    EXPECT_EQ(r.status, SnapshotAcceptStatus::REJECTED);
+    EXPECT_EQ(r.reason_code, "unknown_capability_route");
+}
+
+TEST(OwnerSnapshotRegistryTest, LegacyEnabledDefaultsTrue) {
+    OwnerSnapshotRegistry reg;
+    reg.replaceSnapshot(makeSnap("tsp", 1, "d1", true,
+        {makeItem("fota.down", "vehicle/{ecu_uid}/down/fota", SnapshotDirection::DOWN, 1, "tsp.fota", true)}));
+    auto stored = reg.getLatestSnapshot("tsp");
+    ASSERT_TRUE(stored->items[0].enabled.has_value());
+    EXPECT_TRUE(stored->items[0].enabled.value());
+    EXPECT_EQ(stored->items[0].criticality, SubscriptionCriticality::GLOBAL_MANDATORY);
+    EXPECT_TRUE(stored->items[0].readiness_scope.empty());
+}

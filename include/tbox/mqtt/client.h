@@ -52,9 +52,11 @@ private:
 
 /// Cloud Ready 订阅 RAII 句柄 (CR-014 §5)
 ///
-/// 由 Client::subscribeCloudReadinessChanged 返回。move-only；析构幂等 cancel()，
-/// 等待内部 dispatcher 线程有界退出。callback 投递到独立执行器（非 IPC 读线程）；
-/// 检测到 event_sequence 缺口/回退（daemon 重启）时自动重查快照并补投，实现最终收敛。
+/// 由 Client::subscribeCloudReadinessChanged / subscribeCapabilityReadinessChanged 返回。
+/// move-only；析构幂等 cancel()，等待内部 dispatcher/reader 线程有界退出。
+class CloudReadinessHandleImpl;
+class CapabilityHandleImpl;
+
 class SubscriptionHandle {
 public:
     SubscriptionHandle();
@@ -74,6 +76,8 @@ public:
 
 private:
     class Impl;
+    friend class CloudReadinessHandleImpl;
+    friend class CapabilityHandleImpl;
     std::shared_ptr<Impl> impl_;
     friend class Client;
     explicit SubscriptionHandle(std::shared_ptr<Impl> impl);
@@ -156,6 +160,18 @@ public:
     /// @param callback  在 SDK 内部独立执行器中调用（非 IPC 读线程）
     /// @return 活跃 SubscriptionHandle；参数非法返回 isActive()==false 的空句柄。
     SubscriptionHandle subscribeCloudReadinessChanged(CloudReadinessCallback callback);
+
+    // ---- CR-015 §18.4: Capability Readiness ----
+    /// 查询单个 capability 的 readiness（与事件读取同一原子状态）。
+    /// 旧 daemon 不支持该契约时 contract_supported=false，不得用全局 Cloud Ready 冒充。
+    CapabilityReadiness getCapabilityReadiness(std::string_view capability);
+
+    /// 订阅 capability readiness 进入/退出及 generation/reason 变化事件 (CR-015 §18.3)。
+    /// 仅建立 IPC CAPABILITY_READINESS_CHANGED 事件通道，不触发 Broker 操作。
+    /// 返回的 SubscriptionHandle 为 move-only、cancel() 幂等、析构自动取消（同 CR-014 语义）。
+    SubscriptionHandle subscribeCapabilityReadinessChanged(
+        std::string_view capability,
+        CapabilityReadinessCallback callback);
 
 private:
     class Impl;

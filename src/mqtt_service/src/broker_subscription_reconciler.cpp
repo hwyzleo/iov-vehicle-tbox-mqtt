@@ -57,10 +57,12 @@ ReconcileResult BrokerSubscriptionReconciler::reconcile(
     ++reconcile_generation_;
     uint64_t gen = reconcile_generation_;
 
-    // 更新 mandatory 集合
+    // 更新 mandatory 集合（CR-015: eff.mandatory 仅表示 GLOBAL_MANDATORY）
     mandatory_topics_.clear();
+    capability_scopes_.clear();
     for (const auto& [topic, eff] : *desired) {
         if (eff.mandatory) mandatory_topics_.insert(topic);
+        if (!eff.readiness_scope.empty()) capability_scopes_.insert(eff.readiness_scope);
     }
 
     // 判定 manifest 是否可用于 session 恢复
@@ -123,9 +125,10 @@ ReconcileResult BrokerSubscriptionReconciler::reconcile(
         }
     }
 
-    // 同步 mandatory 标记到 topics_
+    // 同步 mandatory 标记与 capability scope 到 topics_ (CR-015)
     for (const auto& [topic, eff] : *desired) {
         topics_[topic].mandatory = eff.mandatory;
+        topics_[topic].readiness_scope = eff.readiness_scope;
     }
 
     return result;
@@ -238,6 +241,33 @@ uint32_t BrokerSubscriptionReconciler::mandatoryTotal() const {
     return static_cast<uint32_t>(mandatory_topics_.size());
 }
 
+bool BrokerSubscriptionReconciler::capabilityConverged(const std::string& readiness_scope) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (readiness_scope.empty()) return false;
+    bool any = false;
+    for (const auto& [topic, ts] : topics_) {
+        if (ts.readiness_scope != readiness_scope) continue;
+        any = true;
+        if (ts.state != BrokerSubscriptionState::ACTIVE) return false;
+    }
+    return any;
+}
+
+bool BrokerSubscriptionReconciler::hasCapability(const std::string& readiness_scope) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return capability_scopes_.count(readiness_scope) > 0;
+}
+
+bool BrokerSubscriptionReconciler::capabilityRejected(const std::string& readiness_scope) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (readiness_scope.empty()) return false;
+    for (const auto& [topic, ts] : topics_) {
+        if (ts.readiness_scope != readiness_scope) continue;
+        if (ts.state == BrokerSubscriptionState::FAILED) return true;
+    }
+    return false;
+}
+
 std::map<std::string, uint8_t> BrokerSubscriptionReconciler::activeTopics() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::map<std::string, uint8_t> out;
@@ -253,6 +283,7 @@ void BrokerSubscriptionReconciler::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     topics_.clear();
     mandatory_topics_.clear();
+    capability_scopes_.clear();
 }
 
 } // namespace mqtt

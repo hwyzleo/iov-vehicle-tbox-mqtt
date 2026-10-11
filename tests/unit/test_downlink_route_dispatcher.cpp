@@ -127,6 +127,62 @@ TEST(DownlinkRouteDispatcherTest, DispatchNullTable) {
     EXPECT_EQ(matched, 0u);
 }
 
+// ---- CR-015 §18.6: capability 下行 payload 上限（DOWNLINK_VALIDATE）----
+
+TEST(DownlinkRouteDispatcherTest, KeyprovDownlinkWithinLimitDispatched) {
+    OwnerSnapshotRegistry reg;
+    TopicTemplateResolver resolver;
+    resolver.setIdentity("ECU123", 1);
+    SubscriptionItem it;
+    it.route_id = kKeyprovDownlinkRouteId;
+    it.enabled = true;
+    auto snap = makeSnap("tsp", 1, "d1", true, {it});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    reg.replaceSnapshot(snap);
+    TopicProjectionBuilder builder;
+    auto table = builder.build(reg, resolver);
+
+    std::vector<RoutedDownlinkEnvelope> events;
+    DownlinkRouteDispatcher dispatcher;
+    dispatcher.setDispatchFn([&events](const RoutedDownlinkEnvelope& e) {
+        events.push_back(e);
+    });
+
+    std::vector<uint8_t> payload(kKeyprovMaxPayloadBytes, 0x01);
+    size_t matched = dispatcher.dispatch(
+        "vehicle/ECU123/down/keyprov", payload, table, 1);
+    EXPECT_EQ(matched, 1u);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].target, "tsp.keyprov");
+    EXPECT_EQ(events[0].readiness_scope, kCapabilitySecurityKeyprov);
+}
+
+TEST(DownlinkRouteDispatcherTest, KeyprovDownlinkTooLargeRejected) {
+    OwnerSnapshotRegistry reg;
+    TopicTemplateResolver resolver;
+    resolver.setIdentity("ECU123", 1);
+    SubscriptionItem it;
+    it.route_id = kKeyprovDownlinkRouteId;
+    it.enabled = true;
+    auto snap = makeSnap("tsp", 1, "d1", true, {it});
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    reg.replaceSnapshot(snap);
+    TopicProjectionBuilder builder;
+    auto table = builder.build(reg, resolver);
+
+    int call_count = 0;
+    DownlinkRouteDispatcher dispatcher;
+    dispatcher.setDispatchFn([&call_count](const RoutedDownlinkEnvelope&) {
+        ++call_count;
+    });
+
+    std::vector<uint8_t> payload(kKeyprovMaxPayloadBytes + 1, 0x01);
+    size_t matched = dispatcher.dispatch(
+        "vehicle/ECU123/down/keyprov", payload, table, 1);
+    EXPECT_EQ(matched, 0u);
+    EXPECT_EQ(call_count, 0);
+}
+
 // ---- LegacyTopicGuard 测试 ----
 
 TEST(LegacyTopicGuardTest, ValidateValidDeviceTopic) {

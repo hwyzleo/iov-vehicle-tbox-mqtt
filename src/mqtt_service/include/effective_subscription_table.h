@@ -46,10 +46,13 @@ struct EffectiveSubscription {
     std::string expanded_topic;
     std::string topic_template;     // 模板（日志只输出模板，CR-007 §11）
     uint8_t effective_qos = 1;      // 所有 owner 请求的最大值
-    bool mandatory = false;         // 各 owner 引用逻辑 OR
+    bool mandatory = false;         // 各 owner 引用逻辑 OR（仅 GLOBAL_MANDATORY 计入）
     std::set<std::string> owners;   // 引用该 Topic 的 owner 集合
     std::vector<RouteTarget> targets;  // 所有有效 owner 路由（下行 fan-out）
     BrokerSubscriptionState state = BrokerSubscriptionState::PENDING;
+    // ---- CR-015 ----
+    std::string readiness_scope;    // 空=全局；非空=capability scope
+    SubscriptionCriticality criticality = SubscriptionCriticality::OPTIONAL;
 };
 
 /// 上行路由条目（供 RouteBridge 注册，发布用，不产生 Broker SUBSCRIBE）
@@ -78,8 +81,11 @@ public:
     /// 获取当前上行路由列表（线程安全，供 RouteBridge 注册）
     std::vector<UpstreamRoute> upstreamRoutes() const;
 
-    /// 当前 mandatory 下行项数量
+    /// 当前 mandatory 下行项数量（仅 GLOBAL_MANDATORY，CR-015）
     uint32_t mandatoryCount() const;
+
+    /// CR-015: 当前 capability-scoped 下行项数量（不含全局）
+    uint32_t capabilityCount() const;
 
     /// 清空投影（进程重启语义）
     void clear();

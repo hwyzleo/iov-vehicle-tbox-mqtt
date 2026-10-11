@@ -19,6 +19,7 @@
 #include "mqtt_types.h"
 #include "tbox/mqtt/types.h"
 #include "topic_template_validator.h"
+#include "subscription_catalog.h"
 #include <map>
 #include <memory>
 #include <mutex>
@@ -71,6 +72,7 @@ private:
         bool ok = false;
         std::string reason_code;
         std::vector<std::string> rejected_route_ids;
+        OwnerSubscriptionSnapshot normalized;  // CR-015: catalog 字段归一化后的快照
     };
     ValidationResult validate(const OwnerSubscriptionSnapshot& snapshot) const;
 

@@ -32,8 +32,57 @@ OwnerSnapshotRegistry::ValidationResult OwnerSnapshotRegistry::validate(
         r.reason_code = "invalid_digest";
         return r;
     }
+
+    const auto& catalog = SubscriptionCatalog::instance();
+    r.normalized = snapshot;  // 保留 owner/generation/digest/registration_complete/contract_version
+    r.normalized.items.clear();
+    r.normalized.items.reserve(snapshot.items.size());
+
     std::vector<std::string> seen;
-    for (const auto& item : snapshot.items) {
+    for (const auto& raw : snapshot.items) {
+        SubscriptionItem item = raw;
+
+        const CatalogEntry* entry = catalog.lookup(snapshot.owner, raw.route_id);
+        const bool catalog_route = (entry != nullptr);
+        if (entry != nullptr) {
+            // CR-015: catalog-governed route —— 模板/方向/QoS/target/scope 由 catalog 冻结，
+            // 调用方只引用 route_id；显式传入冲突模板/scope 时整体拒绝，禁止任意 Topic 注入。
+            if (!raw.readiness_scope.empty() &&
+                raw.readiness_scope != entry->readiness_scope) {
+                r.rejected_route_ids.push_back(raw.route_id);
+                r.reason_code = "catalog_scope_mismatch";
+                return r;
+            }
+            if (!raw.topic_template.empty() &&
+                raw.topic_template != entry->topic_template) {
+                r.rejected_route_ids.push_back(raw.route_id);
+                r.reason_code = "catalog_template_mismatch";
+                return r;
+            }
+            item.topic_template = entry->topic_template;
+            item.direction = entry->direction;
+            item.qos = entry->qos;
+            item.target = entry->target;
+            item.readiness_scope = entry->readiness_scope;
+            item.criticality = entry->criticality;
+            item.mandatory = false;  // capability-gated，不进入全局 mandatory 集合
+            // capability-gated route：字段缺失必须解释为 enabled=false
+            item.enabled = raw.enabled.value_or(false);
+        } else {
+            // CR-015: 非 catalog route 不得携带 readiness_scope（未受控能力路由）
+            if (!raw.readiness_scope.empty()) {
+                r.rejected_route_ids.push_back(raw.route_id);
+                r.reason_code = "unknown_capability_route";
+                return r;
+            }
+            // legacy route：字段缺失解释为 enabled=true（保持兼容）
+            item.enabled = raw.enabled.value_or(true);
+            item.readiness_scope.clear();
+            item.criticality = raw.mandatory
+                ? SubscriptionCriticality::GLOBAL_MANDATORY
+                : SubscriptionCriticality::OPTIONAL;
+        }
+
         if (item.route_id.empty()) {
             r.rejected_route_ids.push_back("<empty>");
             r.reason_code = "invalid_route_id";
@@ -62,11 +111,14 @@ OwnerSnapshotRegistry::ValidationResult OwnerSnapshotRegistry::validate(
             r.reason_code = "invalid_qos";
             return r;
         }
-        if (item.target.empty()) {
+        if (item.target.empty() && !catalog_route) {
+            // catalog-governed route 的 target 可为空（由 catalog 冻结，如 keyprov.uplink）；
+            // legacy route 仍要求 target 非空（保持 CR-007 校验）。
             r.rejected_route_ids.push_back(item.route_id);
             r.reason_code = "invalid_target";
             return r;
         }
+        r.normalized.items.push_back(std::move(item));
     }
     r.ok = true;
     return r;
@@ -115,7 +167,7 @@ ReplaceSnapshotResult OwnerSnapshotRegistry::replaceSnapshot(
     // 接受：影子副本完成全量校验后单指针切换 (CR-007 §4)
     auto next = std::make_shared<State>(*state_);
     OwnerEntry entry;
-    entry.snapshot = snapshot;
+    entry.snapshot = vr.normalized;  // CR-015: 存储归一化后的快照
     entry.reason_code = "accepted";
     next->owners[snapshot.owner] = std::move(entry);
     state_ = next;  // 原子替换（mutex 串行）

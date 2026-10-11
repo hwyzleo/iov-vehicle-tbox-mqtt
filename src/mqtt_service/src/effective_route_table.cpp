@@ -27,6 +27,7 @@ void EffectiveRouteTable::addRoute(ResolvedRoute route) {
         ref.target = r.definition.target;
         ref.qos = r.definition.qos;
         ref.mandatory = r.definition.mandatory;
+        ref.readiness_scope = r.definition.readiness_scope;  // CR-015
         reverse_index_[r.expanded_topic].push_back(std::move(ref));
     }
 }

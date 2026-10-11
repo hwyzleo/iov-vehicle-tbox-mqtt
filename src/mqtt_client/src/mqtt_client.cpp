@@ -250,6 +250,55 @@ CloudReadinessSnapshot parseCloudReadinessJson(std::string_view payload_json) {
     return r;
 }
 
+/// 解析 CapabilityReadiness JSON -> CapabilityReadiness (CR-015 §18.4)
+/// contract_version 缺失或不兼容时 contract_supported=false，不得伪造 ready。
+CapabilityReadiness parseCapabilityReadinessJson(std::string_view payload_json,
+                                                 const std::string& expected_capability) {
+    CapabilityReadiness r;
+    r.capability = expected_capability;
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(payload_json);
+    } catch (...) {
+        r.contract_supported = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    if (!j.is_object()) {
+        r.contract_supported = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    const uint32_t version = j.value("contract_version", 0u);
+    if (version != kCapabilityReadinessContractVersion) {
+        r.contract_supported = false;
+        r.ready = false;
+        r.reason_code = "UNSUPPORTED_CONTRACT_VERSION";
+        return r;
+    }
+    r.contract_supported = true;
+    std::string cap = j.value("capability", expected_capability);
+    if (cap != expected_capability) {
+        // capability 不匹配：不得构造半成品，标记不支持
+        r.contract_supported = false;
+        r.ready = false;
+        r.reason_code = "CAPABILITY_MISMATCH";
+        return r;
+    }
+    r.capability = std::move(cap);
+    r.enabled = j.value("enabled", false);
+    r.snapshot_accepted = j.value("snapshot_accepted", false);
+    r.uplink_ready = j.value("uplink_ready", false);
+    r.downlink_suback_ready = j.value("downlink_suback_ready", false);
+    r.ready = j.value("ready", false);
+    r.owner_generation = j.value("owner_generation", 0ULL);
+    r.connection_generation = j.value("connection_generation", 0ULL);
+    r.cert_session_generation = j.value("cert_session_generation", 0ULL);
+    r.reason_code = j.value("reason_code", "");
+    r.event_sequence = j.value("event_sequence", 0ULL);
+    return r;
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -382,13 +431,21 @@ private:
 // 独立 dispatcher 线程 + 有界队列解耦 IPC 读取与业务 callback；
 // sequence 缺口/回退（daemon 重启）时自动重查快照补投，实现最终收敛。
 // ============================================================
-class SubscriptionHandle::Impl
-    : public std::enable_shared_from_this<SubscriptionHandle::Impl> {
+class SubscriptionHandle::Impl {
 public:
-    Impl(CloudReadinessCallback callback, size_t queue_capacity)
+    virtual ~Impl() = default;
+    virtual void cancel() = 0;
+    virtual bool isActive() const = 0;
+};
+
+class CloudReadinessHandleImpl
+    : public SubscriptionHandle::Impl,
+      public std::enable_shared_from_this<CloudReadinessHandleImpl> {
+public:
+    CloudReadinessHandleImpl(CloudReadinessCallback callback, size_t queue_capacity)
         : callback_(std::move(callback)), queue_capacity_(queue_capacity) {}
 
-    ~Impl() { cancel(); }
+    ~CloudReadinessHandleImpl() override { cancel(); }
 
     void start(::tbox::fw::ipc::Client* fw_client,
                std::function<CloudReadinessSnapshot()> resync) {
@@ -400,10 +457,10 @@ public:
             [self](uint32_t /*ev_type*/, std::string_view payload_json) {
                 self->onEvent(payload_json);
             });
-        dispatcher_ = std::thread(&Impl::dispatchLoop, this);
+        dispatcher_ = std::thread(&CloudReadinessHandleImpl::dispatchLoop, this);
     }
 
-    void cancel() {
+    void cancel() override {
         bool expected = true;
         if (!active_.compare_exchange_strong(expected, false)) return;
         queue_cv_.notify_all();
@@ -411,7 +468,7 @@ public:
         fw_sub_.cancel();
     }
 
-    bool isActive() const {
+    bool isActive() const override {
         return active_.load() && fw_sub_.isActive();
     }
 
@@ -508,6 +565,141 @@ private:
 };
 
 // ============================================================
+// CR-015 §18.4: CapabilityHandleImpl
+// 与 CloudReadinessHandleImpl 同构，但使用 capability 事件与 Per-capability 序列。
+// ============================================================
+class CapabilityHandleImpl
+    : public SubscriptionHandle::Impl,
+      public std::enable_shared_from_this<CapabilityHandleImpl> {
+public:
+    CapabilityHandleImpl(std::string capability,
+                         CapabilityReadinessCallback callback,
+                         size_t queue_capacity)
+        : capability_(std::move(capability)),
+          callback_(std::move(callback)),
+          queue_capacity_(queue_capacity) {}
+
+    ~CapabilityHandleImpl() override { cancel(); }
+
+    void start(::tbox::fw::ipc::Client* fw_client,
+               std::function<CapabilityReadiness()> resync) {
+        resync_ = std::move(resync);
+        nlohmann::json params;
+        params["capability"] = capability_;
+        auto self = shared_from_this();
+        fw_sub_ = fw_client->subscribe(
+            static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_CAPABILITY_READINESS),
+            static_cast<uint32_t>(ipc::EventType::CAPABILITY_READINESS_CHANGED),
+            params.dump(),
+            [self](uint32_t /*ev_type*/, std::string_view payload_json) {
+                self->onEvent(payload_json);
+            });
+        dispatcher_ = std::thread(&CapabilityHandleImpl::dispatchLoop, this);
+    }
+
+    void cancel() override {
+        bool expected = true;
+        if (!active_.compare_exchange_strong(expected, false)) return;
+        queue_cv_.notify_all();
+        if (dispatcher_.joinable()) dispatcher_.join();
+        fw_sub_.cancel();
+    }
+
+    bool isActive() const override {
+        return active_.load() && fw_sub_.isActive();
+    }
+
+private:
+    void onEvent(std::string_view payload_json) {
+        if (!active_.load()) return;
+        CapabilityReadiness snap =
+            parseCapabilityReadinessJson(payload_json, capability_);
+        if (!snap.contract_supported) {
+            enqueue(std::move(snap));
+            return;
+        }
+        bool need_resync = false;
+        {
+            std::lock_guard<std::mutex> lock(seq_mutex_);
+            if (have_sequence_ && snap.event_sequence <= last_sequence_) {
+                need_resync = true;
+            } else if (have_sequence_ && snap.event_sequence > last_sequence_ + 1) {
+                need_resync = true;
+            }
+            if (!need_resync) {
+                last_sequence_ = snap.event_sequence;
+                have_sequence_ = true;
+            }
+        }
+        if (need_resync && resync_) {
+            CapabilityReadiness fresh = resync_();
+            if (fresh.contract_supported) {
+                std::lock_guard<std::mutex> lock(seq_mutex_);
+                if (fresh.event_sequence > last_sequence_) {
+                    last_sequence_ = fresh.event_sequence;
+                }
+                have_sequence_ = true;
+            }
+            enqueue(std::move(fresh));
+        } else {
+            enqueue(std::move(snap));
+        }
+    }
+
+    void enqueue(CapabilityReadiness snap) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (queue_.size() >= queue_capacity_) return;
+            queue_.push_back(std::move(snap));
+        }
+        queue_cv_.notify_one();
+    }
+
+    void dispatchLoop() {
+        while (true) {
+            CapabilityReadiness snap;
+            bool have = false;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_cv_.wait(lock, [this] {
+                    return !active_.load() || !queue_.empty();
+                });
+                if (!active_.load()) return;
+                if (!queue_.empty()) {
+                    snap = std::move(queue_.front());
+                    queue_.pop_front();
+                    have = true;
+                }
+            }
+            if (have && callback_) {
+                try {
+                    callback_(snap);
+                } catch (...) {
+                    // 捕获业务异常，继续投递
+                }
+            }
+        }
+    }
+
+    std::string capability_;
+    CapabilityReadinessCallback callback_;
+    std::function<CapabilityReadiness()> resync_;
+    size_t queue_capacity_;
+
+    std::deque<CapabilityReadiness> queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+
+    std::mutex seq_mutex_;
+    uint64_t last_sequence_ = 0;
+    bool have_sequence_ = false;
+
+    std::atomic<bool> active_{true};
+    ::tbox::fw::ipc::Subscription fw_sub_;
+    std::thread dispatcher_;
+};
+
+// ============================================================
 // Client::Impl
 // ============================================================
 class Client::Impl {
@@ -518,8 +710,9 @@ public:
     }
 
     ~Impl() {
-        // CR-010 §6 / CR-014 §5: 先取消订阅句柄（join reader/dispatcher），再断 fw_client
+        // CR-010 §6 / CR-014 §5 / CR-015 §18.4: 先取消订阅句柄（join reader/dispatcher），再断 fw_client
         cancelAllReadiness();
+        cancelAllCapability();
         cancelAllRouted();
         disconnect();
     }
@@ -666,7 +859,7 @@ public:
     std::shared_ptr<SubscriptionHandle::Impl>
     subscribeCloudReadiness(CloudReadinessCallback callback) {
         if (!callback) return nullptr;
-        auto impl = std::make_shared<SubscriptionHandle::Impl>(
+        auto impl = std::make_shared<CloudReadinessHandleImpl>(
             std::move(callback), kRoutedDispatchQueueSize);
         impl->start(fw_client_.get(), [this]() { return fetchCloudReadiness(); });
         {
@@ -689,6 +882,52 @@ public:
         for (auto& sp : live) sp->cancel();
     }
 
+    // CR-015 §18.4: capability readiness 查询与事件订阅
+    CapabilityReadiness fetchCapabilityReadiness(const std::string& capability) {
+        nlohmann::json params;
+        params["capability"] = capability;
+        auto [ok, status, response_json] = send_request(
+            static_cast<uint32_t>(ipc::MethodId::GET_CAPABILITY_READINESS),
+            params.dump());
+        if (!ok) {
+            CapabilityReadiness r;
+            r.capability = capability;
+            r.contract_supported = false;
+            r.reason_code = "transport_failed";
+            return r;
+        }
+        return parseCapabilityReadinessJson(response_json, capability);
+    }
+
+    std::shared_ptr<SubscriptionHandle::Impl>
+    subscribeCapabilityReadiness(const std::string& capability,
+                                 CapabilityReadinessCallback callback) {
+        if (capability.empty() || !callback) return nullptr;
+        auto impl = std::make_shared<CapabilityHandleImpl>(
+            capability, std::move(callback), kRoutedDispatchQueueSize);
+        impl->start(fw_client_.get(), [this, capability]() {
+            return fetchCapabilityReadiness(capability);
+        });
+        {
+            std::lock_guard<std::mutex> lock(capability_handle_mutex_);
+            capability_registry_.push_back(impl);
+        }
+        return impl;
+    }
+
+    void cancelAllCapability() {
+        std::vector<std::shared_ptr<SubscriptionHandle::Impl>> live;
+        {
+            std::lock_guard<std::mutex> lock(capability_handle_mutex_);
+            live.reserve(capability_registry_.size());
+            for (auto& weak : capability_registry_) {
+                if (auto sp = weak.lock()) live.push_back(std::move(sp));
+            }
+            capability_registry_.clear();
+        }
+        for (auto& sp : live) sp->cancel();
+    }
+
 private:
     std::string socket_path_;
     std::unique_ptr<::tbox::fw::ipc::Client> fw_client_;
@@ -700,6 +939,10 @@ private:
     // CR-014 §5: Cloud Ready 订阅句柄注册表（析构批量取消）
     std::vector<std::weak_ptr<SubscriptionHandle::Impl>> readiness_registry_;
     std::mutex readiness_mutex_;
+
+    // CR-015 §18.4: capability 订阅句柄注册表（析构批量取消）
+    std::vector<std::weak_ptr<SubscriptionHandle::Impl>> capability_registry_;
+    std::mutex capability_handle_mutex_;
 };
 
 // ============================================================
@@ -1035,6 +1278,30 @@ CloudReadinessSnapshot Client::getSubscriptionReadiness() {
 
 SubscriptionHandle Client::subscribeCloudReadinessChanged(CloudReadinessCallback callback) {
     auto impl = impl_->subscribeCloudReadiness(std::move(callback));
+    if (!impl) {
+        return SubscriptionHandle{};  // 参数非法：空句柄
+    }
+    return SubscriptionHandle(std::move(impl));
+}
+
+// ============================================================
+// CR-015 §18.4: Capability Readiness
+// ============================================================
+CapabilityReadiness Client::getCapabilityReadiness(std::string_view capability) {
+    std::string cap(capability);
+    if (cap.empty()) {
+        CapabilityReadiness r;
+        r.contract_supported = false;
+        r.reason_code = "invalid_capability";
+        return r;
+    }
+    return impl_->fetchCapabilityReadiness(cap);
+}
+
+SubscriptionHandle Client::subscribeCapabilityReadinessChanged(
+        std::string_view capability, CapabilityReadinessCallback callback) {
+    std::string cap(capability);
+    auto impl = impl_->subscribeCapabilityReadiness(cap, std::move(callback));
     if (!impl) {
         return SubscriptionHandle{};  // 参数非法：空句柄
     }

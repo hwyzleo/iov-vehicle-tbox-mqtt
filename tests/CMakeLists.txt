@@ -346,6 +346,7 @@ add_executable(test_owner_snapshot_registry
     unit/test_owner_snapshot_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_owner_snapshot_registry PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_owner_snapshot_registry GTest::gtest_main pthread)
@@ -355,6 +356,7 @@ add_executable(test_effective_subscription_table
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/effective_subscription_table.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_effective_subscription_table PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_effective_subscription_table GTest::gtest_main pthread)
@@ -427,6 +429,7 @@ add_executable(test_route_projection
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_route_projection PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_route_projection GTest::gtest_main pthread)
@@ -440,6 +443,7 @@ add_executable(test_route_publisher
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
@@ -456,6 +460,8 @@ add_executable(test_downlink_route_dispatcher
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/owner_snapshot_registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_downlink_route_dispatcher PRIVATE ${TEST_COMMON_INCLUDES})
@@ -473,6 +479,36 @@ target_include_directories(test_mqtt_route_projection PRIVATE ${TEST_COMMON_INCL
 target_link_directories(test_mqtt_route_projection PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
 target_link_libraries(test_mqtt_route_projection mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${MOSQUITTO_LIBRARIES} pthread)
 add_test(NAME MqttRouteProjectionTest COMMAND test_mqtt_route_projection)
+
+# ============================================================
+# CR-015: Keyprov Route 与 Capability Readiness 测试
+# ============================================================
+add_executable(test_subscription_catalog
+    unit/test_subscription_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
+)
+target_include_directories(test_subscription_catalog PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_subscription_catalog GTest::gtest_main pthread)
+add_test(NAME SubscriptionCatalogTest COMMAND test_subscription_catalog)
+
+add_executable(test_mqtt_client_capability
+    unit/test_mqtt_client_capability.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_client/src/mqtt_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_ipc_dispatcher.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_retry_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_log_adapter.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
+)
+target_include_directories(test_mqtt_client_capability PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
+target_link_libraries(test_mqtt_client_capability GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+add_test(NAME MqttClientCapabilityTest COMMAND test_mqtt_client_capability)
+
+add_executable(test_mqtt_keyprov_capability
+    integration/test_mqtt_keyprov_capability.cpp
+)
+target_include_directories(test_mqtt_keyprov_capability PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_mqtt_keyprov_capability mqtt_service_lib tbox_mqtt_client GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+add_test(NAME MqttKeyprovCapabilityIntegTest COMMAND test_mqtt_keyprov_capability)
 
 # ============================================================
 # Log tests (CR-003 §7)

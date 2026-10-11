@@ -1,5 +1,6 @@
-// TopicProjectionBuilder (CR-009 §2, §5)
+// TopicProjectionBuilder (CR-009 §2, §5; CR-015 §18.2)
 #include "topic_projection_builder.h"
+#include "subscription_catalog.h"
 #include <utility>
 
 namespace tbox {
@@ -24,7 +25,15 @@ std::shared_ptr<const EffectiveRouteTable> TopicProjectionBuilder::build(
     table->setIdentityGeneration(identity_gen);
 
     for (const auto& [owner, snap] : snapshots) {
+        const bool contract_supported =
+            (snap.contract_version == kSubscriptionCatalogContractVersion);
         for (const auto& item : snap.items) {
+            // CR-015 §18.2: enabled=false 等价 desired 中不存在
+            if (!item.enabled.value_or(true)) continue;
+            // CR-015: capability-gated route 仅在双方 contract 兼容时进入投影
+            const bool capability = !item.readiness_scope.empty();
+            if (capability && !contract_supported) continue;
+
             ResolvedRoute route;
             route.definition.key.owner = owner;
             route.definition.key.route_id = item.route_id;
@@ -35,8 +44,17 @@ std::shared_ptr<const EffectiveRouteTable> TopicProjectionBuilder::build(
             route.definition.direction = item.direction;
             route.definition.qos = item.qos;
             route.definition.target = item.target;
-            route.definition.mandatory = item.mandatory;
+            route.definition.mandatory =
+                (item.criticality == SubscriptionCriticality::GLOBAL_MANDATORY);
             route.definition.snapshot_generation = snap.generation;
+            route.definition.readiness_scope = item.readiness_scope;  // CR-015
+            route.definition.criticality = item.criticality;          // CR-015
+            route.definition.enabled = item.enabled.value_or(true);   // CR-015
+            // CR-015: catalog-governed route 的上行不持久化约束
+            const CatalogEntry* entry =
+                SubscriptionCatalog::instance().lookup(owner, item.route_id);
+            route.definition.persist_offline = (entry != nullptr)
+                ? entry->persist_offline : true;
             route.identity_generation = identity_gen;
 
             if (!identity_valid) {

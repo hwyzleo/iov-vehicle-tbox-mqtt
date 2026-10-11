@@ -79,6 +79,16 @@ public:
     uint32_t mandatoryActive() const;
     uint32_t mandatoryTotal() const;
 
+    /// CR-015: 指定 capability scope 的下行 topic 是否全部 ACTIVE
+    /// 无该 scope 的 topic 时返回 true（空集视为就绪；但 enabled/contract 由上层判定）。
+    bool capabilityConverged(const std::string& readiness_scope) const;
+
+    /// CR-015: 指定 capability scope 是否存在 desired 下行 topic
+    bool hasCapability(const std::string& readiness_scope) const;
+
+    /// CR-015: 指定 capability scope 是否存在 SUBACK 失败/拒绝的 topic
+    bool capabilityRejected(const std::string& readiness_scope) const;
+
     /// 当前 ACTIVE 的 topic->qos（供 manifest 持久化）
     std::map<std::string, uint8_t> activeTopics() const;
 
@@ -93,6 +103,8 @@ private:
         uint32_t retries = 0;
         uint64_t reconcile_generation = 0;
         std::chrono::steady_clock::time_point last_attempt;
+        // CR-015: capability scope（空=全局）
+        std::string readiness_scope;
     };
 
     void sendSubscribe(const std::string& topic, uint8_t qos, uint64_t gen);
@@ -105,7 +117,8 @@ private:
     uint32_t suback_retry_max_ = 3;
 
     std::map<std::string, TopicState> topics_;
-    std::set<std::string> mandatory_topics_;  // 当前 desired 的 mandatory 集合
+    std::set<std::string> mandatory_topics_;  // 当前 desired 的全局 mandatory 集合
+    std::set<std::string> capability_scopes_;  // CR-015: desired 中出现的 capability scope
     uint64_t reconcile_generation_ = 0;
 };
 

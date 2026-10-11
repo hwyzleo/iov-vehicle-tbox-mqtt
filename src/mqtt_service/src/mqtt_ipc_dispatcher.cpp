@@ -69,6 +69,30 @@ std::string cloudReadinessToJson(const CloudReadinessSnapshot& r) {
     j["owner_generations"] = gens;
     j["mandatory_count"] = r.mandatory_count;
     j["mandatory_active"] = r.mandatory_active;
+    // CR-015 §18.3: capability map（空时仍输出空对象）
+    nlohmann::json caps = nlohmann::json::object();
+    for (const auto& [cap, cr] : r.capabilities) {
+        caps[cap] = nlohmann::json::parse(capabilityReadinessToJson(cr));
+    }
+    j["capabilities"] = caps;
+    return j.dump();
+}
+
+std::string capabilityReadinessToJson(const CapabilityReadiness& r) {
+    nlohmann::json j;
+    j["capability"] = r.capability;
+    j["enabled"] = r.enabled;
+    j["contract_supported"] = r.contract_supported;
+    j["snapshot_accepted"] = r.snapshot_accepted;
+    j["uplink_ready"] = r.uplink_ready;
+    j["downlink_suback_ready"] = r.downlink_suback_ready;
+    j["ready"] = r.ready;
+    j["owner_generation"] = r.owner_generation;
+    j["connection_generation"] = r.connection_generation;
+    j["cert_session_generation"] = r.cert_session_generation;
+    j["reason_code"] = r.reason_code;
+    j["event_sequence"] = r.event_sequence;
+    j["contract_version"] = kCapabilityReadinessContractVersion;
     return j.dump();
 }
 
@@ -130,6 +154,13 @@ std::string MqttIpcDispatcher::dispatch(uint32_t method_id,
             // CR-014 §5: Cloud Ready 事件订阅
             case ipc::MethodId::SUBSCRIBE_CLOUD_READINESS:
                 result = handleSubscribeCloudReadiness(client_fd);
+                break;
+            // CR-015 §18.4: capability readiness
+            case ipc::MethodId::GET_CAPABILITY_READINESS:
+                result = handleGetCapabilityReadiness(params_json);
+                break;
+            case ipc::MethodId::SUBSCRIBE_CAPABILITY_READINESS:
+                result = handleSubscribeCapabilityReadiness(params_json, client_fd);
                 break;
             default:
                 MqttLogAdapter::ipc().warn(
@@ -211,6 +242,20 @@ void MqttIpcDispatcher::onClientDisconnected(int client_fd) {
                 if (oit->second.empty()) routed_owner_fds_.erase(oit);
             }
             fd_routed_owner_.erase(fit);
+        }
+    }
+    // CR-015 §18.3: 清理 capability fd->capability 注册表
+    {
+        std::lock_guard<std::mutex> clock(capability_mutex_);
+        auto fit = fd_capability_.find(client_fd);
+        if (fit != fd_capability_.end()) {
+            const std::string& capability = fit->second;
+            auto oit = capability_fds_.find(capability);
+            if (oit != capability_fds_.end()) {
+                oit->second.erase(client_fd);
+                if (oit->second.empty()) capability_fds_.erase(oit);
+            }
+            fd_capability_.erase(fit);
         }
     }
 }
@@ -382,6 +427,7 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleReplaceSubscriptionSnap
     snapshot.generation = j.value("generation", 0ULL);
     snapshot.content_digest = j.value("content_digest", "");
     snapshot.registration_complete = j.value("registration_complete", false);
+    snapshot.contract_version = j.value("contract_version", 0u);
     if (j.contains("items") && j["items"].is_array()) {
         for (const auto& it : j["items"]) {
             SubscriptionItem item;
@@ -392,6 +438,13 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleReplaceSubscriptionSnap
             item.qos = static_cast<uint8_t>(it.value("qos", 1));
             item.target = it.value("target", "");
             item.mandatory = it.value("mandatory", false);
+            // CR-015: enabled 缺省语义区分 route 类型（缺失时不在此处定值，由 registry 归一化）
+            if (it.contains("enabled") && it["enabled"].is_boolean()) {
+                item.enabled = it["enabled"].get<bool>();
+            }
+            item.readiness_scope = it.value("readiness_scope", "");
+            std::string crit = it.value("criticality", "");
+            subscriptionCriticalityFromString(crit, item.criticality);
             snapshot.items.push_back(std::move(item));
         }
     }
@@ -509,6 +562,10 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handlePublishRoute(
     nlohmann::json resp;
     resp["accepted"] = result.accepted;
     resp["outcome"] = result.accepted ? "accepted" : "rejected";
+    if (!result.reason_code.empty()) {
+        resp["reason_code"] = result.reason_code;
+        resp["retryable"] = result.retryable;
+    }
     return {result.error.has_value() ? static_cast<int32_t>(result.error.value()) : 0,
             resp.dump()};
 }
@@ -564,6 +621,13 @@ std::vector<int> MqttIpcDispatcher::getRoutedFdsForOwner(const std::string& owne
     return std::vector<int>(it->second.begin(), it->second.end());
 }
 
+std::vector<int> MqttIpcDispatcher::getCapabilityFds(const std::string& capability) const {
+    std::lock_guard<std::mutex> lock(capability_mutex_);
+    auto it = capability_fds_.find(capability);
+    if (it == capability_fds_.end()) return {};
+    return std::vector<int>(it->second.begin(), it->second.end());
+}
+
 // ============================================================
 // CR-014 §5: Cloud Ready 事件订阅 handler
 // ============================================================
@@ -574,6 +638,65 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handleSubscribeCloudReadiness
         "mqtt.ipc.cloud_readiness_subscribed",
         "Cloud Ready event channel subscribed",
         {tbox::fw::log::Field("peer", tbox::fw::log::FieldValue::makeInt(client_fd)),
+         tbox::fw::log::Field("ok", tbox::fw::log::FieldValue::makeBool(ok))}
+    );
+
+    nlohmann::json resp;
+    resp["ok"] = ok;
+    return {status, resp.dump()};
+}
+
+// ============================================================
+// CR-015 §18.4: capability readiness handler
+// ============================================================
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleGetCapabilityReadiness(
+        std::string_view params) {
+    std::string capability;
+    try {
+        auto j = nlohmann::json::parse(params);
+        capability = j.value("capability", "");
+    } catch (...) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004),
+                nlohmann::json({{"error", "Invalid params"}}).dump()};
+    }
+    if (capability.empty()) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004),
+                nlohmann::json({{"error", "Missing capability"}}).dump()};
+    }
+    auto r = service_->onGetCapabilityReadiness(capability);
+    return {0, capabilityReadinessToJson(r)};
+}
+
+std::pair<int32_t, std::string> MqttIpcDispatcher::handleSubscribeCapabilityReadiness(
+        std::string_view params, int client_fd) {
+    std::string capability;
+    try {
+        auto j = nlohmann::json::parse(params);
+        capability = j.value("capability", "");
+    } catch (...) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004),
+                nlohmann::json({{"ok", false}, {"error", "Invalid params"}}).dump()};
+    }
+    if (capability.empty()) {
+        return {static_cast<int32_t>(ErrorCode::MQTT_1004),
+                nlohmann::json({{"ok", false}, {"error", "Missing capability"}}).dump()};
+    }
+
+    // 登记 fd<->capability（daemon 按 capability 定向推送，CR-015 §18.3）
+    {
+        std::lock_guard<std::mutex> lock(capability_mutex_);
+        fd_capability_[client_fd] = capability;
+        capability_fds_[capability].insert(client_fd);
+    }
+
+    auto [status, ok] = service_->onSubscribeCapabilityReadinessEventChannel(
+        capability, client_fd);
+
+    MqttLogAdapter::ipc().info(
+        "mqtt.ipc.capability_readiness_subscribed",
+        "Capability readiness event channel subscribed",
+        {tbox::fw::log::Field("peer", tbox::fw::log::FieldValue::makeInt(client_fd)),
+         tbox::fw::log::Field("capability", tbox::fw::log::FieldValue::makeString(capability)),
          tbox::fw::log::Field("ok", tbox::fw::log::FieldValue::makeBool(ok))}
     );
 

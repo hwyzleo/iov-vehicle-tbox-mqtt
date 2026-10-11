@@ -18,6 +18,10 @@ namespace mqtt {
 /// daemon 的快照查询响应与 CLOUD_READY_CHANGED 事件共用此实现，保证字段集一致。
 std::string cloudReadinessToJson(const CloudReadinessSnapshot& snapshot);
 
+/// CR-015: 序列化 CapabilityReadiness 为 IPC 契约 JSON。
+/// 查询响应与 CAPABILITY_READINESS_CHANGED 事件共用，字段集一致。
+std::string capabilityReadinessToJson(const CapabilityReadiness& readiness);
+
 class MqttService;
 
 /// MqttIpcDispatcher 依赖的业务接口 (CR-004 §3)
@@ -58,6 +62,20 @@ public:
             const std::string& owner, uint64_t generation) = 0;
         /// getSubscriptionReadiness：Cloud Ready 诊断
         virtual CloudReadinessSnapshot onGetSubscriptionReadiness() = 0;
+        // ---- CR-015 §18.4: capability readiness ----
+        /// getCapabilityReadiness：查询 capability-scoped readiness
+        /// 默认实现返回空状态（便于既有 stub 不破纲）。
+        virtual CapabilityReadiness onGetCapabilityReadiness(
+            const std::string& capability) {
+            CapabilityReadiness r;
+            r.capability = capability;
+            return r;
+        }
+        /// 登记 fd 到 capability 事件通道（默认实现返回成功）
+        virtual std::pair<int32_t, bool> onSubscribeCapabilityReadinessEventChannel(
+            const std::string& capability, int client_fd) {
+            (void)capability; (void)client_fd; return {0, true};
+        }
         // ---- CR-009 §6.1: route-based 发布 ----
         /// publishRoute：按 owner/route_id 发布
         virtual PublishResult onPublishRoute(const RoutePublishRequest& req) = 0;
@@ -90,6 +108,9 @@ public:
     /// CR-010 §3: 查询 owner 的活跃 routed 订阅 fd 列表（daemon 按 owner 定向推送）
     std::vector<int> getRoutedFdsForOwner(const std::string& owner) const;
 
+    /// CR-015 §18.3: 查询 capability 的活跃订阅 fd 列表（daemon 按 capability 定向推送）
+    std::vector<int> getCapabilityFds(const std::string& capability) const;
+
     /// 查询 msg_id 是否已被受理（去重，CR-004 §5.2）
     bool isAccepted(const std::string& msg_id) const;
 
@@ -112,6 +133,9 @@ private:
     std::pair<int32_t, std::string> handleSubscribeRoutedDownlink(std::string_view params, int client_fd);
     // CR-014 §5
     std::pair<int32_t, std::string> handleSubscribeCloudReadiness(int client_fd);
+    // CR-015 §18.4
+    std::pair<int32_t, std::string> handleGetCapabilityReadiness(std::string_view params);
+    std::pair<int32_t, std::string> handleSubscribeCapabilityReadiness(std::string_view params, int client_fd);
 
     // per-fd 订阅集合（client 断连时清理，CR-004 §4）
     std::map<int, std::unordered_set<std::string>> fd_subscriptions_;
@@ -121,6 +145,11 @@ private:
     std::unordered_map<int, std::string> fd_routed_owner_;
     std::unordered_map<std::string, std::unordered_set<int>> routed_owner_fds_;
     mutable std::mutex routed_mutex_;
+
+    // CR-015 §18.3: capability fd<->capability 注册表（daemon 按 capability 定向推送）
+    std::unordered_map<int, std::string> fd_capability_;
+    std::unordered_map<std::string, std::unordered_set<int>> capability_fds_;
+    mutable std::mutex capability_mutex_;
 
     // msg_id 去重表（进程生命周期内，accepted 状态，CR-004 §5.2）
     std::unordered_set<std::string> accepted_msg_ids_;

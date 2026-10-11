@@ -126,12 +126,16 @@ enum class PublishOutcome {
     UNKNOWN
 };
 
-/// publish 结果 (CR-004 §5.2, §7.1)
+/// publish 结果 (CR-004 §5.2, §7.1; CR-015 §18.4)
 /// accepted 仅表示 daemon 已接管，不表示 Broker 已 PUBACK。
+/// CR-015: reason_code 为稳定脱敏原因（如 KEYPROV_PAYLOAD_TOO_LARGE），
+/// 供调用方与指标按 reason 聚合；不含身份/Topic/payload。
 struct PublishResult {
     bool accepted = false;
     PublishOutcome outcome = PublishOutcome::ACCEPTED;
     std::optional<ErrorCode> error;
+    std::string reason_code;   // CR-015：稳定原因码（可为空）
+    bool retryable = true;     // CR-015：是否可安全重试（长度/格式门禁失败为 false）
 };
 
 // ============================================================
@@ -246,7 +250,60 @@ inline bool snapshotDirectionFromString(std::string_view s, SnapshotDirection& o
     return false;
 }
 
-/// 单条业务订阅项 (CR-007 §3; TSP DSN-CR-004 §3)
+/// 订阅关键等级 (DSN-CR-015 §3, §18.3)
+/// - OPTIONAL: 非必需，不参与任何 readiness 门禁
+/// - GLOBAL_MANDATORY: 进入共享 Cloud Ready 的全局必需下行
+/// - CAPABILITY_MANDATORY: 绑定到具体 capability scope，只影响该 capability readiness
+enum class SubscriptionCriticality : uint8_t {
+    OPTIONAL            = 0,
+    GLOBAL_MANDATORY    = 1,
+    CAPABILITY_MANDATORY = 2
+};
+
+inline std::string subscriptionCriticalityToString(SubscriptionCriticality c) {
+    switch (c) {
+        case SubscriptionCriticality::OPTIONAL:             return "OPTIONAL";
+        case SubscriptionCriticality::GLOBAL_MANDATORY:     return "GLOBAL_MANDATORY";
+        case SubscriptionCriticality::CAPABILITY_MANDATORY: return "CAPABILITY_MANDATORY";
+        default: return "OPTIONAL";
+    }
+}
+
+inline bool subscriptionCriticalityFromString(std::string_view s,
+                                              SubscriptionCriticality& out) {
+    if (s == "OPTIONAL")             { out = SubscriptionCriticality::OPTIONAL; return true; }
+    if (s == "GLOBAL_MANDATORY")     { out = SubscriptionCriticality::GLOBAL_MANDATORY; return true; }
+    if (s == "CAPABILITY_MANDATORY") { out = SubscriptionCriticality::CAPABILITY_MANDATORY; return true; }
+    return false;
+}
+
+/// CR-015 SubscriptionCatalog 契约版本；catalog-governed route 需要双方一致
+constexpr uint32_t kSubscriptionCatalogContractVersion = 1;
+
+/// CR-015 capability: 安全 keyprov 能力名（同时作为 readiness_scope 值）
+constexpr const char* kCapabilitySecurityKeyprov = "security.keyprov";
+
+/// CR-015 catalog-governed route id
+constexpr const char* kKeyprovUplinkRouteId   = "keyprov.uplink";
+constexpr const char* kKeyprovDownlinkRouteId = "keyprov.downlink";
+
+/// CR-015 keyprov payload 上限（上下行一致，PAR-PROTO-DSN-CR-006）
+constexpr size_t kKeyprovMaxPayloadBytes = 16 * 1024;
+
+/// CR-015 稳定 reason code（脱敏，不含身份/Topic/payload）
+namespace capability_reason {
+constexpr const char* kKeyprovDisabled          = "KEYPROV_DISABLED";
+constexpr const char* kKeyprovContractUnsupported = "KEYPROV_CONTRACT_UNSUPPORTED";
+constexpr const char* kKeyprovSnapshotRejected  = "KEYPROV_SNAPSHOT_REJECTED";
+constexpr const char* kKeyprovSubscribePending  = "KEYPROV_SUBSCRIBE_PENDING";
+constexpr const char* kKeyprovSubackRejected    = "KEYPROV_SUBACK_REJECTED";
+constexpr const char* kKeyprovTopicNotAuthorized = "KEYPROV_TOPIC_NOT_AUTHORIZED";
+constexpr const char* kKeyprovGenerationStale   = "KEYPROV_GENERATION_STALE";
+constexpr const char* kKeyprovPayloadTooLarge   = "KEYPROV_PAYLOAD_TOO_LARGE";
+constexpr const char* kKeyprovDownlinkBackpressure = "KEYPROV_DOWNLINK_BACKPRESSURE";
+} // namespace capability_reason
+
+/// 单条业务订阅项 (CR-007 §3; TSP DSN-CR-004 §3; CR-015 §3)
 struct SubscriptionItem {
     std::string route_id;        // owner 内稳定唯一
     std::string topic_template;  // 保存模板，不固化设备实例值（{ecu_uid} 占位）
@@ -254,14 +311,26 @@ struct SubscriptionItem {
     uint8_t qos = 1;             // 0/1/2
     std::string target;          // 目标处理器，如 tsp.fota
     bool mandatory = false;
+    // ---- CR-015 ----
+    // enabled 语义与 route 类型相关（DSN-CR-015 §4, §18.2）：
+    // - legacy route: nullopt 解释为 enabled=true（保持兼容）
+    // - capability-gated route: nullopt 解释为 enabled=false（必须显式开启）
+    std::optional<bool> enabled;
+    // readiness_scope: 空=全局（进入共享 Cloud Ready）；非空=capability scope
+    // catalog-governed route 由 catalog 权威覆盖，不接受调用方伪造
+    std::string readiness_scope;
+    SubscriptionCriticality criticality = SubscriptionCriticality::OPTIONAL;
 };
 
-/// 完整版本化订阅快照 (CR-007 §3; TSP DSN-CR-004 §3)
+/// 完整版本化订阅快照 (CR-007 §3; TSP DSN-CR-004 §3; CR-015 §3)
 struct OwnerSubscriptionSnapshot {
     std::string owner;                       // 稳定服务身份，如 "tsp"
     uint64_t generation = 0;                 // 集合语义变化时单调递增
     std::string content_digest;              // 规范化集合摘要（owner 生成, SHA-256 hex）
     bool registration_complete = false;      // 是否包含全部 Mandatory 项
+    // CR-015: catalog/contract 版本；catalog-governed route 需要 == kSubscriptionCatalogContractVersion
+    // 缺失(0)/未知/不支持时 catalog route 不得激活，返回 KEYPROV_CONTRACT_UNSUPPORTED
+    uint32_t contract_version = 0;
     std::vector<SubscriptionItem> items;
 };
 
@@ -304,6 +373,32 @@ struct SnapshotStatusResult {
 /// UNSUPPORTED_CONTRACT_VERSION，不得伪造空证书身份后宣告可用。
 constexpr uint32_t kCloudReadinessContractVersion = 2;
 
+/// Capability Readiness 契约版本 (DSN-CR-015 §18.4)
+constexpr uint32_t kCapabilityReadinessContractVersion = 1;
+
+/// Capability-scoped readiness 状态 (DSN-CR-015 §3, §18.3)
+///
+/// keyprov 属于 CAPABILITY_MANDATORY(security.keyprov)，不进入共享 Cloud Ready。
+/// ready = cloud_ready && enabled && contract_supported && snapshot_accepted
+///         && uplink_ready && downlink_suback_ready。
+struct CapabilityReadiness {
+    std::string capability;              // 如 security.keyprov
+    bool enabled = false;                // TSP 显式开启
+    bool contract_supported = false;     // 双方 contract_version 兼容
+    bool snapshot_accepted = false;      // 携带该 capability 的快照已被本地接受
+    bool uplink_ready = false;           // 上行 route 已投影 ACTIVE
+    bool downlink_suback_ready = false;  // 下行 SUBACK 已就绪
+    bool ready = false;                  // 综合能力就绪
+    uint64_t owner_generation = 0;       // 提交快照的 owner generation
+    uint64_t connection_generation = 0;  // 当前连接 generation
+    uint64_t cert_session_generation = 0; // 本次 TLS 会话 generation
+    std::string reason_code;             // 非 ready 原因（KEYPROV_* 等）
+    uint64_t event_sequence = 0;         // capability 事件序列（单调递增）
+};
+
+/// Capability Readiness 事件回调 (DSN-CR-015 §18.3)
+using CapabilityReadinessCallback = std::function<void(const CapabilityReadiness&)>;
+
 /// Cloud Readiness 权威快照 (DSN-CR-014 §3, §5, §12.5)
 ///
 /// 由 MQTT daemon 生成，client 只读。cloud_ready 与本次 TLS context 实际装载的
@@ -331,6 +426,8 @@ struct CloudReadinessSnapshot {
     // ---- CR-014 §7: 契约版本兼容 ----
     uint32_t contract_version = 0;          // daemon 声明的契约版本（0=旧 daemon 未提供）
     bool contract_supported = true;         // false = UNSUPPORTED_CONTRACT_VERSION
+    // ---- CR-015 §18.3: capability readiness map（与独立查询读取同一原子状态）----
+    std::map<std::string, CapabilityReadiness> capabilities;
 };
 
 /// 源兼容别名：既有调用方仍可使用 SubscriptionReadiness。

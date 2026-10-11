@@ -194,6 +194,9 @@ private:
     void reconcileSubscriptions();
     void evaluateCloudReadiness();
     void publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot);
+    // CR-015: capability readiness 刷新与事件发布
+    void refreshCapabilityReadiness();
+    void publishCapabilityEvent(const CapabilityReadiness& readiness);
     void refreshUpstreamRoutes();
     void checkStartupGate();
 
@@ -204,6 +207,10 @@ private:
         const std::string& owner, int client_fd) override;
     // ---- CR-014 §5: Cloud Ready 事件订阅 ----
     std::pair<int32_t, bool> onSubscribeCloudReadinessEventChannel(int client_fd) override;
+    // ---- CR-015 §18.4: capability readiness ----
+    CapabilityReadiness onGetCapabilityReadiness(const std::string& capability) override;
+    std::pair<int32_t, bool> onSubscribeCapabilityReadinessEventChannel(
+        const std::string& capability, int client_fd) override;
 };
 
 } // namespace mqtt

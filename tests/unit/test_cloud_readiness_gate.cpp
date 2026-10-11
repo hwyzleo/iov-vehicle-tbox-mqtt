@@ -167,3 +167,103 @@ TEST(CloudReadinessGateTest, NewSessionMustReconvergeBeforeReady) {
     EXPECT_TRUE(gate.isCloudReady());
     EXPECT_EQ(gate.getReadiness().cert_session_generation, 2u);
 }
+
+// ============================================================
+// CR-015 §18.3: capability-scoped readiness
+// ============================================================
+
+TEST(CloudReadinessGateTest, CapabilityReadyIndependentOfGlobal) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);          // 全局 GLOBAL_MANDATORY 就绪
+    gate.setCapabilityState(kCapabilitySecurityKeyprov,
+                            /*enabled=*/true, /*contract=*/true,
+                            /*snapshot=*/true, /*uplink=*/true, /*owner_gen=*/3);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, true);
+    auto c = gate.getCapabilityReadiness(kCapabilitySecurityKeyprov);
+    EXPECT_TRUE(c.ready);
+    EXPECT_EQ(c.owner_generation, 3u);
+    EXPECT_EQ(c.connection_generation, 1u);
+    EXPECT_EQ(c.reason_code, "READY");
+    EXPECT_TRUE(c.contract_supported);
+}
+
+TEST(CloudReadinessGateTest, CapabilityEnabledButNoSubackNotReady) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, true, true, true, true, 3);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, false);
+    auto c = gate.getCapabilityReadiness(kCapabilitySecurityKeyprov);
+    EXPECT_FALSE(c.ready);
+    EXPECT_FALSE(c.downlink_suback_ready);
+    EXPECT_EQ(c.reason_code, capability_reason::kKeyprovSubscribePending);
+}
+
+TEST(CloudReadinessGateTest, CapabilityDisabledReason) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, false, true, false, false, 0);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, false);
+    auto c = gate.getCapabilityReadiness(kCapabilitySecurityKeyprov);
+    EXPECT_FALSE(c.ready);
+    EXPECT_EQ(c.reason_code, capability_reason::kKeyprovDisabled);
+}
+
+TEST(CloudReadinessGateTest, CapabilityContractUnsupportedReason) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, true, false, true, true, 5);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, true);
+    auto c = gate.getCapabilityReadiness(kCapabilitySecurityKeyprov);
+    EXPECT_FALSE(c.ready);
+    EXPECT_EQ(c.reason_code, capability_reason::kKeyprovContractUnsupported);
+}
+
+TEST(CloudReadinessGateTest, KeyprovFailureDoesNotDropGlobalReady) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, true, true, true, true, 2);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, false);
+    // 全局 Cloud Ready 不受 keyprov capability 失败影响 (DSN-CR-015 §18.3)
+    EXPECT_TRUE(gate.isCloudReady());
+    EXPECT_FALSE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+}
+
+TEST(CloudReadinessGateTest, CapabilityEventSequenceAndSnapshotMap) {
+    CloudReadinessGate gate;
+    std::vector<CapabilityReadiness> events;
+    gate.setCapabilityCallback([&](const CapabilityReadiness& c) { events.push_back(c); });
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, true, true, true, true, 4);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, true);
+
+    ASSERT_FALSE(events.empty());
+    uint64_t prev = 0;
+    for (const auto& e : events) {
+        EXPECT_GT(e.event_sequence, prev);
+        prev = e.event_sequence;
+    }
+    // 全局快照包含 capability map，且与独立查询一致
+    auto snap = gate.getReadiness();
+    ASSERT_EQ(snap.capabilities.count(kCapabilitySecurityKeyprov), 1u);
+    EXPECT_EQ(snap.capabilities.at(kCapabilitySecurityKeyprov).event_sequence,
+              gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).event_sequence);
+}
+
+TEST(CloudReadinessGateTest, CapabilityLosesReadyOnDisconnect) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.onSubscriptionsReady(true, 1, 1);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, true, true, true, true, 2);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, true);
+    ASSERT_TRUE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+
+    gate.onConnectionState(ConnectionState::RECONNECTING, 1);
+    EXPECT_FALSE(gate.isCloudReady());
+    EXPECT_FALSE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+}

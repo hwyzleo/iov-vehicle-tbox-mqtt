@@ -42,7 +42,15 @@ EffectiveSubscriptionTable::recompute(const OwnerSnapshotRegistry& registry) {
     }
 
     for (const auto& [owner, snap] : all) {
+        const bool contract_supported =
+            (snap.contract_version == kSubscriptionCatalogContractVersion);
         for (const auto& item : snap.items) {
+            // CR-015 §18.2: enabled=false 等价 desired 中不存在
+            if (!item.enabled.value_or(true)) continue;
+            // CR-015: capability-gated route 仅在双方 contract 兼容时进入 desired projection
+            const bool capability = !item.readiness_scope.empty();
+            if (capability && !contract_supported) continue;
+
             // 展开模板（ecu_uid 为空时保留占位，reconciler 会因无法订阅而失败）
             std::string topic = item.topic_template;
             const std::string placeholder = "{ecu_uid}";
@@ -61,10 +69,15 @@ EffectiveSubscriptionTable::recompute(const OwnerSnapshotRegistry& registry) {
                     eff.expanded_topic = topic;
                     eff.topic_template = item.topic_template;
                     eff.effective_qos = item.qos;
+                    eff.readiness_scope = item.readiness_scope;
+                    eff.criticality = item.criticality;
                 } else {
                     eff.effective_qos = std::max(eff.effective_qos, item.qos);
                 }
-                eff.mandatory = eff.mandatory || item.mandatory;
+                // 仅 GLOBAL_MANDATORY 计入共享 Cloud Ready（CR-015 §18.3）
+                if (item.criticality == SubscriptionCriticality::GLOBAL_MANDATORY) {
+                    eff.mandatory = true;
+                }
                 eff.owners.insert(owner);
                 eff.targets.push_back({owner, item.target, item.route_id});
             }
@@ -103,6 +116,15 @@ uint32_t EffectiveSubscriptionTable::mandatoryCount() const {
     uint32_t count = 0;
     for (const auto& [topic, eff] : *downstream_) {
         if (eff.mandatory) ++count;
+    }
+    return count;
+}
+
+uint32_t EffectiveSubscriptionTable::capabilityCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint32_t count = 0;
+    for (const auto& [topic, eff] : *downstream_) {
+        if (!eff.readiness_scope.empty()) ++count;
     }
     return count;
 }

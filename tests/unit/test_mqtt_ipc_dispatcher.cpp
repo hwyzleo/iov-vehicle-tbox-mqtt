@@ -59,9 +59,11 @@ public:
     ReplaceSnapshotResult last_snapshot_result;
     SnapshotStatusResult last_snapshot_status;
     SubscriptionReadiness last_readiness;
+    OwnerSubscriptionSnapshot last_snapshot;
 
     ReplaceSnapshotResult onReplaceSubscriptionSnapshot(
-        const OwnerSubscriptionSnapshot&) override {
+        const OwnerSubscriptionSnapshot& s) override {
+        last_snapshot = s;
         return last_snapshot_result;
     }
     SnapshotStatusResult onGetSubscriptionSnapshotStatus(
@@ -73,6 +75,16 @@ public:
     }
     PublishResult onPublishRoute(const RoutePublishRequest&) override {
         return PublishResult{};
+    }
+
+    // CR-015 §18.4 stub
+    CapabilityReadiness last_capability_readiness;
+    std::string last_capability_query;
+    CapabilityReadiness onGetCapabilityReadiness(const std::string& capability) override {
+        last_capability_query = capability;
+        CapabilityReadiness r = last_capability_readiness;
+        r.capability = capability;
+        return r;
     }
 };
 
@@ -260,4 +272,82 @@ TEST_F(MqttIpcDispatcherTest, PublishBase64PayloadDecoded) {
         makePublishJson("msg-payload", "test/topic", 1, "AQID"), 100);
 
     EXPECT_EQ(handler.last_publish_env.payload, (std::vector<uint8_t>{0x01, 0x02, 0x03}));
+}
+
+// ============================================================
+// CR-015 §18.2/§18.4: snapshot 新字段解析 + capability handlers
+// ============================================================
+
+TEST_F(MqttIpcDispatcherTest, ReplaceSnapshotParsesCapabilityFields) {
+    json j;
+    j["owner"] = "tsp";
+    j["generation"] = 7;
+    j["content_digest"] = "d7";
+    j["registration_complete"] = true;
+    j["contract_version"] = kSubscriptionCatalogContractVersion;
+    json items = json::array();
+    json item;
+    item["route_id"] = kKeyprovDownlinkRouteId;
+    item["topic_template"] = "";
+    item["direction"] = "DOWN";
+    item["qos"] = 1;
+    item["enabled"] = true;
+    item["readiness_scope"] = kCapabilitySecurityKeyprov;
+    item["criticality"] = "CAPABILITY_MANDATORY";
+    items.push_back(item);
+    j["items"] = items;
+    handler.last_snapshot_result.status = SnapshotAcceptStatus::ACCEPTED;
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::REPLACE_SUBSCRIPTION_SNAPSHOT), j.dump(), 700);
+
+    EXPECT_EQ(handler.last_snapshot.contract_version, kSubscriptionCatalogContractVersion);
+    ASSERT_EQ(handler.last_snapshot.items.size(), 1u);
+    const auto& parsed = handler.last_snapshot.items[0];
+    ASSERT_TRUE(parsed.enabled.has_value());
+    EXPECT_TRUE(parsed.enabled.value());
+    EXPECT_EQ(parsed.readiness_scope, kCapabilitySecurityKeyprov);
+    EXPECT_EQ(parsed.criticality, SubscriptionCriticality::CAPABILITY_MANDATORY);
+}
+
+TEST_F(MqttIpcDispatcherTest, GetCapabilityReadiness) {
+    handler.last_capability_readiness.ready = true;
+    handler.last_capability_readiness.enabled = true;
+    handler.last_capability_readiness.reason_code = "READY";
+
+    json j;
+    j["capability"] = kCapabilitySecurityKeyprov;
+    auto resp = dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::GET_CAPABILITY_READINESS), j.dump(), 800);
+
+    auto parsed = json::parse(resp);
+    EXPECT_EQ(parsed["status"], 0);
+    EXPECT_EQ(handler.last_capability_query, kCapabilitySecurityKeyprov);
+    EXPECT_TRUE(parsed["ready"].get<bool>());
+    EXPECT_EQ(parsed["capability"], kCapabilitySecurityKeyprov);
+    EXPECT_EQ(parsed["contract_version"], kCapabilityReadinessContractVersion);
+}
+
+TEST_F(MqttIpcDispatcherTest, GetCapabilityReadinessMissingCapability) {
+    auto resp = dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::GET_CAPABILITY_READINESS), "{}", 800);
+    auto parsed = json::parse(resp);
+    EXPECT_EQ(parsed["status"], 1004);
+}
+
+TEST_F(MqttIpcDispatcherTest, SubscribeCapabilityReadinessRegistersFd) {
+    json j;
+    j["capability"] = kCapabilitySecurityKeyprov;
+    auto resp = dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_CAPABILITY_READINESS), j.dump(), 810);
+    auto parsed = json::parse(resp);
+    EXPECT_EQ(parsed["status"], 0);
+    EXPECT_TRUE(parsed["ok"].get<bool>());
+
+    auto fds = dispatcher->getCapabilityFds(kCapabilitySecurityKeyprov);
+    ASSERT_EQ(fds.size(), 1u);
+    EXPECT_EQ(fds[0], 810);
+
+    dispatcher->onClientDisconnected(810);
+    EXPECT_TRUE(dispatcher->getCapabilityFds(kCapabilitySecurityKeyprov).empty());
 }

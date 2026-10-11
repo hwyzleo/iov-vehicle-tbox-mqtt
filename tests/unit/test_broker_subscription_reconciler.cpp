@@ -168,3 +168,115 @@ TEST(BrokerSubscriptionReconcilerTest, ActiveTopicsForManifest) {
     EXPECT_EQ(active.size(), 1u);
     EXPECT_EQ(active["vehicle/x"], 1u);
 }
+
+// ============================================================
+// CR-015: capability-scoped 收敛与全局 mandatory 隔离
+// ============================================================
+
+namespace {
+std::shared_ptr<const std::map<std::string, EffectiveSubscription>>
+makeCapabilityDesired(const std::string& fota_topic, const std::string& keyprov_topic) {
+    auto m = std::make_shared<std::map<std::string, EffectiveSubscription>>();
+    EffectiveSubscription fota;
+    fota.expanded_topic = fota_topic; fota.topic_template = fota_topic;
+    fota.effective_qos = 1; fota.mandatory = true; fota.owners.insert("tsp");
+    EffectiveSubscription kp;
+    kp.expanded_topic = keyprov_topic; kp.topic_template = keyprov_topic;
+    kp.effective_qos = 1; kp.mandatory = false;
+    kp.readiness_scope = kCapabilitySecurityKeyprov;
+    kp.criticality = SubscriptionCriticality::CAPABILITY_MANDATORY;
+    kp.owners.insert("tsp");
+    (*m)[fota_topic] = fota;
+    (*m)[keyprov_topic] = kp;
+    return m;
+}
+}
+
+TEST(BrokerSubscriptionReconcilerTest, CapabilityConvergenceIndependentOfGlobal) {
+    FakeBrokerOps ops;
+    BrokerSubscriptionReconciler rec;
+    rec.setBrokerOperations(&ops);
+    auto desired = makeCapabilityDesired("vehicle/x/down/fota", "vehicle/x/down/keyprov");
+    rec.reconcile(desired, false, "c", 1);
+    EXPECT_TRUE(rec.hasCapability(kCapabilitySecurityKeyprov));
+    EXPECT_FALSE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    EXPECT_FALSE(rec.isConverged());
+
+    // FOTA 成功 -> 全局就绪，但 keyprov 仍未就绪
+    rec.onSubAck("vehicle/x/down/fota", true);
+    EXPECT_TRUE(rec.isConverged());
+    EXPECT_FALSE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    EXPECT_EQ(rec.mandatoryTotal(), 1u);  // keyprov 不计入全局 mandatory
+
+    // keyprov 成功 -> capability 就绪
+    rec.onSubAck("vehicle/x/down/keyprov", true);
+    EXPECT_TRUE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    EXPECT_TRUE(rec.isConverged());
+}
+
+TEST(BrokerSubscriptionReconcilerTest, CapabilityFailureDoesNotBreakGlobal) {
+    FakeBrokerOps ops;
+    BrokerSubscriptionReconciler rec;
+    rec.setBrokerOperations(&ops);
+    rec.setSubackRetryMax(0);
+    auto desired = makeCapabilityDesired("vehicle/x/down/fota", "vehicle/x/down/keyprov");
+    rec.reconcile(desired, false, "c", 1);
+    rec.onSubAck("vehicle/x/down/fota", true);
+    rec.onSubAck("vehicle/x/down/keyprov", false);  // keyprov SUBACK 失败
+    EXPECT_TRUE(rec.isConverged());                              // 全局不受影响
+    EXPECT_FALSE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    EXPECT_TRUE(rec.capabilityRejected(kCapabilitySecurityKeyprov));
+}
+
+TEST(BrokerSubscriptionReconcilerTest, KeyprovChangeDoesNotResubscribeFota) {
+    FakeBrokerOps ops;
+    auto dir = mkStore();
+    auto store = std::make_shared<hwyz::store::Store>(hwyz::store::Store::open("mqtt", dir));
+    AppliedSubscriptionManifestStore ms;
+    ms.setStore(store);
+    AppliedSubscriptionManifest m;
+    m.client_id_hash = "c_abc";
+    m.identity_generation = 1;
+    m.active_topics = {{"vehicle/x/down/fota", 1}, {"vehicle/x/down/keyprov", 1}};
+    ms.save(m);
+
+    BrokerSubscriptionReconciler rec;
+    rec.setBrokerOperations(&ops);
+    rec.setManifestStore(&ms);
+    auto desired = makeCapabilityDesired("vehicle/x/down/fota", "vehicle/x/down/keyprov");
+    auto r = rec.reconcile(desired, true, "c_abc", 1);
+    EXPECT_EQ(r.subscribe_count, 0);  // FOTA 与 keyprov 均不重建
+    EXPECT_EQ(r.unsubscribe_count, 0);
+    EXPECT_TRUE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    EXPECT_TRUE(rec.isConverged());
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BrokerSubscriptionReconcilerTest, CapabilityRemovedOnlyUnsubscribesKeyprov) {
+    FakeBrokerOps ops;
+    auto dir = mkStore();
+    auto store = std::make_shared<hwyz::store::Store>(hwyz::store::Store::open("mqtt", dir));
+    AppliedSubscriptionManifestStore ms;
+    ms.setStore(store);
+    AppliedSubscriptionManifest m;
+    m.client_id_hash = "c_abc";
+    m.identity_generation = 1;
+    m.active_topics = {{"vehicle/x/down/fota", 1}, {"vehicle/x/down/keyprov", 1}};
+    ms.save(m);
+
+    BrokerSubscriptionReconciler rec;
+    rec.setBrokerOperations(&ops);
+    rec.setManifestStore(&ms);
+    auto desired1 = makeCapabilityDesired("vehicle/x/down/fota", "vehicle/x/down/keyprov");
+
+    // 关闭 keyprov（desired 中无 keyprov），FOTA 保留
+    auto desired2 = std::make_shared<std::map<std::string, EffectiveSubscription>>();
+    (*desired2)["vehicle/x/down/fota"] = desired1->at("vehicle/x/down/fota");
+    auto r = rec.reconcile(desired2, true, "c_abc", 1);
+    EXPECT_EQ(r.unsubscribe_count, 1);
+    ASSERT_EQ(ops.unsubscribes.size(), 1u);
+    EXPECT_EQ(ops.unsubscribes[0], "vehicle/x/down/keyprov");
+    EXPECT_TRUE(rec.isConverged());
+    EXPECT_FALSE(rec.capabilityConverged(kCapabilitySecurityKeyprov));
+    std::filesystem::remove_all(dir);
+}

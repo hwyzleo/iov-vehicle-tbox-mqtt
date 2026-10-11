@@ -92,9 +92,14 @@ bool MqttDispatchQueue::enqueueRouted(const RoutedDownlinkEnvelope& event) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (queue_.size() >= max_size_) {
             dropped_.fetch_add(1);
+            // CR-015 §18.6: capability 下行背压使用稳定 reason，且不写磁盘重试队列。
+            const bool capability =
+                !event.readiness_scope.empty();
             MqttLogAdapter::router().warn(
                 "mqtt.downlink.route_failed",
-                "分发队列已满，route-based 下行消息被丢弃",
+                capability
+                    ? "分发队列已满，capability 下行消息被拒绝（不落盘）"
+                    : "分发队列已满，route-based 下行消息被丢弃",
                 {{"route_id_hash", tbox::fw::log::FieldValue::makeString(
                      topicTemplate(event.key.route_id))},
                  {"payload_size", tbox::fw::log::FieldValue::makeInt(
@@ -103,7 +108,12 @@ bool MqttDispatchQueue::enqueueRouted(const RoutedDownlinkEnvelope& event) {
                      static_cast<int64_t>(queue_.size()))},
                  {"queue_capacity", tbox::fw::log::FieldValue::makeInt(
                      static_cast<int64_t>(max_size_))},
-                 {"reason", tbox::fw::log::FieldValue::makeString("dispatch_queue_full")},
+                 {"reason", tbox::fw::log::FieldValue::makeString(
+                     capability ? capability_reason::kKeyprovDownlinkBackpressure
+                                : "dispatch_queue_full")},
+                 {"reason_code", tbox::fw::log::FieldValue::makeString(
+                     capability ? capability_reason::kKeyprovDownlinkBackpressure
+                                : "dispatch_queue_full")},
                  {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1007")}}
             );
             return false;

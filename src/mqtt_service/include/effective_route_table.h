@@ -29,6 +29,7 @@ struct DownlinkRouteRef {
     std::string target;     // 目标处理器，如 tsp.fota
     uint8_t qos = 1;
     bool mandatory = false;
+    std::string readiness_scope;  // CR-015: 空=全局；非空=capability scope
 };
 
 class TopicProjectionBuilder;

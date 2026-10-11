@@ -1,4 +1,4 @@
-// CloudReadinessGate (CR-007 §2, §10; CR-014 §3, §4.2, §12.5)
+// CloudReadinessGate (CR-007 §2, §10; CR-014 §3, §4.2, §12.5; CR-015 §18.3)
 #include "cloud_readiness_gate.h"
 
 namespace tbox {
@@ -9,10 +9,17 @@ void CloudReadinessGate::setCallback(ChangeCallback cb) {
     callback_ = std::move(cb);
 }
 
+void CloudReadinessGate::setCapabilityCallback(CapabilityChangeCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    capability_callback_ = std::move(cb);
+}
+
 void CloudReadinessGate::onConnectionState(ConnectionState state,
                                            uint64_t connection_generation) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -28,8 +35,11 @@ void CloudReadinessGate::onConnectionState(ConnectionState state,
                 : "connection_lost";
         changed = evaluateLocked(reason, snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
 
 void CloudReadinessGate::setOwnerGenerations(
@@ -50,7 +60,9 @@ void CloudReadinessGate::setOwnerGenerations(
 void CloudReadinessGate::onSubscriptionsReady(bool ready, uint32_t mandatory_active,
                                               uint32_t mandatory_total) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -60,39 +72,54 @@ void CloudReadinessGate::onSubscriptionsReady(bool ready, uint32_t mandatory_act
         changed = evaluateLocked(ready ? "subscriptions_ready" : "subscriptions_not_ready",
                                  snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
 
 void CloudReadinessGate::onMandatoryFailed(const std::string& reason) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         subscriptions_ready_ = false;
         changed = evaluateLocked(reason, snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
 
 void CloudReadinessGate::setDegraded(bool degraded, const std::string& reason) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         degraded_ = degraded;
         changed = evaluateLocked(reason, snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
 
 void CloudReadinessGate::setTlsSessionIdentity(const TlsSessionIdentity& identity) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -103,13 +130,18 @@ void CloudReadinessGate::setTlsSessionIdentity(const TlsSessionIdentity& identit
         degraded_ = false;
         changed = evaluateLocked("tls_session_established", snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
 
 void CloudReadinessGate::revokeSession(const std::string& reason) {
     ChangeCallback cb;
+    CapabilityChangeCallback ccb;
     CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -118,9 +150,151 @@ void CloudReadinessGate::revokeSession(const std::string& reason) {
         degraded_ = false;
         changed = evaluateLocked(reason, snap);
         if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
     }
     if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
 }
+
+// ============================================================
+// CR-015 §18.3: capability-scoped readiness
+// ============================================================
+
+void CloudReadinessGate::setCapabilityState(const std::string& capability,
+                                            bool enabled,
+                                            bool contract_supported,
+                                            bool snapshot_accepted,
+                                            bool uplink_ready,
+                                            uint64_t owner_generation) {
+    CapabilityChangeCallback ccb;
+    std::vector<CapabilityReadiness> cap_events;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& c = capabilities_[capability];
+        if (c.capability.empty()) c.capability = capability;
+        c.enabled = enabled;
+        c.contract_supported = contract_supported;
+        c.snapshot_accepted = snapshot_accepted;
+        c.uplink_ready = uplink_ready;
+        c.owner_generation = owner_generation;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
+    }
+    if (ccb) for (const auto& e : cap_events) ccb(e);
+}
+
+void CloudReadinessGate::setCapabilityDownlinkReady(const std::string& capability,
+                                                    bool ready,
+                                                    bool rejected) {
+    CapabilityChangeCallback ccb;
+    std::vector<CapabilityReadiness> cap_events;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& c = capabilities_[capability];
+        if (c.capability.empty()) c.capability = capability;
+        c.downlink_suback_ready = ready;
+        capability_downlink_rejected_[capability] = (rejected && !ready);
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
+    }
+    if (ccb) for (const auto& e : cap_events) ccb(e);
+}
+
+void CloudReadinessGate::reevaluateCapabilitiesLocked(
+        std::vector<CapabilityReadiness>& events) {
+    for (auto& [cap, current] : capabilities_) {
+        CapabilityReadiness next = current;
+        next.connection_generation = connection_generation_;
+        next.cert_session_generation = identity_.cert_session_generation;
+        // ready = cloud_ready && enabled && contract_supported && snapshot_accepted
+        //         && uplink_ready && downlink_suback_ready (DSN-CR-015 §18.3)
+        next.ready = cloud_ready_ && current.enabled && current.contract_supported &&
+                     current.snapshot_accepted && current.uplink_ready &&
+                     current.downlink_suback_ready;
+        bool rejected = false;
+        auto rit = capability_downlink_rejected_.find(cap);
+        if (rit != capability_downlink_rejected_.end()) rejected = rit->second;
+        next.reason_code = capabilityReasonFor(cap, current.enabled,
+                                               current.contract_supported,
+                                               current.snapshot_accepted,
+                                               current.uplink_ready,
+                                               current.downlink_suback_ready,
+                                               rejected);
+        if (capabilityChanged(current, next)) {
+            next.event_sequence = ++capability_sequences_[cap];
+            current = next;
+            events.push_back(next);
+        }
+    }
+}
+
+bool CloudReadinessGate::capabilityChanged(const CapabilityReadiness& a,
+                                           const CapabilityReadiness& b) {
+    return a.ready != b.ready ||
+           a.enabled != b.enabled ||
+           a.contract_supported != b.contract_supported ||
+           a.snapshot_accepted != b.snapshot_accepted ||
+           a.uplink_ready != b.uplink_ready ||
+           a.downlink_suback_ready != b.downlink_suback_ready ||
+           a.owner_generation != b.owner_generation ||
+           a.connection_generation != b.connection_generation ||
+           a.cert_session_generation != b.cert_session_generation ||
+           a.reason_code != b.reason_code;
+}
+
+std::string CloudReadinessGate::capabilityReasonFor(
+        const std::string& cap, bool enabled, bool contract_supported,
+        bool snapshot_accepted, bool uplink_ready, bool downlink_suback_ready,
+        bool downlink_rejected) {
+    const bool keyprov = (cap == kCapabilitySecurityKeyprov);
+    if (!enabled) {
+        return keyprov ? capability_reason::kKeyprovDisabled : "CAPABILITY_DISABLED";
+    }
+    if (!contract_supported) {
+        return keyprov ? capability_reason::kKeyprovContractUnsupported
+                       : "CAPABILITY_CONTRACT_UNSUPPORTED";
+    }
+    if (!snapshot_accepted) {
+        return keyprov ? capability_reason::kKeyprovSnapshotRejected
+                       : "CAPABILITY_SNAPSHOT_REJECTED";
+    }
+    if (!uplink_ready) {
+        return keyprov ? capability_reason::kKeyprovSubscribePending
+                       : "CAPABILITY_UPLINK_PENDING";
+    }
+    if (!downlink_suback_ready) {
+        if (downlink_rejected) {
+            return keyprov ? capability_reason::kKeyprovSubackRejected
+                           : "CAPABILITY_SUBACK_REJECTED";
+        }
+        return keyprov ? capability_reason::kKeyprovSubscribePending
+                       : "CAPABILITY_SUBSCRIBE_PENDING";
+    }
+    return "READY";
+}
+
+CapabilityReadiness CloudReadinessGate::getCapabilityReadiness(
+        const std::string& capability) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = capabilities_.find(capability);
+    if (it == capabilities_.end()) {
+        CapabilityReadiness r;
+        r.capability = capability;
+        return r;
+    }
+    return it->second;
+}
+
+std::map<std::string, CapabilityReadiness>
+CloudReadinessGate::getCapabilities() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return capabilities_;
+}
+
+// ============================================================
+// 内部评估
+// ============================================================
 
 bool CloudReadinessGate::evaluateLocked(const std::string& reason,
                                         CloudReadinessSnapshot& out) {
@@ -162,6 +336,7 @@ CloudReadinessSnapshot CloudReadinessGate::buildSnapshotLocked(
     s.mandatory_active = mandatory_active_;
     s.contract_version = kCloudReadinessContractVersion;
     s.contract_supported = true;
+    s.capabilities = capabilities_;
     return s;
 }
 
@@ -189,8 +364,12 @@ bool CloudReadinessGate::isCloudReady() const {
 
 CloudReadinessSnapshot CloudReadinessGate::getReadiness() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (has_committed_) return committed_;
-    return buildSnapshotLocked(cloud_ready_, last_reason_);
+    CloudReadinessSnapshot s = has_committed_
+        ? committed_
+        : buildSnapshotLocked(cloud_ready_, last_reason_);
+    // CR-015: capability map 与独立查询读取同一原子状态
+    s.capabilities = capabilities_;
+    return s;
 }
 
 } // namespace mqtt

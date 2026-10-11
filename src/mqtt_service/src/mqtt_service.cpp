@@ -7,11 +7,13 @@
 #include "credential_manager.h"
 #include "provision_identity_manager.h"
 #include "sec_tls_key_adapter.h"
+#include "subscription_catalog.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include "utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <set>
 
 namespace tbox {
 namespace mqtt {
@@ -194,6 +196,12 @@ bool MqttService::initializeLocal() {
                 state_machine_->getCurrentState() == ConnectionState::SUBSCRIBING) {
                 state_machine_->onSubscriptionsReady();
             }
+        });
+
+    // CR-015 §18.3: capability readiness 变化 -> 按 capability 定向发布 typed 事件
+    cloud_ready_gate_->setCapabilityCallback(
+        [this](const CapabilityReadiness& readiness) {
+            publishCapabilityEvent(readiness);
         });
 
     // CR-007 §6: IPC Server 先于首次 CONNECT 可用
@@ -691,6 +699,30 @@ std::pair<int32_t, bool> MqttService::onSubscribeCloudReadinessEventChannel(int 
     return {0, true};
 }
 
+// CR-015 §18.3: capability readiness 事件通道（仅登记 fd，不触发 Broker 操作）
+std::pair<int32_t, bool> MqttService::onSubscribeCapabilityReadinessEventChannel(
+        const std::string& capability, int client_fd) {
+    bool ok = false;
+    if (ipc_server_) {
+        ok = ipc_server_->add_subscription(
+            client_fd, static_cast<uint32_t>(ipc::EventType::CAPABILITY_READINESS_CHANGED));
+    }
+    if (!ok) {
+        MqttLogAdapter::subscribe().error(
+            "mqtt.subscription.capability_readiness_failed",
+            "capability readiness 事件订阅登记失败",
+            {tbox::fw::log::Field("capability",
+                tbox::fw::log::FieldValue::makeString(capability)),
+             tbox::fw::log::Field("error_code",
+                tbox::fw::log::FieldValue::makeString("MQTT-1008"))}
+        );
+        return {static_cast<int32_t>(ErrorCode::MQTT_1008), false};
+    }
+    // 订阅建立后刷新一次，保证客户端能读到当前 capability 快照
+    refreshCapabilityReadiness();
+    return {0, true};
+}
+
 std::pair<int32_t, bool> MqttService::onUnsubscribe(int client_fd) {
     if (ipc_server_) {
         ipc_server_->remove_subscription(
@@ -1140,6 +1172,8 @@ ReplaceSnapshotResult MqttService::onReplaceSubscriptionSnapshot(
             state == ConnectionState::CONNECTED_DEGRADED) {
             reconcileSubscriptions();
         }
+        // CR-015: 刷新 capability readiness（enabled/contract/snapshot/uplink/downlink）
+        refreshCapabilityReadiness();
 
         MqttLogAdapter::subscribe().info(
             "mqtt.subscription.snapshot.accepted",
@@ -1179,6 +1213,12 @@ SubscriptionReadiness MqttService::onGetSubscriptionReadiness() {
         r.owner_generations[owner] = snap.generation;
     }
     return r;
+}
+
+// CR-015 §18.4: capability readiness 查询（与事件读取同一原子状态）
+CapabilityReadiness MqttService::onGetCapabilityReadiness(const std::string& capability) {
+    if (!cloud_ready_gate_) return CapabilityReadiness{};
+    return cloud_ready_gate_->getCapabilityReadiness(capability);
 }
 
 bool MqttService::brokerSubscribe(const std::string& topic, uint8_t qos) {
@@ -1244,6 +1284,8 @@ void MqttService::evaluateCloudReadiness() {
     uint32_t ma = reconciler_->mandatoryActive();
     uint32_t mt = reconciler_->mandatoryTotal();
     cloud_ready_gate_->onSubscriptionsReady(ready, ma, mt);
+    // CR-015: mandatory 收敛后同步 capability 下行就绪状态
+    refreshCapabilityReadiness();
 }
 
 void MqttService::publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot) {
@@ -1267,6 +1309,89 @@ void MqttService::publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot)
          {"event_sequence", tbox::fw::log::FieldValue::makeInt(
              static_cast<int64_t>(snapshot.event_sequence))},
          {"reason_code", tbox::fw::log::FieldValue::makeString(snapshot.reason_code)}}
+    );
+}
+
+// CR-015 §18.3: 根据 owner 快照 + catalog + 当前投影/收敛状态刷新 capability readiness
+void MqttService::refreshCapabilityReadiness() {
+    if (!cloud_ready_gate_) return;
+    const auto& catalog = SubscriptionCatalog::instance();
+
+    std::set<std::string> scopes;
+    for (const auto& [key, entry] : catalog.entries()) {
+        if (!entry.readiness_scope.empty()) scopes.insert(entry.readiness_scope);
+    }
+
+    for (const auto& scope : scopes) {
+        bool enabled = false;
+        bool present = false;
+        bool contract_supported = false;
+        uint64_t owner_generation = 0;
+        bool uplink_ready = false;
+
+        for (const auto& [key, entry] : catalog.entries()) {
+            if (entry.readiness_scope != scope) continue;
+
+            auto snap = snapshot_registry_->getLatestSnapshot(entry.owner);
+            if (snap) {
+                for (const auto& item : snap->items) {
+                    if (item.route_id != entry.route_id) continue;
+                    present = true;
+                    if (item.enabled.value_or(false)) enabled = true;
+                    contract_supported =
+                        (snap->contract_version == kSubscriptionCatalogContractVersion);
+                    owner_generation = snap->generation;
+                    break;
+                }
+            }
+
+            if (entry.direction == SnapshotDirection::UP ||
+                entry.direction == SnapshotDirection::BIDIRECTIONAL) {
+                if (route_table_) {
+                    auto r = route_table_->lookupRoute({entry.owner, entry.route_id});
+                    if (r.has_value() && r->state == RouteState::ACTIVE) {
+                        uplink_ready = true;
+                    }
+                }
+            }
+        }
+
+        cloud_ready_gate_->setCapabilityState(
+            scope, enabled, contract_supported, present, uplink_ready, owner_generation);
+        bool downlink_ready = reconciler_ && reconciler_->capabilityConverged(scope);
+        bool downlink_rejected = reconciler_ && reconciler_->capabilityRejected(scope);
+        cloud_ready_gate_->setCapabilityDownlinkReady(scope, downlink_ready, downlink_rejected);
+    }
+}
+
+// CR-015 §18.3: 向已订阅的 fd 定向推送 capability readiness 事件（脱敏）
+void MqttService::publishCapabilityEvent(const CapabilityReadiness& readiness) {
+    if (ipc_server_ && ipc_dispatcher_) {
+        auto fds = ipc_dispatcher_->getCapabilityFds(readiness.capability);
+        if (!fds.empty()) {
+            std::string json = capabilityReadinessToJson(readiness);
+            for (int fd : fds) {
+                ipc_server_->push_event_to(
+                    fd, static_cast<uint32_t>(ipc::EventType::CAPABILITY_READINESS_CHANGED),
+                    json);
+            }
+        }
+    }
+    MqttLogAdapter::connection().info(
+        "mqtt.capability.readiness.changed",
+        readiness.ready ? "capability 就绪" : "capability 未就绪",
+        {{"capability", tbox::fw::log::FieldValue::makeString(readiness.capability)},
+         {"ready", tbox::fw::log::FieldValue::makeBool(readiness.ready)},
+         {"enabled", tbox::fw::log::FieldValue::makeBool(readiness.enabled)},
+         {"contract_supported", tbox::fw::log::FieldValue::makeBool(readiness.contract_supported)},
+         {"snapshot_accepted", tbox::fw::log::FieldValue::makeBool(readiness.snapshot_accepted)},
+         {"uplink_ready", tbox::fw::log::FieldValue::makeBool(readiness.uplink_ready)},
+         {"downlink_suback_ready", tbox::fw::log::FieldValue::makeBool(readiness.downlink_suback_ready)},
+         {"owner_generation", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(readiness.owner_generation))},
+         {"event_sequence", tbox::fw::log::FieldValue::makeInt(
+             static_cast<int64_t>(readiness.event_sequence))},
+         {"reason_code", tbox::fw::log::FieldValue::makeString(readiness.reason_code)}}
     );
 }
 
@@ -1308,6 +1433,8 @@ void MqttService::rebuildRouteProjection() {
          {"unresolved_count", tbox::fw::log::FieldValue::makeInt(
              static_cast<int64_t>(new_table->unresolvedRoutes()))}}
     );
+    // CR-015: 身份/投影变化后刷新 capability 上行就绪
+    refreshCapabilityReadiness();
 }
 
 std::shared_ptr<const EffectiveRouteTable> MqttService::getRouteTable() const {

@@ -1,5 +1,6 @@
-// RoutePublisher (CR-009 §2, §6)
+// RoutePublisher (CR-009 §2, §6; CR-015 §18.4/§18.6)
 #include "route_publisher.h"
+#include "subscription_catalog.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
 #include <chrono>
@@ -41,6 +42,12 @@ PublishResult RoutePublisher::publishRoute(
         // route 不存在 -> MQTT-1004 (CR-009 §6.2)
         result.accepted = false;
         result.error = ErrorCode::MQTT_1004;
+        // CR-015: catalog-governed route 未投影（默认关闭/未启用）时返回稳定 reason
+        const CatalogEntry* entry = SubscriptionCatalog::instance()
+            .lookup(req.key.owner, req.key.route_id);
+        if (entry != nullptr) {
+            result.reason_code = capability_reason::kKeyprovDisabled;
+        }
         return result;
     }
 
@@ -67,6 +74,9 @@ PublishResult RoutePublisher::publishRoute(
         // stale generation -> MQTT-1009 (CR-009 §8)
         result.accepted = false;
         result.error = ErrorCode::MQTT_1009;
+        if (!route->definition.readiness_scope.empty()) {
+            result.reason_code = capability_reason::kKeyprovGenerationStale;
+        }
         return result;
     }
 
@@ -77,6 +87,16 @@ PublishResult RoutePublisher::publishRoute(
             qos = req.qos.value();
         }
         // 超出范围的 QoS 覆盖忽略，使用 route 默认值
+    }
+
+    // 5b. CR-015 §18.6: capability 上行 payload 上限（整体拒绝，不截断、不落盘）
+    if (!route->definition.readiness_scope.empty() &&
+        req.payload.size() > kKeyprovMaxPayloadBytes) {
+        result.accepted = false;
+        result.error = ErrorCode::MQTT_1004;
+        result.reason_code = capability_reason::kKeyprovPayloadTooLarge;
+        result.retryable = false;
+        return result;
     }
 
     // 6. 在线/离线处理 (CR-009 §6.2)
@@ -95,6 +115,9 @@ PublishResult RoutePublisher::publishRoute(
         if (!resolver.isGenerationCurrent(route->identity_generation)) {
             result.accepted = false;
             result.error = ErrorCode::MQTT_1009;
+            if (!route->definition.readiness_scope.empty()) {
+                result.reason_code = capability_reason::kKeyprovGenerationStale;
+            }
             return result;
         }
 
@@ -110,6 +133,16 @@ PublishResult RoutePublisher::publishRoute(
             result.error = ErrorCode::MQTT_1002;
         }
     } else {
+        // CR-015 §18.6: capability 上行默认不持久化：断网时拒绝受理（不写磁盘），
+        // 由 TSP 使用原 requestId 对账／重发，避免持久化含 importProof 的 ACK payload。
+        if (!route->definition.persist_offline) {
+            result.accepted = false;
+            result.error = ErrorCode::MQTT_1002;
+            result.reason_code = capability_reason::kKeyprovSubscribePending;
+            result.retryable = true;
+            return result;
+        }
+
         // 离线: 构造 OutboundMessage 入队 (CR-009 §6.2, §9)
         OutboundMessage msg;
         msg.msg_id = req.msg_id;

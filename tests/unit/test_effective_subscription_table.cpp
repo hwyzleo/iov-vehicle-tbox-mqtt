@@ -120,3 +120,62 @@ TEST(EffectiveSubscriptionTableTest, MandatoryCount) {
     table.recompute(reg);
     EXPECT_EQ(table.mandatoryCount(), 1u);
 }
+
+// ============================================================
+// CR-015: capability-gated route 与全局 mandatory 隔离
+// ============================================================
+
+namespace {
+SubscriptionItem makeKeyprovDown(bool enabled) {
+    SubscriptionItem it;
+    it.route_id = kKeyprovDownlinkRouteId;
+    it.enabled = enabled;
+    return it;
+}
+}
+
+TEST(EffectiveSubscriptionTableTest, CapabilityRouteNotInGlobalMandatory) {
+    OwnerSnapshotRegistry reg;
+    EffectiveSubscriptionTable table;
+    table.setEcuUid("ECU");
+    auto snap = makeSnap("tsp", 1, "d1", true, {
+        makeItem("fota.down", "vehicle/{ecu_uid}/down/fota", SnapshotDirection::DOWN, 1, "tsp.fota", true),
+        makeKeyprovDown(true)
+    });
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    ASSERT_EQ(reg.replaceSnapshot(snap).status, SnapshotAcceptStatus::ACCEPTED);
+    table.recompute(reg);
+    EXPECT_EQ(table.downstreamSnapshot()->size(), 2u);  // FOTA + keyprov 均订阅
+    EXPECT_EQ(table.mandatoryCount(), 1u);              // 仅 FOTA 计入全局
+    EXPECT_EQ(table.capabilityCount(), 1u);             // keyprov 计入 capability
+}
+
+TEST(EffectiveSubscriptionTableTest, CapabilityRouteExcludedWhenContractUnsupported) {
+    OwnerSnapshotRegistry reg;
+    EffectiveSubscriptionTable table;
+    table.setEcuUid("ECU");
+    auto snap = makeSnap("tsp", 1, "d1", true, {
+        makeItem("fota.down", "vehicle/{ecu_uid}/down/fota", SnapshotDirection::DOWN, 1, "tsp.fota", true),
+        makeKeyprovDown(true)
+    });
+    snap.contract_version = 0;  // 旧/未知契约
+    ASSERT_EQ(reg.replaceSnapshot(snap).status, SnapshotAcceptStatus::ACCEPTED);
+    table.recompute(reg);
+    EXPECT_EQ(table.downstreamSnapshot()->size(), 1u);  // 仅 FOTA
+    EXPECT_EQ(table.capabilityCount(), 0u);
+    EXPECT_EQ(table.mandatoryCount(), 1u);
+}
+
+TEST(EffectiveSubscriptionTableTest, DisabledCapabilityRouteNotProjected) {
+    OwnerSnapshotRegistry reg;
+    EffectiveSubscriptionTable table;
+    table.setEcuUid("ECU");
+    auto snap = makeSnap("tsp", 1, "d1", true, {
+        makeKeyprovDown(false)
+    });
+    snap.contract_version = kSubscriptionCatalogContractVersion;
+    ASSERT_EQ(reg.replaceSnapshot(snap).status, SnapshotAcceptStatus::ACCEPTED);
+    table.recompute(reg);
+    EXPECT_EQ(table.downstreamSnapshot()->size(), 0u);
+    EXPECT_EQ(table.capabilityCount(), 0u);
+}

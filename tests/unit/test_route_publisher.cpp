@@ -208,3 +208,98 @@ TEST(RoutePublisherTest, PublishRouteUnresolvedState) {
     EXPECT_FALSE(result.accepted);
     EXPECT_EQ(result.error, ErrorCode::MQTT_1009);
 }
+
+// ============================================================
+// CR-015 §18.6: keyprov payload 上限、非持久化与默认关闭
+// ============================================================
+
+namespace {
+void setupKeyprov(RoutePublisherTestEnv& env, bool enabled, uint32_t contract) {
+    env.resolver.setIdentity("ECU123", 1);
+    SubscriptionItem up;
+    up.route_id = kKeyprovUplinkRouteId;
+    up.enabled = enabled;
+    auto snap = makeSnap("tsp", 1, "d1", true, {up});
+    snap.contract_version = contract;
+    env.reg.replaceSnapshot(snap);
+    env.table = env.builder.build(env.reg, env.resolver);
+}
+}
+
+TEST(RoutePublisherTest, KeyprovPayloadTooLargeRejected) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, true, kSubscriptionCatalogContractVersion);
+    env.is_connected = true;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_large";
+    req.payload.assign(kKeyprovMaxPayloadBytes + 1, 0xAB);
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(result.error, ErrorCode::MQTT_1004);
+    EXPECT_EQ(result.reason_code, capability_reason::kKeyprovPayloadTooLarge);
+    EXPECT_FALSE(result.retryable);
+    EXPECT_FALSE(env.broker_called);
+}
+
+TEST(RoutePublisherTest, KeyprovPayloadAtLimitAccepted) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, true, kSubscriptionCatalogContractVersion);
+    env.is_connected = true;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_limit";
+    req.payload.assign(kKeyprovMaxPayloadBytes, 0x01);
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_TRUE(result.accepted);
+    EXPECT_TRUE(env.broker_called);
+    EXPECT_EQ(env.broker_topic, "vehicle/ECU123/up/keyprov");
+}
+
+TEST(RoutePublisherTest, KeyprovOfflineNotPersisted) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, true, kSubscriptionCatalogContractVersion);
+    env.is_connected = false;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_offline";
+    req.payload = {0x01};
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_FALSE(env.enqueue_called);  // 不写离线队列
+    EXPECT_EQ(result.reason_code, capability_reason::kKeyprovSubscribePending);
+}
+
+TEST(RoutePublisherTest, KeyprovDisabledReason) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, false, kSubscriptionCatalogContractVersion);  // enabled=false -> 未投影
+    env.is_connected = true;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_disabled";
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(result.reason_code, capability_reason::kKeyprovDisabled);
+}
+
+TEST(RoutePublisherTest, KeyprovContractUnsupportedNotProjected) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, true, 0);  // 契约不支持 -> 未投影
+    env.is_connected = true;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_contract";
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(result.reason_code, capability_reason::kKeyprovDisabled);
+}

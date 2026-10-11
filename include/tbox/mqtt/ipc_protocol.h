@@ -29,6 +29,9 @@ enum class MethodId : uint32_t {
     SUBSCRIBE_ROUTED_DOWNLINK        = 11, // subscribeRoutedDownlink -> 登记 fd->owner 事件通道
     // CR-014 §5: Cloud Ready 事件订阅（仅登记 fd 到 CLOUD_READY_CHANGED，不触发 Broker 操作）
     SUBSCRIBE_CLOUD_READINESS        = 12, // subscribeCloudReadinessChanged -> 登记 fd 事件通道
+    // CR-015 §18.4: capability readiness 查询与事件订阅
+    GET_CAPABILITY_READINESS         = 13, // getCapabilityReadiness(capability) -> CapabilityReadiness
+    SUBSCRIBE_CAPABILITY_READINESS   = 14, // subscribeCapabilityReadinessChanged -> 登记 fd->capability
 };
 
 /// MQTT IPC 事件类型（与 framework-ipc EventHeader.event_type 一致, CR-004 §6）
@@ -39,6 +42,8 @@ enum class EventType : uint32_t {
     CLOUD_READY_CHANGED       = 3,  // Cloud Ready 状态变更 (CR-007 §10)
     // CR-010 §3: routed downlink 事件（daemon 按 owner 定向推送，不广播给 legacy 订阅者）
     ROUTED_DOWNLINK_MESSAGE   = 4,  // routed downlink（payload 为 routed envelope JSON）
+    // CR-015 §18.3: capability readiness 变更事件（按 capability 定向推送）
+    CAPABILITY_READINESS_CHANGED = 5,  // payload 为 CapabilityReadiness JSON
 };
 
 } // namespace ipc

@@ -180,6 +180,11 @@ struct RouteDefinition {
     std::string target;          // 目标处理器，如 tsp.fota
     bool mandatory = false;
     uint64_t snapshot_generation = 0;  // owner 快照 generation
+    // ---- CR-015 ----
+    std::string readiness_scope;  // 空=全局；非空=capability scope
+    SubscriptionCriticality criticality = SubscriptionCriticality::OPTIONAL;
+    bool enabled = true;          // catalog-governed route 要求显式 enabled=true
+    bool persist_offline = true;  // 是否允许写入持久离线队列
 };
 
 /// 路由解析状态 (CR-009 §3, §8)
@@ -232,6 +237,7 @@ struct RoutedDownlinkEnvelope {
     uint8_t qos = 1;
     std::string request_id;
     std::string trace_id;
+    std::string readiness_scope;    // CR-015: 空=全局；非空=capability scope
 };
 
 /// 离线缓存队列元素 (设计 §3，MQTT 自身业务数据，自研持久化)
