@@ -1205,6 +1205,9 @@ ReplaceSnapshotResult Client::replaceSubscriptionSnapshot(
     params["generation"] = snapshot.generation;
     params["content_digest"] = snapshot.content_digest;
     params["registration_complete"] = snapshot.registration_complete;
+    // CR-015 (DSN-CR-015 §4/§18.2): contract_version 必须随快照下发，缺失时
+    // daemon 归一化为 0 -> capability route 判定 KEYPROV_CONTRACT_UNSUPPORTED。
+    params["contract_version"] = snapshot.contract_version;
     nlohmann::json items = nlohmann::json::array();
     for (const auto& it : snapshot.items) {
         nlohmann::json item;
@@ -1214,6 +1217,13 @@ ReplaceSnapshotResult Client::replaceSubscriptionSnapshot(
         item["qos"] = static_cast<int>(it.qos);
         item["target"] = it.target;
         item["mandatory"] = it.mandatory;
+        // CR-015: enabled 仅在显式设置时序列化，保留 nullopt 的缺省语义
+        // （daemon 侧：legacy route 缺省=true，capability route 缺省=false）。
+        if (it.enabled.has_value()) {
+            item["enabled"] = *it.enabled;
+        }
+        item["readiness_scope"] = it.readiness_scope;
+        item["criticality"] = subscriptionCriticalityToString(it.criticality);
         items.push_back(item);
     }
     params["items"] = items;
