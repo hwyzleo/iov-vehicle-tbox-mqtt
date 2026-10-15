@@ -21,6 +21,7 @@
 #include "ipc.h"
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace tbox {
 namespace mqtt {
@@ -170,6 +171,10 @@ private:
 
     // CR-006 §7: 连接构造时捕获的身份 generation，CONNACK 后核对
     uint64_t connect_identity_generation_ = 0;
+
+    // CR-017 §5, §19.3: 串行化「校验 expected_session + 选择连接 + 提交发送」与
+    // 会话身份切换（setTlsSessionIdentity/revokeSession），消除 TOCTOU。
+    std::mutex session_guard_mutex_;
 
     // ---- CR-007 §2 订阅快照与 Cloud Readiness 组件 ----
     std::unique_ptr<OwnerSnapshotRegistry> snapshot_registry_;

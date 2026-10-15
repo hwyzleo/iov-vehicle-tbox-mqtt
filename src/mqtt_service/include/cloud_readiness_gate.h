@@ -29,6 +29,8 @@ namespace mqtt {
 
 class CloudReadinessGate {
 public:
+    CloudReadinessGate();
+
     /// 变更回调：每次原子提交新快照（cloud_ready、connection/cert generation、
     /// credential、fingerprint、reason 任一变化）后投递完整快照。回调在锁外调用。
     using ChangeCallback = std::function<void(const CloudReadinessSnapshot&)>;
@@ -65,6 +67,14 @@ public:
 
     /// 返回与事件一致的最新已提交快照（含 identity 与 event_sequence）。
     CloudReadinessSnapshot getReadiness() const;
+
+    // ---- CR-017 §3, §4: daemon epoch 与会话上下文校验 ----
+    /// 进程级 daemon epoch（启动时生成一次）；随机源失败时为空。
+    std::string getDaemonEpoch() const;
+
+    /// 校验 expected_session 是否与当前活动会话上下文一致。
+    /// 比较 daemon_epoch + connection_generation + cert_session_generation。
+    bool validateSession(const SessionContext& expected) const;
 
     // ---- CR-015 §18.3: capability-scoped readiness ----
     /// capability 变更回调（在锁外调用，携带完整 CapabilityReadiness）
@@ -118,6 +128,9 @@ private:
 
     mutable std::mutex mutex_;
     ChangeCallback callback_;
+    // CR-017 §3: 进程级 daemon epoch（启动时注入一次，进程内不变）
+    std::string daemon_epoch_;
+    bool daemon_epoch_valid_ = false;
     ConnectionState connection_state_ = ConnectionState::INIT;
     uint64_t connection_generation_ = 0;
     std::map<std::string, uint64_t> owner_generations_;

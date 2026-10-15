@@ -160,8 +160,10 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
             {
                 {"broker_hash", tbox::fw::log::FieldValue::makeString(brokerHash(config.broker_host))},
                 {"reason", tbox::fw::log::FieldValue::makeString(tls_adapter_->getLastError())},
+                {"reason_code", tbox::fw::log::FieldValue::makeString(tls_adapter_->getLastReasonCode())},
                 {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration.count())},
-                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1001")}
+                // CR-017: CN 身份错误保留 MQTT-1009；TLS 材料/配置错误沿用 MQTT-1001
+                {"error_code", tbox::fw::log::FieldValue::makeString(tls_adapter_->getLastErrorCode())}
             }
         );
         return false;
@@ -187,9 +189,9 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         return false;
     }
 
-    // DSN-CR-014 §4.1: TLS context 建立成功，固化不可复用的客户端证书会话身份。
-    // device_identity_digest/certificate_ref 来自实际写入 SSL_CTX 的 leaf 证书，
-    // 不重新查询 SEC 当前 credential。
+    // DSN-CR-014 §4.1 / DSN-CR-017 §3: TLS context 建立成功，固化不可复用的客户端证书
+    // 会话身份。device_identity_digest/certificate_ref/ecu_uid 来自实际写入 SSL_CTX 的
+    // leaf 证书，不重新查询 SEC 当前 credential。
     {
         std::lock_guard<std::mutex> lock(tls_session_mutex_);
         ++cert_session_generation_;
@@ -201,7 +203,33 @@ bool MqttClientManager::connect(const ConnectionConfig& config) {
         // 初始 device_identity_digest 与 certificate_ref 使用同一摘要；
         // 后续若引入域分离必须版本化算法标识，不得静默改变 (CR-014 §3)。
         tls_session_.device_identity_digest = tls_session_.certificate_ref;
-        tls_session_.valid = !tls_session_.certificate_ref.empty();
+        // CR-017 §3: leaf 客户端证书 CN 规范化 ecu_uid
+        tls_session_.ecu_uid = tls_adapter_->getLeafEcUid();
+        tls_session_.valid = !tls_session_.certificate_ref.empty() &&
+                             !tls_session_.ecu_uid.empty();
+    }
+
+    // CR-017 §3: 确认用于 username/Topic 的 PROV 身份投影与该证书身份一致。
+    // 不一致时 fail-closed，不建立可用会话；不覆写 PROV 以掩盖冲突。
+    if (!config.username.empty()) {
+        std::string normalized_username;
+        if (!SecTlsKeyAdapter::normalizeEcuUid(config.username, normalized_username) ||
+            normalized_username != tls_adapter_->getLeafEcUid()) {
+            MqttLogAdapter::publish().error(
+                "mqtt.session.identity_conflict",
+                "PROV username 与 leaf 证书 CN 身份不一致，fail-closed",
+                {
+                    {"reason_code", tbox::fw::log::FieldValue::makeString(
+                        session_reason::kSessionIdentityConflict)},
+                    {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
+                }
+            );
+            tls_adapter_->destroyContext();
+            // 不发布有效会话身份：清除已暂时写入的 identity
+            std::lock_guard<std::mutex> lock(tls_session_mutex_);
+            tls_session_ = TlsSessionIdentity{};
+            return false;
+        }
     }
 
     // Set username from client certificate CN for broker authentication
@@ -270,6 +298,20 @@ void MqttClientManager::disconnect() {
         mosquitto_loop_stop(mosq_, true);
         connected_ = false;
     }
+}
+
+void MqttClientManager::reset() {
+    if (mosq_) {
+        mosquitto_disconnect(mosq_);
+        mosquitto_loop_stop(mosq_, true);
+        // 销毁实例以丢弃 libmosquitto 内部未决 QoS>0 发送队列（不跨会话重发）
+        mosquitto_destroy(mosq_);
+        mosq_ = nullptr;
+    }
+    connected_ = false;
+    // 旧会话身份不可复用于新连接
+    std::lock_guard<std::mutex> lock(tls_session_mutex_);
+    tls_session_ = TlsSessionIdentity{};
 }
 
 PublishResult MqttClientManager::publish(const std::string& topic,

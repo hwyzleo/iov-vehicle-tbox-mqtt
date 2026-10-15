@@ -1,8 +1,14 @@
-// CloudReadinessGate (CR-007 §2, §10; CR-014 §3, §4.2, §12.5; CR-015 §18.3)
+// CloudReadinessGate (CR-007 §2, §10; CR-014 §3, §4.2, §12.5; CR-015 §18.3; CR-017 §3)
 #include "cloud_readiness_gate.h"
+#include "daemon_epoch.h"
 
 namespace tbox {
 namespace mqtt {
+
+CloudReadinessGate::CloudReadinessGate()
+    : daemon_epoch_(daemonEpoch()),
+      daemon_epoch_valid_(!daemon_epoch_.empty()) {
+}
 
 void CloudReadinessGate::setCallback(ChangeCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -298,14 +304,20 @@ CloudReadinessGate::getCapabilities() const {
 
 bool CloudReadinessGate::evaluateLocked(const std::string& reason,
                                         CloudReadinessSnapshot& out) {
+    // CR-017 §3: daemon epoch 随机源失败时不得宣告身份绑定能力就绪。
     bool new_ready = isConnectedState(connection_state_) &&
                      subscriptions_ready_ &&
                      !degraded_ &&
+                     daemon_epoch_valid_ &&
                      connection_state_ != ConnectionState::CONNECTED_DEGRADED;
-    last_reason_ = reason;
+    // CR-017 §3: epoch 不可用时给出明确、可区分的 identity reason
+    const std::string effective_reason = daemon_epoch_valid_
+        ? reason
+        : session_reason::kSessionIdentityInvalid;
+    last_reason_ = effective_reason;
     cloud_ready_ = new_ready;
 
-    CloudReadinessSnapshot next = buildSnapshotLocked(new_ready, reason);
+    CloudReadinessSnapshot next = buildSnapshotLocked(new_ready, effective_reason);
     if (!has_committed_ || snapshotChanged(committed_, next)) {
         next.event_sequence = ++event_sequence_;
         committed_ = next;
@@ -335,7 +347,13 @@ CloudReadinessSnapshot CloudReadinessGate::buildSnapshotLocked(
     s.mandatory_count = mandatory_total_;
     s.mandatory_active = mandatory_active_;
     s.contract_version = kCloudReadinessContractVersion;
+    s.publish_contract_version = kPublishSessionContractVersion;
     s.contract_supported = true;
+    // CR-017 §4: 会话身份投影与可校验上下文（与指纹/generation 同一不可变对象产生）
+    s.ecu_uid = identity_.ecu_uid;
+    s.session_context.daemon_epoch = daemon_epoch_;
+    s.session_context.connection_generation = connection_generation_;
+    s.session_context.cert_session_generation = identity_.cert_session_generation;
     s.capabilities = capabilities_;
     return s;
 }
@@ -349,6 +367,10 @@ bool CloudReadinessGate::snapshotChanged(const CloudReadinessSnapshot& a,
            a.credential_version != b.credential_version ||
            a.device_identity_digest != b.device_identity_digest ||
            a.certificate_ref != b.certificate_ref ||
+           a.ecu_uid != b.ecu_uid ||
+           a.session_context.daemon_epoch != b.session_context.daemon_epoch ||
+           a.session_context.connection_generation != b.session_context.connection_generation ||
+           a.session_context.cert_session_generation != b.session_context.cert_session_generation ||
            a.reason_code != b.reason_code ||
            a.subscriptions_ready != b.subscriptions_ready ||
            a.connected != b.connected ||
@@ -370,6 +392,19 @@ CloudReadinessSnapshot CloudReadinessGate::getReadiness() const {
     // CR-015: capability map 与独立查询读取同一原子状态
     s.capabilities = capabilities_;
     return s;
+}
+
+std::string CloudReadinessGate::getDaemonEpoch() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return daemon_epoch_;
+}
+
+bool CloudReadinessGate::validateSession(const SessionContext& expected) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!daemon_epoch_valid_ || !identity_.valid) return false;
+    return expected.daemon_epoch == daemon_epoch_ &&
+           expected.connection_generation == connection_generation_ &&
+           expected.cert_session_generation == identity_.cert_session_generation;
 }
 
 } // namespace mqtt

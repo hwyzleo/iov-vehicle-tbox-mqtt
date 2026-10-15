@@ -171,7 +171,37 @@ void SecTlsKeyAdapter::destroyContext() {
     current_credential_.private_key_ref.data.shrink_to_fit();
     // CR-014 §4.2: 旧会话指纹不跨 context 复用（已由 gate 固化为快照）
     leaf_fingerprint_.clear();
+    // CR-017 §3: 同样清理 leaf ecu_uid 与错误分类，避免旧身份被当作新上下文
+    leaf_ecu_uid_.clear();
+    last_error_code_ = "MQTT-1001";
+    last_reason_code_.clear();
     cred_mgr_ = nullptr;
+}
+
+bool SecTlsKeyAdapter::normalizeEcuUid(const std::string& raw, std::string& out) {
+    out.clear();
+    const auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
+    };
+    size_t begin = 0;
+    size_t end = raw.size();
+    while (begin < end && is_ws(static_cast<unsigned char>(raw[begin]))) ++begin;
+    while (end > begin && is_ws(static_cast<unsigned char>(raw[end - 1]))) --end;
+
+    std::string norm;
+    norm.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i) {
+        unsigned char c = static_cast<unsigned char>(raw[i]);
+        if (c >= 'a' && c <= 'z') c = static_cast<unsigned char>(c - 'a' + 'A');
+        norm.push_back(static_cast<char>(c));
+    }
+    if (norm.empty() || norm.size() > 64) return false;
+    for (char c : norm) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+        if (!ok) return false;
+    }
+    out = std::move(norm);
+    return true;
 }
 
 bool SecTlsKeyAdapter::isAlgorithmAllowed(tbox::sec::KeyAlgorithm key_alg,
@@ -247,6 +277,11 @@ SSL_CTX* SecTlsKeyAdapter::buildTlsContext(const ActiveTlsCredential& credential
 
     current_credential_ = credential;
     cred_mgr_ = &cred_mgr;
+    // CR-017 §3: 每次构建重置 leaf 身份与错误分类，避免旧会话身份被复用。
+    leaf_fingerprint_.clear();
+    leaf_ecu_uid_.clear();
+    last_error_code_ = "MQTT-1001";
+    last_reason_code_.clear();
 
     if (!credential.ready) {
         last_error_ = "Credential not ready";
@@ -428,6 +463,52 @@ bool SecTlsKeyAdapter::loadClientCertChain(SSL_CTX* ctx,
                 // 回退：直接对输入 DER 片段求指纹（保证身份仍可用，不阻断连接）
                 leaf_fingerprint_ = "sha256:" + sha256Hex(p, consumed);
             }
+
+            // CR-017 §3: 从实际 leaf 证书 CN 提取并规范化 ecu_uid。
+            // CN 缺失/歧义/非法时 fail-closed（保留 MQTT-1009 分类），
+            // 不 fallback 到 PROV/clientId/配置。
+            {
+                X509_NAME* subject = X509_get_subject_name(cert);
+                int first = (subject != nullptr)
+                    ? X509_NAME_get_index_by_NID(subject, NID_commonName, -1)
+                    : -1;
+                if (first < 0) {
+                    last_error_ = "client leaf certificate has no CN";
+                    last_error_code_ = "MQTT-1009";
+                    last_reason_code_ = session_reason::kSessionIdentityMissing;
+                    X509_free(cert);
+                    return false;
+                }
+                int second = X509_NAME_get_index_by_NID(subject, NID_commonName, first);
+                if (second >= 0) {
+                    last_error_ = "client leaf certificate has ambiguous (multiple) CN";
+                    last_error_code_ = "MQTT-1009";
+                    last_reason_code_ = session_reason::kSessionIdentityInvalid;
+                    X509_free(cert);
+                    return false;
+                }
+                X509_NAME_ENTRY* entry = X509_NAME_get_entry(subject, first);
+                ASN1_STRING* cn_data = (entry != nullptr) ? X509_NAME_ENTRY_get_data(entry) : nullptr;
+                std::string cn;
+                if (cn_data != nullptr) {
+                    unsigned char* utf8 = nullptr;
+                    int len = ASN1_STRING_to_UTF8(&utf8, cn_data);
+                    if (len >= 0 && utf8 != nullptr) {
+                        cn.assign(reinterpret_cast<char*>(utf8), static_cast<size_t>(len));
+                    }
+                    if (utf8 != nullptr) OPENSSL_free(utf8);
+                }
+                std::string normalized;
+                if (!normalizeEcuUid(cn, normalized)) {
+                    last_error_ = "client leaf certificate CN is not a valid ecu_uid";
+                    last_error_code_ = "MQTT-1009";
+                    last_reason_code_ = session_reason::kSessionIdentityInvalid;
+                    X509_free(cert);
+                    return false;
+                }
+                leaf_ecu_uid_ = std::move(normalized);
+            }
+
             if (SSL_CTX_use_certificate(ctx, cert) != 1) {
                 last_error_ = "SSL_CTX_use_certificate failed for leaf cert";
                 X509_free(cert);

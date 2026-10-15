@@ -380,6 +380,7 @@ target_link_libraries(test_applied_subscription_manifest GTest::gtest_main ${FRA
 add_executable(test_cloud_readiness_gate
     unit/test_cloud_readiness_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/cloud_readiness_gate.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/daemon_epoch.cpp
 )
 target_include_directories(test_cloud_readiness_gate PRIVATE ${TEST_COMMON_INCLUDES})
 target_link_libraries(test_cloud_readiness_gate GTest::gtest_main pthread)

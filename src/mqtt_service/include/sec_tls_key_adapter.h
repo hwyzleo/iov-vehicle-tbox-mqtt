@@ -75,6 +75,21 @@ public:
     /// 规范 DER 的 SHA-256，格式 "sha256:<hex>"；无 leaf 时为空字符串。
     const std::string& getLeafFingerprint() const { return leaf_fingerprint_; }
 
+    /// CR-017 §3: 本次 TLS context 实际装载的 leaf 客户端证书 CN 规范化后的 ecu_uid。
+    /// 仅在 CN 合法时非空；缺失/歧义/非法时为空。
+    const std::string& getLeafEcUid() const { return leaf_ecu_uid_; }
+
+    /// 最后一次错误的 MQTT 错误码（如 "MQTT-1009" / "MQTT-1001"）。
+    /// CR-017：CN 身份错误保留 MQTT-1009，不因函数名统一成 MQTT-1001。
+    const std::string& getLastErrorCode() const { return last_error_code_; }
+
+    /// 最后一次错误的稳定 reason code（如 SESSION_IDENTITY_INVALID）。
+    const std::string& getLastReasonCode() const { return last_reason_code_; }
+
+    /// CR-017 §3: 将 leaf CN 规范化为 ecu_uid（去首尾空白、ASCII 大写、^[A-Z0-9-]{1,64}$）。
+    /// @return 合法返回 true；否则 false（不 fallback）。
+    static bool normalizeEcuUid(const std::string& raw, std::string& out);
+
 private:
     /// 解析 DER root CA bundle 并装入 X509_STORE (CR-005 §5.1)
     bool loadRootCaBundle(SSL_CTX* ctx, const std::vector<uint8_t>& der_bundle);
@@ -104,6 +119,11 @@ private:
     std::string last_error_;
     // DSN-CR-014 §4.1: 实际写入 SSL_CTX 的 leaf 证书指纹 "sha256:<hex>"
     std::string leaf_fingerprint_;
+    // CR-017 §3: 实际写入 SSL_CTX 的 leaf 客户端证书 CN 规范化 ecu_uid
+    std::string leaf_ecu_uid_;
+    // CR-017: 错误分类（CN 身份错误保留 MQTT-1009，TLS 材料/配置错误 MQTT-1001）
+    std::string last_error_code_ = "MQTT-1001";
+    std::string last_reason_code_;
 
     // 持有当前凭据快照和 CredentialManager 指针，供 ENGINE sign callback 使用
     // 注意：ENGINE callback 是 C 函数，通过 ex_data 或全局指针访问此对象

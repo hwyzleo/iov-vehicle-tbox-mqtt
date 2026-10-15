@@ -122,6 +122,9 @@ struct TlsSessionIdentity {
     uint64_t credential_version = 0;
     std::string device_identity_digest;  // sha256(leaf DER)
     std::string certificate_ref;         // sha256:<hex fingerprint>
+    // CR-017 §3, §19.2: 从实际装入 SSL_CTX 的 leaf 客户端证书 CN 规范化得到的 ecu_uid。
+    // 与上述指纹/generation 固化于同一不可变对象，查询时不得重新读取 SEC/PROV 拼接覆盖。
+    std::string ecu_uid;
     bool valid = false;                  // 是否已成功固化 leaf 身份
 };
 
@@ -216,7 +219,7 @@ struct ResolvedRoute {
     RouteState state = RouteState::UNRESOLVED;
 };
 
-/// Route-based 发布请求 (CR-009 §3, §6.1)
+/// Route-based 发布请求 (CR-009 §3, §6.1; CR-017 §5, §19.3)
 struct RoutePublishRequest {
     RouteKey key;
     std::string msg_id;
@@ -226,6 +229,8 @@ struct RoutePublishRequest {
     std::string content_type;
     std::string trace_id;
     std::string request_id;
+    // CR-017 §5: 调用方构造报文时使用的预期会话上下文；keyprov.uplink 必填。
+    std::optional<SessionContext> expected_session;
 };
 
 /// Route-based 下行事件 (CR-009 §3, §7)

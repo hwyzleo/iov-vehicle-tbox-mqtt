@@ -146,7 +146,44 @@ public:
     CapabilityReadiness onGetCapabilityReadiness(const std::string& capability) override {
         return gate.getCapabilityReadiness(capability);
     }
-    PublishResult onPublishRoute(const RoutePublishRequest&) override { return PublishResult{}; }
+    // CR-017 §5: 模拟 MqttService §19.3 keyprov 会话绑定 guard
+    std::mutex pub_mutex;
+    bool has_route_req = false;
+    RoutePublishRequest last_route_req;
+    std::vector<uint8_t> last_payload;
+    PublishResult onPublishRoute(const RoutePublishRequest& req) override {
+        std::lock_guard<std::mutex> lock(pub_mutex);
+        has_route_req = true;
+        last_route_req = req;
+        last_payload = req.payload;
+        const bool capability_gated = (req.key.route_id == kKeyprovUplinkRouteId);
+        if (capability_gated) {
+            if (!req.expected_session.has_value()) {
+                PublishResult r;
+                r.error = ErrorCode::MQTT_1004;
+                r.reason_code = session_reason::kPublishContextRequired;
+                r.retryable = false;
+                return r;
+            }
+            if (req.expected_session->daemon_epoch.empty()) {
+                PublishResult r;
+                r.error = ErrorCode::MQTT_1004;
+                r.reason_code = session_reason::kPublishContextUnsupported;
+                r.retryable = false;
+                return r;
+            }
+            if (!gate.validateSession(req.expected_session.value())) {
+                PublishResult r;
+                r.error = ErrorCode::MQTT_1009;
+                r.reason_code = session_reason::kPublishContextStale;
+                r.retryable = true;
+                return r;
+            }
+        }
+        PublishResult ok;
+        ok.accepted = true;
+        return ok;
+    }
     std::pair<int32_t, bool> onSubscribeCapabilityReadinessEventChannel(
             const std::string&, int client_fd) override {
         if (server) {
@@ -356,3 +393,75 @@ TEST_F(MqttKeyprovCapabilityIntegTest, CapabilityEventDelivered) {
     for (const auto& e : events) if (e.ready) saw_ready = true;
     EXPECT_TRUE(saw_ready);
 }
+
+// ============================================================
+// CR-017 §5: keyprov 上行会话绑定（client SDK -> IPC -> daemon guard）
+// ============================================================
+
+TEST_F(MqttKeyprovCapabilityIntegTest, KeyprovPublishRequiresExpectedSessionOverIpc) {
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-req-1",
+                                    std::vector<uint8_t>{0x01});
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextRequired);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1004);
+    EXPECT_FALSE(res.retryable);
+}
+
+TEST_F(MqttKeyprovCapabilityIntegTest, KeyprovPublishWithCurrentSessionAccepted) {
+    TlsSessionIdentity id;
+    id.cert_session_generation = 7;
+    id.ecu_uid = "ECU123";
+    id.valid = true;
+    handler.gate.setTlsSessionIdentity(id);
+
+    auto ready = client->getSubscriptionReadiness();
+    ASSERT_FALSE(ready.session_context.daemon_epoch.empty());
+    ASSERT_EQ(ready.session_context.cert_session_generation, 7u);
+
+    PublishOptions opts;
+    opts.expected_session = ready.session_context;
+    std::vector<uint8_t> payload = {0x08, 0x00, 0xFF, 0x00, 0x80};
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-ok-1", payload, opts);
+    EXPECT_TRUE(res.accepted);
+    std::lock_guard<std::mutex> l(handler.pub_mutex);
+    EXPECT_EQ(handler.last_payload, payload);  // §19.5 逐字节透明
+}
+
+TEST_F(MqttKeyprovCapabilityIntegTest, KeyprovPublishWithStaleSessionRejectedOverIpc) {
+    TlsSessionIdentity id;
+    id.cert_session_generation = 7;
+    id.ecu_uid = "ECU123";
+    id.valid = true;
+    handler.gate.setTlsSessionIdentity(id);
+
+    PublishOptions opts;
+    SessionContext sc;
+    auto ready = client->getSubscriptionReadiness();
+    sc.daemon_epoch = "deadbeef";  // 与当前 epoch 不符
+    sc.connection_generation = ready.session_context.connection_generation;
+    sc.cert_session_generation = ready.session_context.cert_session_generation;
+    opts.expected_session = sc;
+
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-stale-1", {0x01}, opts);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextStale);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1009);
+    EXPECT_TRUE(res.retryable);
+}
+
+TEST_F(MqttKeyprovCapabilityIntegTest, KeyprovPublishEmptyEpochRejectedOverIpc) {
+    PublishOptions opts;
+    opts.expected_session = SessionContext{};  // 空 epoch -> UNSUPPORTED
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-unsupported-1", {0x01}, opts);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextUnsupported);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1004);
+}
+
+TEST_F(MqttKeyprovCapabilityIntegTest, FotaPublishNotBlockedBySessionGuardOverIpc) {
+    // 非 keyprov route 不要求 expected_session（旧签名兼容入口）
+    auto res = client->publishRoute("tsp", "fota.uplink", "fota-ok-1",
+                                    std::vector<uint8_t>{0x02});
+    EXPECT_TRUE(res.accepted);
+}
+

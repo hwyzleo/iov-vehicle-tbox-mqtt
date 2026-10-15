@@ -77,6 +77,8 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/applied_subscription_manifest.cpp
     src/mqtt_service/src/broker_subscription_reconciler.cpp
     src/mqtt_service/src/cloud_readiness_gate.cpp
+    # CR-017: 进程级 daemon epoch
+    src/mqtt_service/src/daemon_epoch.cpp
     # CR-008: Application 组合根
     src/mqtt_service/src/mqtt_application.cpp
     # CR-009: Topic 模板校验/解析

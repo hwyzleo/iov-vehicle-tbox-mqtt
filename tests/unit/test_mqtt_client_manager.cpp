@@ -2,8 +2,46 @@
 #include "mqtt_client_manager.h"
 #include "credential_manager.h"
 #include "sec_tls_key_adapter.h"
+#include <openssl/x509.h>
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/bn.h>
 
 using namespace tbox::mqtt;
+
+namespace {
+/// CR-017: 生成指定 CN 的自签 ECDSA P-256 DER 证书（用于身份一致性测试）
+std::vector<uint8_t> makeSelfSignedDer(const std::string& cn) {
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1);
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_keygen(pctx, &pkey);
+    EVP_PKEY_CTX_free(pctx);
+    if (!pkey) return {};
+
+    X509* cert = X509_new();
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), 31536000L);
+    X509_NAME* name = X509_NAME_new();
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+    X509_set_subject_name(cert, name);
+    X509_set_issuer_name(cert, name);
+    X509_NAME_free(name);
+    X509_set_pubkey(cert, pkey);
+    X509_sign(cert, pkey, EVP_sha256());
+    unsigned char* buf = nullptr;
+    int len = i2d_X509(cert, &buf);
+    std::vector<uint8_t> der(buf, buf + len);
+    OPENSSL_free(buf);
+    X509_free(cert);
+    EVP_PKEY_free(pkey);
+    return der;
+}
+} // namespace
 
 class MqttClientManagerTest : public ::testing::Test {
 protected:
@@ -150,4 +188,40 @@ TEST_F(MqttClientManagerTest, NoLocalCredentialFileAccess) {
     MqttClientManager client;
     EXPECT_TRUE(client.initialize(cred_mgr_, tls_adapter_));
     // No file path parameters in initialize() - compilation verifies this
+}
+
+// CR-017 §3: leaf CN 与 PROV username 身份不一致时 fail-closed（不发起网络连接）
+TEST_F(MqttClientManagerTest, ConnectFailsOnUsernameCnConflict) {
+    std::vector<uint8_t> der = makeSelfSignedDer("ECU-ABC");
+    ASSERT_FALSE(der.empty());
+
+    CredentialManager ready;
+    ActiveTlsCredential cred;
+    cred.credential_id = "cred-1";
+    cred.version = 1;
+    cred.status = tbox::sec::TlsCredentialStatus::READY;
+    cred.root_ca_bundle = der;
+    cred.client_cert_chain = der;
+    cred.private_key_ref.data = {0x01, 0x02};
+    cred.key_algorithm = tbox::sec::KeyAlgorithm::ECDSA_P256;
+    cred.ready = true;
+    ready.simulateReady(cred);
+
+    SecTlsKeyAdapter adapter;
+    MqttClientManager client;
+    ASSERT_TRUE(client.initialize(ready, adapter));
+
+    ConnectionConfig config;
+    config.broker_host = "broker.example.com";
+    config.broker_port = 8883;
+    config.client_id = "VIN0001-SN0001";
+    config.credential_profile = "mqtt";
+    config.username = "ECU-XYZ";  // 与 CN(ECU-ABC) 不一致
+    config.min_tls_version = TlsVersion::TLS_1_2;
+    config.max_tls_version = TlsVersion::TLS_1_3;
+
+    EXPECT_FALSE(client.connect(config));
+    // 不发布有效会话身份
+    EXPECT_FALSE(client.getTlsSessionIdentity().valid);
+    EXPECT_TRUE(client.getTlsSessionIdentity().ecu_uid.empty());
 }

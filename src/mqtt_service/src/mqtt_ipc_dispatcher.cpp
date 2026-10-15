@@ -59,6 +59,15 @@ std::string cloudReadinessToJson(const CloudReadinessSnapshot& r) {
     j["certificate_ref"] = r.certificate_ref;
     j["reason_code"] = r.reason_code;
     j["event_sequence"] = r.event_sequence;
+    // CR-017 §4: 会话身份投影与可校验上下文（查询与事件共用）
+    j["ecu_uid"] = r.ecu_uid;
+    nlohmann::json sc = nlohmann::json::object();
+    sc["daemon_epoch"] = r.session_context.daemon_epoch;
+    sc["connection_generation"] = r.session_context.connection_generation;
+    sc["cert_session_generation"] = r.session_context.cert_session_generation;
+    j["session_context"] = sc;
+    // CR-017 §4: 由快照字段产生（旧 daemon 为 0/缺省，支持独立协商）
+    j["publish_contract_version"] = r.publish_contract_version;
     j["contract_version"] = kCloudReadinessContractVersion;
     j["subscriptions_ready"] = r.subscriptions_ready;
     j["connected"] = r.connected;
@@ -511,6 +520,16 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handlePublishRoute(
     req.content_type = j.value("content_type", "");
     req.trace_id = j.value("trace_id", "");
     req.request_id = j.value("request_id", "");
+
+    // CR-017 §5: 可选预期会话上下文（keyprov.uplink 必填，由 daemon 强制）
+    if (j.contains("expected_session") && j["expected_session"].is_object()) {
+        const auto& es = j["expected_session"];
+        SessionContext sc;
+        sc.daemon_epoch = es.value("daemon_epoch", "");
+        sc.connection_generation = es.value("connection_generation", 0ULL);
+        sc.cert_session_generation = es.value("cert_session_generation", 0ULL);
+        req.expected_session = std::move(sc);
+    }
 
     if (j.contains("qos")) {
         req.qos = static_cast<uint8_t>(j["qos"].get<int>());

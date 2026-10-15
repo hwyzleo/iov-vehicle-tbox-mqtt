@@ -73,6 +73,42 @@ std::shared_ptr<ProvisionIdentityManager> createSimulatedProvMgr() {
     return mgr;
 }
 
+/// CR-017: TSP 快照包含 catalog-governed keyprov.uplink（模板由 catalog 冻结）
+OwnerSubscriptionSnapshot makeKeyprovUplinkSnapshot(uint64_t gen) {
+    OwnerSubscriptionSnapshot s;
+    s.owner = "tsp";
+    s.generation = gen;
+    s.content_digest = "digest-" + std::to_string(gen);
+    s.registration_complete = true;
+    s.contract_version = kSubscriptionCatalogContractVersion;
+    SubscriptionItem up;
+    up.route_id = kKeyprovUplinkRouteId;
+    up.direction = SnapshotDirection::UP;
+    up.qos = 1;
+    up.enabled = true;
+    up.readiness_scope = kCapabilitySecurityKeyprov;
+    up.criticality = SubscriptionCriticality::CAPABILITY_MANDATORY;
+    s.items.push_back(up);
+    return s;
+}
+
+/// CR-017: 普通（非 keyprov）owner 自定义上行 route
+OwnerSubscriptionSnapshot makeFotaUplinkSnapshot(uint64_t gen) {
+    OwnerSubscriptionSnapshot s;
+    s.owner = "tsp";
+    s.generation = gen;
+    s.content_digest = "fota-" + std::to_string(gen);
+    s.registration_complete = true;
+    SubscriptionItem up;
+    up.route_id = "fota.uplink";
+    up.topic_template = "vehicle/{ecu_uid}/up/fota";
+    up.direction = SnapshotDirection::UP;
+    up.qos = 1;
+    up.target = "tsp.fota";
+    s.items.push_back(up);
+    return s;
+}
+
 struct MqttServiceDeps {
     std::shared_ptr<hwyz::store::Store> store;
     std::shared_ptr<ProvisionIdentityManager> prov_mgr;
@@ -218,5 +254,112 @@ TEST(MqttServiceIntegrationTest, ApplyOtaConfiguration) {
 
     EXPECT_TRUE(service.applyConfig(config, ConnectionConfig::Source::OTA));
 
+    cleanupTempDirs();
+}
+
+// ============================================================
+// CR-017 §5: keyprov 上行会话绑定 guard
+// ============================================================
+
+TEST(MqttServiceIntegrationTest, KeyprovPublishRequiresExpectedSession) {
+    std::string config_dir = createTempConfigDir();
+    std::string store_dir = createTempStoreDir();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    ASSERT_EQ(service.onReplaceSubscriptionSnapshot(makeKeyprovUplinkSnapshot(1)).status,
+              SnapshotAcceptStatus::ACCEPTED);
+
+    RoutePublishRequest req;
+    req.key.owner = "tsp";
+    req.key.route_id = kKeyprovUplinkRouteId;
+    req.msg_id = "kp-missing";
+    req.payload = {0x01, 0x02};
+    auto res = service.publishRoute(req);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextRequired);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1004);
+    EXPECT_FALSE(res.retryable);
+
+    service.stop();
+    cleanupTempDirs();
+}
+
+TEST(MqttServiceIntegrationTest, KeyprovPublishRejectsStaleSession) {
+    std::string config_dir = createTempConfigDir();
+    std::string store_dir = createTempStoreDir();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    ASSERT_EQ(service.onReplaceSubscriptionSnapshot(makeKeyprovUplinkSnapshot(1)).status,
+              SnapshotAcceptStatus::ACCEPTED);
+
+    RoutePublishRequest req;
+    req.key.owner = "tsp";
+    req.key.route_id = kKeyprovUplinkRouteId;
+    req.msg_id = "kp-stale";
+    req.payload = {0x01};
+    // 无有效 TLS 会话身份 -> validateSession 失败 -> STALE（需刷新快照后对账）
+    SessionContext sc;
+    sc.daemon_epoch = "deadbeefdeadbeef";
+    sc.connection_generation = 1;
+    sc.cert_session_generation = 1;
+    req.expected_session = sc;
+
+    auto res = service.publishRoute(req);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextStale);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1009);
+    EXPECT_TRUE(res.retryable);
+
+    service.stop();
+    cleanupTempDirs();
+}
+
+TEST(MqttServiceIntegrationTest, KeyprovPublishRejectsUnsupportedEmptyEpoch) {
+    std::string config_dir = createTempConfigDir();
+    std::string store_dir = createTempStoreDir();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    ASSERT_EQ(service.onReplaceSubscriptionSnapshot(makeKeyprovUplinkSnapshot(1)).status,
+              SnapshotAcceptStatus::ACCEPTED);
+
+    RoutePublishRequest req;
+    req.key.owner = "tsp";
+    req.key.route_id = kKeyprovUplinkRouteId;
+    req.msg_id = "kp-unsupported";
+    SessionContext sc;  // 空 epoch = 结构非法/契约不支持
+    req.expected_session = sc;
+
+    auto res = service.publishRoute(req);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextUnsupported);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1004);
+
+    service.stop();
+    cleanupTempDirs();
+}
+
+TEST(MqttServiceIntegrationTest, NonKeyprovPublishNotBlockedBySessionGuard) {
+    std::string config_dir = createTempConfigDir();
+    std::string store_dir = createTempStoreDir();
+    auto deps = createMqttDeps(config_dir, store_dir);
+    MqttService service(deps.store, *deps.prov_mgr, *deps.cred_mgr, *deps.tls_adapter);
+    service.initializeLocal();
+    ASSERT_EQ(service.onReplaceSubscriptionSnapshot(makeFotaUplinkSnapshot(1)).status,
+              SnapshotAcceptStatus::ACCEPTED);
+
+    RoutePublishRequest req;
+    req.key.owner = "tsp";
+    req.key.route_id = "fota.uplink";
+    req.msg_id = "fota-1";
+    req.payload = {0x09};
+    // 普通业务不携带 expected_session：guard 不适用（不得返回 session_* reason）
+    auto res = service.publishRoute(req);
+    EXPECT_NE(res.reason_code, session_reason::kPublishContextRequired);
+    EXPECT_NE(res.reason_code, session_reason::kPublishContextStale);
+
+    service.stop();
     cleanupTempDirs();
 }

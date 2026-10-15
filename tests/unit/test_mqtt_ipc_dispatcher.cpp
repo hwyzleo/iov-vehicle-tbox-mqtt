@@ -73,8 +73,13 @@ public:
     SubscriptionReadiness onGetSubscriptionReadiness() override {
         return last_readiness;
     }
-    PublishResult onPublishRoute(const RoutePublishRequest&) override {
-        return PublishResult{};
+    RoutePublishRequest last_route_req;
+    bool has_route_req = false;
+    PublishResult route_publish_result;
+    PublishResult onPublishRoute(const RoutePublishRequest& req) override {
+        last_route_req = req;
+        has_route_req = true;
+        return route_publish_result;
     }
 
     // CR-015 §18.4 stub
@@ -350,4 +355,80 @@ TEST_F(MqttIpcDispatcherTest, SubscribeCapabilityReadinessRegistersFd) {
 
     dispatcher->onClientDisconnected(810);
     EXPECT_TRUE(dispatcher->getCapabilityFds(kCapabilitySecurityKeyprov).empty());
+}
+
+// ============================================================
+// CR-017 §4/§5: readiness 新字段序列化 + publishRoute expected_session 解析
+// ============================================================
+
+TEST_F(MqttIpcDispatcherTest, ReadinessJsonIncludesEcuUidSessionContextAndPublishContract) {
+    handler.last_readiness.ecu_uid = "ECU-42";
+    handler.last_readiness.session_context.daemon_epoch = "aabbcc";
+    handler.last_readiness.session_context.connection_generation = 3;
+    handler.last_readiness.session_context.cert_session_generation = 4;
+    handler.last_readiness.contract_version = kCloudReadinessContractVersion;
+    handler.last_readiness.publish_contract_version = kPublishSessionContractVersion;
+
+    auto resp = dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::GET_SUBSCRIPTION_READINESS), "{}", 900);
+    auto j = json::parse(resp);
+    EXPECT_EQ(j["status"], 0);
+    EXPECT_EQ(j["ecu_uid"], "ECU-42");
+    ASSERT_TRUE(j.contains("session_context"));
+    EXPECT_EQ(j["session_context"]["daemon_epoch"], "aabbcc");
+    EXPECT_EQ(j["session_context"]["connection_generation"], 3u);
+    EXPECT_EQ(j["session_context"]["cert_session_generation"], 4u);
+    EXPECT_EQ(j["publish_contract_version"], kPublishSessionContractVersion);
+    EXPECT_EQ(j["contract_version"], kCloudReadinessContractVersion);
+}
+
+TEST_F(MqttIpcDispatcherTest, PublishRouteParsesExpectedSession) {
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = kKeyprovUplinkRouteId;
+    j["msg_id"] = "mp-1";
+    j["expected_session"] = {{"daemon_epoch", "epoch-1"},
+                             {"connection_generation", 5},
+                             {"cert_session_generation", 6}};
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 910);
+
+    ASSERT_TRUE(handler.has_route_req);
+    ASSERT_TRUE(handler.last_route_req.expected_session.has_value());
+    EXPECT_EQ(handler.last_route_req.expected_session->daemon_epoch, "epoch-1");
+    EXPECT_EQ(handler.last_route_req.expected_session->connection_generation, 5u);
+    EXPECT_EQ(handler.last_route_req.expected_session->cert_session_generation, 6u);
+}
+
+TEST_F(MqttIpcDispatcherTest, PublishRouteWithoutExpectedSessionIsNullopt) {
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = "fota.uplink";
+    j["msg_id"] = "mp-2";
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 920);
+
+    ASSERT_TRUE(handler.has_route_req);
+    EXPECT_FALSE(handler.last_route_req.expected_session.has_value());
+}
+
+TEST_F(MqttIpcDispatcherTest, PublishRouteResponseCarriesReasonAndRetryable) {
+    handler.route_publish_result.accepted = false;
+    handler.route_publish_result.error = ErrorCode::MQTT_1009;
+    handler.route_publish_result.reason_code = session_reason::kPublishContextStale;
+    handler.route_publish_result.retryable = true;
+
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = kKeyprovUplinkRouteId;
+    j["msg_id"] = "mp-3";
+
+    auto resp = dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 930);
+    auto parsed = json::parse(resp);
+    EXPECT_EQ(parsed["status"], 1009);
+    EXPECT_EQ(parsed["reason_code"], session_reason::kPublishContextStale);
+    EXPECT_TRUE(parsed["retryable"].get<bool>());
 }

@@ -238,6 +238,15 @@ CloudReadinessSnapshot parseCloudReadinessJson(std::string_view payload_json) {
     r.certificate_ref = j.value("certificate_ref", "");
     r.reason_code = j.value("reason_code", "");
     r.event_sequence = j.value("event_sequence", 0ULL);
+    // CR-017 §4: 会话身份投影、可校验上下文与 publish 契约版本
+    r.ecu_uid = j.value("ecu_uid", "");
+    r.publish_contract_version = j.value("publish_contract_version", 0u);
+    if (j.contains("session_context") && j["session_context"].is_object()) {
+        const auto& sc = j["session_context"];
+        r.session_context.daemon_epoch = sc.value("daemon_epoch", "");
+        r.session_context.connection_generation = sc.value("connection_generation", 0ULL);
+        r.session_context.cert_session_generation = sc.value("cert_session_generation", 0ULL);
+    }
     r.subscriptions_ready = j.value("subscriptions_ready", false);
     r.connected = j.value("connected", false);
     r.mandatory_count = j.value("mandatory_count", 0u);
@@ -775,8 +784,15 @@ public:
             r.reason_code = "transport_failed";
             return r;
         }
-        return parseCloudReadinessJson(response_json);
+        CloudReadinessSnapshot r = parseCloudReadinessJson(response_json);
+        // CR-017 §4: 缓存 daemon 公布的精 identity 绑定发布契约版本，
+        // 供 publishRoute(expected_session) 协商（旧 daemon 无保护，不得发 keyprov）
+        publish_contract_version_.store(r.contract_supported ? r.publish_contract_version : 0u);
+        return r;
     }
+
+    /// CR-017: daemon 公布的身份绑定发布契约版本（0=未知/不支持）
+    std::atomic<uint32_t> publish_contract_version_{0};
 
     std::string b64_encode(const std::vector<uint8_t>& data) {
         return b64Encode(data);
@@ -1071,21 +1087,55 @@ PublishResult Client::publishRoute(const std::string& owner,
                                    const std::string& content_type,
                                    const std::string& trace_id,
                                    const std::string& request_id) {
+    // CR-017: 旧签名保留源兼容；委托到带控制元数据重载（不含 expected_session）。
+    PublishOptions options;
+    options.qos = qos;
+    options.priority = priority;
+    options.content_type = content_type;
+    options.trace_id = trace_id;
+    options.request_id = request_id;
+    return publishRoute(owner, route_id, msg_id, payload, options);
+}
+
+PublishResult Client::publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   const PublishOptions& options) {
     PublishResult result;
 
-    // 构建 route publish JSON (CR-009 §6.1)
+    // CR-017 §19.6: 携带 expected_session 时显式协商发布契约。
+    // 旧 daemon 不识别 expected_session 也不会执行 guard，
+    // 故新 SDK 必须拒绝，不得降级为无保护发布。
+    if (options.expected_session.has_value() &&
+        impl_->publish_contract_version_.load() != kPublishSessionContractVersion) {
+        result.accepted = false;
+        result.error = ErrorCode::MQTT_1004;
+        result.reason_code = session_reason::kPublishContextUnsupported;
+        result.retryable = false;
+        return result;
+    }
+
+    // 构建 route publish JSON (CR-009 §6.1; CR-017 §5 expected_session)
     nlohmann::json params;
     params["owner"] = owner;
     params["route_id"] = route_id;
     params["msg_id"] = msg_id;
-    params["qos"] = static_cast<int>(qos);
-    params["priority"] = static_cast<int>(priority);
-    params["content_type"] = content_type;
+    params["qos"] = static_cast<int>(options.qos);
+    params["priority"] = static_cast<int>(options.priority);
+    params["content_type"] = options.content_type;
     if (!payload.empty()) {
         params["payload_base64"] = impl_->b64_encode(payload);
     }
-    params["trace_id"] = trace_id;
-    params["request_id"] = request_id;
+    params["trace_id"] = options.trace_id;
+    params["request_id"] = options.request_id;
+    if (options.expected_session.has_value()) {
+        nlohmann::json sc = nlohmann::json::object();
+        sc["daemon_epoch"] = options.expected_session->daemon_epoch;
+        sc["connection_generation"] = options.expected_session->connection_generation;
+        sc["cert_session_generation"] = options.expected_session->cert_session_generation;
+        params["expected_session"] = sc;
+    }
 
     // publishRoute: 相同 msg_id 可去重时允许一次重试 (同 publish 语义, CR-004 §7.1)
     auto [ok, status, response_json] = impl_->send_request(
@@ -1103,6 +1153,9 @@ PublishResult Client::publishRoute(const std::string& owner,
         std::string outcome = j.value("outcome", "rejected");
         result.outcome = (outcome == "accepted") ? PublishOutcome::ACCEPTED
                                                   : PublishOutcome::UNKNOWN;
+        // CR-017 §6: 调用方按 reason 判断处理方式（STALE 刷新快照；CONFLICT 不可原样重试）
+        result.reason_code = j.value("reason_code", "");
+        result.retryable = j.value("retryable", true);
         if (status != 0) {
             result.error = static_cast<ErrorCode>(status);
         }

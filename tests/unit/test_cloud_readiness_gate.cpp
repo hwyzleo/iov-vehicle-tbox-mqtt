@@ -5,13 +5,15 @@
 using namespace tbox::mqtt;
 
 namespace {
-TlsSessionIdentity makeIdentity(uint64_t cert_gen, const std::string& fp = "sha256:aa11bb22") {
+TlsSessionIdentity makeIdentity(uint64_t cert_gen, const std::string& fp = "sha256:aa11bb22",
+                               const std::string& uid = "HWYZ-ABC123") {
     TlsSessionIdentity id;
     id.cert_session_generation = cert_gen;
     id.credential_id = "cred-1";
     id.credential_version = cert_gen;
     id.certificate_ref = fp;
     id.device_identity_digest = fp;
+    id.ecu_uid = uid;
     id.valid = true;
     return id;
 }
@@ -266,4 +268,87 @@ TEST(CloudReadinessGateTest, CapabilityLosesReadyOnDisconnect) {
     gate.onConnectionState(ConnectionState::RECONNECTING, 1);
     EXPECT_FALSE(gate.isCloudReady());
     EXPECT_FALSE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+}
+
+// ============================================================
+// CR-017 §3, §4: ecu_uid 会话投影与 daemon epoch
+// ============================================================
+
+TEST(CloudReadinessGateTest, SnapshotCarriesEcuUidAndSessionContext) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 9);
+    gate.setTlsSessionIdentity(makeIdentity(12, "sha256:beef", "ECU-123"));
+    gate.onSubscriptionsReady(true, 1, 1);
+
+    auto r = gate.getReadiness();
+    EXPECT_TRUE(r.cloud_ready);
+    EXPECT_EQ(r.ecu_uid, "ECU-123");
+    EXPECT_FALSE(r.session_context.daemon_epoch.empty());
+    EXPECT_EQ(r.session_context.connection_generation, 9u);
+    EXPECT_EQ(r.session_context.cert_session_generation, 12u);
+    EXPECT_EQ(r.publish_contract_version, kPublishSessionContractVersion);
+    EXPECT_EQ(r.contract_version, kCloudReadinessContractVersion);
+}
+
+TEST(CloudReadinessGateTest, NoIdentityHasEmptyEcuUid) {
+    CloudReadinessGate gate;
+    auto r = gate.getReadiness();
+    EXPECT_TRUE(r.ecu_uid.empty());
+    EXPECT_FALSE(r.cloud_ready);
+}
+
+TEST(CloudReadinessGateTest, DaemonEpochStableAcrossGateInstances) {
+    // CR-017 §3: epoch 为进程级，Gate 重建不改变
+    CloudReadinessGate gate1;
+    CloudReadinessGate gate2;
+    EXPECT_EQ(gate1.getDaemonEpoch(), gate2.getDaemonEpoch());
+    EXPECT_FALSE(gate1.getDaemonEpoch().empty());
+    EXPECT_EQ(gate1.getDaemonEpoch().size(), 32u);  // 128-bit hex
+}
+
+TEST(CloudReadinessGateTest, ValidateSessionMatchesCurrentContext) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 9);
+    gate.setTlsSessionIdentity(makeIdentity(12));
+
+    SessionContext ok;
+    ok.daemon_epoch = gate.getDaemonEpoch();
+    ok.connection_generation = 9;
+    ok.cert_session_generation = 12;
+    EXPECT_TRUE(gate.validateSession(ok));
+
+    SessionContext wrong_epoch = ok;
+    wrong_epoch.daemon_epoch = "deadbeef";
+    EXPECT_FALSE(gate.validateSession(wrong_epoch));
+
+    SessionContext wrong_conn = ok;
+    wrong_conn.connection_generation = 8;
+    EXPECT_FALSE(gate.validateSession(wrong_conn));
+
+    SessionContext wrong_cert = ok;
+    wrong_cert.cert_session_generation = 11;
+    EXPECT_FALSE(gate.validateSession(wrong_cert));
+}
+
+TEST(CloudReadinessGateTest, ValidateSessionFalseWithoutValidIdentity) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 9);
+    SessionContext ctx;
+    ctx.daemon_epoch = gate.getDaemonEpoch();
+    ctx.connection_generation = 9;
+    ctx.cert_session_generation = 0;
+    EXPECT_FALSE(gate.validateSession(ctx));  // 无有效 identity
+}
+
+TEST(CloudReadinessGateTest, RevokeKeepsEcuUidInFalseSnapshot) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 2);
+    gate.setTlsSessionIdentity(makeIdentity(5, "sha256:aa11bb22", "ECU-REVOKED"));
+    gate.onSubscriptionsReady(true, 1, 1);
+    CloudReadinessSnapshot revoked;
+    gate.setCallback([&](const CloudReadinessSnapshot& s) { revoked = s; });
+    gate.revokeSession("credential_changed");
+    EXPECT_FALSE(revoked.cloud_ready);
+    EXPECT_EQ(revoked.ecu_uid, "ECU-REVOKED");
+    EXPECT_EQ(revoked.cert_session_generation, 5u);
 }

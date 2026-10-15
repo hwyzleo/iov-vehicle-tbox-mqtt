@@ -117,6 +117,16 @@ public:
                                const std::string& trace_id = "",
                                const std::string& request_id = "");
 
+    /// CR-017 §4/§5: 带控制元数据与会话绑定的 route-based 发布。
+    /// keyprov.uplink 必须携带 options.expected_session（取自 getSubscriptionReadiness
+    /// 的同一快照）；daemon 在受理与实际发送时校验，过期/缺失/不支持时明确拒绝。
+    /// 旧签名保留用于普通业务（源兼容）；keyprov 走旧签名不会绕过 guard（daemon 强制校验）。
+    PublishResult publishRoute(const std::string& owner,
+                               const std::string& route_id,
+                               const std::string& msg_id,
+                               const std::vector<uint8_t>& payload,
+                               const PublishOptions& options);
+
     /// 订阅下行路由 (CR-004 §6)
     /// 每次 subscribe 建立独立连接，完成订阅 Response 后进入 event-only loop。
     /// 返回 RAII Subscription 句柄，析构时自动取消。

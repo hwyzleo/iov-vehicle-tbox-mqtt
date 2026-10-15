@@ -86,6 +86,42 @@ TestCert createTestCert(const std::string& cn) {
     return tc;
 }
 
+/// CR-017: create self-signed cert with arbitrary subject attributes.
+/// e.g. {{"CN", "ecu-1"}} / {{"CN", "a"}, {"CN", "b"}} (ambiguous) /
+/// {{"O", "Org"}} (no CN).
+TestCert createTestCertWithSubject(
+        const std::vector<std::pair<std::string, std::string>>& attrs) {
+    TestCert tc;
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1);
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_keygen(pctx, &pkey);
+    EVP_PKEY_CTX_free(pctx);
+    tc.pkey = pkey;
+
+    X509* cert = X509_new();
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 7);
+    X509_gmtime_adj(X509_get_notBefore(cert), 0);
+    X509_gmtime_adj(X509_get_notAfter(cert), 31536000L);
+
+    X509_NAME* name = X509_NAME_new();
+    for (const auto& [key, value] : attrs) {
+        X509_NAME_add_entry_by_txt(name, key.c_str(), MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>(value.c_str()), -1, -1, 0);
+    }
+    X509_set_subject_name(cert, name);
+    X509_set_issuer_name(cert, name);
+    X509_NAME_free(name);
+
+    X509_set_pubkey(cert, pkey);
+    X509_sign(cert, pkey, EVP_sha256());
+    tc.der = x509ToDer(cert);
+    X509_free(cert);
+    return tc;
+}
+
 } // anonymous namespace
 
 namespace {
@@ -666,4 +702,87 @@ TEST(SecTlsKeyAdapterTest, Handshake_IpHostDnsSan_Fails) {
 
     EXPECT_FALSE(doTlsHandshake(client.ctx, server_ctx));
     SSL_CTX_free(server_ctx);
+}
+
+// ===== CR-017 §3: 实际 leaf CN -> 规范化 ecu_uid 投影 =====
+
+TEST(SecTlsKeyAdapterTest, NormalizeEcuUid_Various) {
+    std::string out;
+    EXPECT_TRUE(SecTlsKeyAdapter::normalizeEcuUid(" hwyz-abc123 ", out));
+    EXPECT_EQ(out, "HWYZ-ABC123");
+    EXPECT_TRUE(SecTlsKeyAdapter::normalizeEcuUid("A1-B2", out));
+    EXPECT_EQ(out, "A1-B2");
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid("", out));
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid("   ", out));
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid("bad uid", out));
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid("uid_1", out));
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid("slash/1", out));
+    EXPECT_FALSE(SecTlsKeyAdapter::normalizeEcuUid(std::string(65, 'A'), out));
+    EXPECT_TRUE(SecTlsKeyAdapter::normalizeEcuUid(std::string(64, 'A'), out));
+}
+
+/// CR-017: buildTlsContext with cert of given subject attrs, return ctx.helper
+static bool buildWithSubject(const std::vector<std::pair<std::string, std::string>>& attrs,
+                             SecTlsKeyAdapter& adapter, CredentialManager& mgr) {
+    auto tc = createTestCertWithSubject(attrs);
+    ActiveTlsCredential cred;
+    cred.credential_id = "test-cred";
+    cred.version = 1;
+    cred.status = TlsCredentialStatus::READY;
+    cred.root_ca_bundle = tc.der;
+    cred.client_cert_chain = tc.der;
+    cred.private_key_ref.data = {0x00, 0x01, 0x02, 0x03};
+    cred.key_algorithm = KeyAlgorithm::ECDSA_P256;
+    cred.ready = true;
+    mgr.simulateReady(cred);
+    SSL_CTX* ctx = adapter.buildTlsContext(cred, mgr, "broker.example.com",
+        TlsVersion::TLS_1_2, TlsVersion::TLS_1_3);
+    return ctx != nullptr;
+}
+
+TEST(SecTlsKeyAdapterTest, BuildTlsContext_ExtractsNormalizedEcuUid) {
+    SecTlsKeyAdapter adapter;
+    CredentialManager mgr;
+    ASSERT_TRUE(buildWithSubject({{"CN", " hwyz-abc123 "}}, adapter, mgr));
+    EXPECT_EQ(adapter.getLeafEcUid(), "HWYZ-ABC123");
+    EXPECT_EQ(adapter.getLastErrorCode(), "MQTT-1001");  // 无错误，保留默认分类
+    adapter.destroyContext();
+    EXPECT_TRUE(adapter.getLeafEcUid().empty());
+}
+
+TEST(SecTlsKeyAdapterTest, BuildTlsContext_MissingCn_FailsClosed_Mqtt1009) {
+    SecTlsKeyAdapter adapter;
+    CredentialManager mgr;
+    EXPECT_FALSE(buildWithSubject({{"O", "TestOrg"}}, adapter, mgr));
+    EXPECT_EQ(adapter.getLastErrorCode(), "MQTT-1009");
+    EXPECT_EQ(adapter.getLastReasonCode(), "SESSION_IDENTITY_MISSING");
+    EXPECT_TRUE(adapter.getLeafEcUid().empty());
+}
+
+TEST(SecTlsKeyAdapterTest, BuildTlsContext_AmbiguousCn_FailsClosed) {
+    SecTlsKeyAdapter adapter;
+    CredentialManager mgr;
+    EXPECT_FALSE(buildWithSubject({{"CN", "A1"}, {"CN", "B2"}}, adapter, mgr));
+    EXPECT_EQ(adapter.getLastErrorCode(), "MQTT-1009");
+    EXPECT_EQ(adapter.getLastReasonCode(), "SESSION_IDENTITY_INVALID");
+}
+
+TEST(SecTlsKeyAdapterTest, BuildTlsContext_IllegalCn_FailsClosed) {
+    SecTlsKeyAdapter adapter;
+    CredentialManager mgr;
+    EXPECT_FALSE(buildWithSubject({{"CN", "bad uid"}}, adapter, mgr));
+    EXPECT_EQ(adapter.getLastErrorCode(), "MQTT-1009");
+    EXPECT_EQ(adapter.getLastReasonCode(), "SESSION_IDENTITY_INVALID");
+}
+
+TEST(SecTlsKeyAdapterTest, BuildTlsContext_TooLongCn_FailsClosed) {
+    SecTlsKeyAdapter adapter;
+    CredentialManager mgr;
+    // OpenSSL 可能在编码阶段拒绝 >64 的 CN（此时报告 MISSING），
+    // 或在规范化阶段拒绝（INVALID）；两种均 fail-closed。
+    EXPECT_FALSE(buildWithSubject({{"CN", std::string(65, 'A')}}, adapter, mgr));
+    EXPECT_EQ(adapter.getLastErrorCode(), "MQTT-1009");
+    const std::string reason = adapter.getLastReasonCode();
+    EXPECT_TRUE(reason == "SESSION_IDENTITY_MISSING" ||
+                reason == "SESSION_IDENTITY_INVALID");
 }

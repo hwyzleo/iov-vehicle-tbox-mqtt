@@ -139,6 +139,37 @@ struct PublishResult {
 };
 
 // ============================================================
+// 会话上下文与身份绑定发布 (CR-017 §4, §19.2)
+// ============================================================
+
+/// 可校验的 daemon 生命周期 / 连接 / 证书会话上下文 (CR-017 §4)
+///
+/// 全部字段由 MQTT daemon 从同一不可变会话身份对象产生；SDK/调用方只读。
+/// 该上下文用于「读快照 -> 构造报文 -> publish」期间的一致性检查（防 TOCTOU），
+/// 不是授权凭据，也不是云端认证证据。
+/// - daemon_epoch：进程级生命周期标识，进程重启后变化；
+/// - connection_generation：Broker 连接 generation；
+/// - cert_session_generation：本次 TLS 会话不可复用 generation。
+struct SessionContext {
+    std::string daemon_epoch;
+    uint64_t connection_generation = 0;
+    uint64_t cert_session_generation = 0;
+};
+
+/// 身份绑定发布的控制元数据 (CR-017 §4, §5, §18.4)
+///
+/// keyprov.uplink 必须携带 expected_session；缺失/不支持/过期时明确拒绝，
+/// 不得退化为未绑定发布。普通业务可省略 expected_session 保持既有行为。
+struct PublishOptions {
+    QoS qos = QoS::AT_LEAST_ONCE;
+    Priority priority = Priority::NORMAL;
+    std::string content_type;
+    std::string trace_id;
+    std::string request_id;
+    std::optional<SessionContext> expected_session;  // CR-017：会话绑定 guard
+};
+
+// ============================================================
 // 通用结果 (CR-004 §7.1)
 // ============================================================
 
@@ -290,6 +321,20 @@ constexpr const char* kKeyprovDownlinkRouteId = "keyprov.downlink";
 /// CR-015 keyprov payload 上限（上下行一致，PAR-PROTO-DSN-CR-006）
 constexpr size_t kKeyprovMaxPayloadBytes = 16 * 1024;
 
+/// CR-017 §6 稳定 reason code（脱敏，不含身份/Topic/payload）
+///
+/// 调用方必须按 reason 判断处理方式，不能只看数字码：
+/// - STALE 应刷新快照、等待就绪并对账；不得误判为 PROV 绑定故障；
+/// - CONFLICT 不能靠原样重试解决。
+namespace session_reason {
+constexpr const char* kSessionIdentityMissing   = "SESSION_IDENTITY_MISSING";
+constexpr const char* kSessionIdentityInvalid   = "SESSION_IDENTITY_INVALID";
+constexpr const char* kSessionIdentityConflict  = "SESSION_IDENTITY_CONFLICT";
+constexpr const char* kPublishContextRequired   = "PUBLISH_SESSION_CONTEXT_REQUIRED";
+constexpr const char* kPublishContextStale      = "PUBLISH_SESSION_CONTEXT_STALE";
+constexpr const char* kPublishContextUnsupported = "PUBLISH_SESSION_CONTEXT_UNSUPPORTED";
+} // namespace session_reason
+
 /// CR-015 稳定 reason code（脱敏，不含身份/Topic/payload）
 namespace capability_reason {
 constexpr const char* kKeyprovDisabled          = "KEYPROV_DISABLED";
@@ -368,10 +413,17 @@ struct SnapshotStatusResult {
     bool registration_complete = false;
 };
 
-/// Cloud Readiness 契约版本 (DSN-CR-014 §7)
+/// Cloud Readiness 契约版本 (DSN-CR-014 §7; DSN-CR-017 §4)
 /// daemon 与 SDK 通过 IPC 传递该版本号；SDK 遇到缺失或不兼容版本时返回
 /// UNSUPPORTED_CONTRACT_VERSION，不得伪造空证书身份后宣告可用。
-constexpr uint32_t kCloudReadinessContractVersion = 2;
+/// CR-017: v3 覆盖完整身份绑定能力（readiness 暴露 ecu_uid + session_context，
+/// 且 daemon 对 keyprov publish 执行 expected_session guard）。
+constexpr uint32_t kCloudReadinessContractVersion = 3;
+
+/// 身份绑定发布契约版本 (DSN-CR-017 §4, §19.6)
+/// 与 readiness 契约分别协商：仅 readiness 升到 v3 不自动代表 publish guard 可用。
+/// SDK 依此字段判断 daemon 是否接受 expected_session，缺失/不兼容时 keyprov not-ready。
+constexpr uint32_t kPublishSessionContractVersion = 1;
 
 /// Capability Readiness 契约版本 (DSN-CR-015 §18.4)
 constexpr uint32_t kCapabilityReadinessContractVersion = 1;
@@ -417,6 +469,14 @@ struct CloudReadinessSnapshot {
     std::string certificate_ref;            // sha256:<hex fingerprint>
     std::string reason_code;                // 非 ready 时的原因（MQTT-1011 等）
     uint64_t event_sequence = 0;            // daemon 生命周期内单调递增，用于发现事件缺口
+    // ---- CR-017 §4: 当前 mTLS 会话身份投影（只读，daemon 生成）----
+    // ecu_uid：来自实际装入 TLS context 的 leaf 客户端证书 CN 的规范化值。
+    // 与 device_identity_digest/certificate_ref/两个 generation 来自同一不可变对象；
+    // 无有效会话时为空，且不得声明 ready。
+    std::string ecu_uid;
+    SessionContext session_context;         // 可校验的 daemon epoch + 两个 generation
+    // CR-017：身份绑定发布契约版本（与 readiness 契约独立协商）
+    uint32_t publish_contract_version = 0;  // 0=旧 daemon 未提供
     // ---- CR-007 兼容诊断字段（旧调用方忽略）----
     bool subscriptions_ready = false;       // Mandatory 全部 ACTIVE
     bool connected = false;                 // CONNACK 成功（含 SUBSCRIBING/CLOUD_READY/DEGRADED）

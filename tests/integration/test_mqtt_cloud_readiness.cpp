@@ -86,6 +86,36 @@ std::string fingerprintForCert(TestCert& tc) {
     return fp;
 }
 
+/// CR-017: 从实际装载的 leaf 证书得到 {指纹, 规范化 ecu_uid}
+struct LeafIdentity {
+    std::string fingerprint;
+    std::string ecu_uid;
+};
+
+LeafIdentity leafIdentityForCert(TestCert& tc) {
+    LeafIdentity out;
+    CredentialManager mgr;
+    ActiveTlsCredential cred;
+    cred.credential_id = "cred-x";
+    cred.version = 1;
+    cred.status = TlsCredentialStatus::READY;
+    cred.root_ca_bundle = tc.der;
+    cred.client_cert_chain = tc.der;
+    cred.private_key_ref.data = {0x00, 0x01};
+    cred.key_algorithm = KeyAlgorithm::ECDSA_P256;
+    cred.ready = true;
+    mgr.simulateReady(cred);
+
+    SecTlsKeyAdapter adapter;
+    SSL_CTX* ctx = adapter.buildTlsContext(cred, mgr, "broker.example.com",
+        TlsVersion::TLS_1_2, TlsVersion::TLS_1_3);
+    if (!ctx) return out;
+    out.fingerprint = adapter.getLeafFingerprint();
+    out.ecu_uid = adapter.getLeafEcUid();
+    adapter.destroyContext();
+    return out;
+}
+
 class CloudReadinessIntegHandler : public MqttIpcDispatcher::ServiceHandler {
 public:
     ::tbox::fw::ipc::Server* server = nullptr;
@@ -127,7 +157,8 @@ std::string make_socket() {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".sock";
 }
 
-TlsSessionIdentity makeIdentity(uint64_t cert_gen, const std::string& fp, uint64_t conn_gen) {
+TlsSessionIdentity makeIdentity(uint64_t cert_gen, const std::string& fp, uint64_t conn_gen,
+                                const std::string& uid = "INTEG-LEAF") {
     TlsSessionIdentity id;
     id.cert_session_generation = cert_gen;
     id.connection_generation = conn_gen;
@@ -135,6 +166,7 @@ TlsSessionIdentity makeIdentity(uint64_t cert_gen, const std::string& fp, uint64
     id.credential_version = cert_gen;
     id.certificate_ref = fp;
     id.device_identity_digest = fp;
+    id.ecu_uid = uid;
     id.valid = true;
     return id;
 }
@@ -295,4 +327,52 @@ TEST_F(MqttCloudReadinessIntegTest, PublishCannotOverrideIdentity) {
     auto r = client->getSubscriptionReadiness();
     EXPECT_EQ(r.certificate_ref, fp);
     EXPECT_EQ(r.device_identity_digest, fp);
+}
+
+// CR-017 §4: readiness.ecu_uid 来自实际 leaf CN，与摘要/generation 原子一致
+TEST_F(MqttCloudReadinessIntegTest, QuerySnapshotCarriesEcuUidFromLeafCn) {
+    TestCert tc = createTestCert("integ-ecu-1");
+    LeafIdentity leaf = leafIdentityForCert(tc);
+    ASSERT_FALSE(leaf.fingerprint.empty());
+    ASSERT_EQ(leaf.ecu_uid, "INTEG-ECU-1");
+
+    handler.gate.onConnectionState(ConnectionState::CONNECTED, 5);
+    handler.gate.setTlsSessionIdentity(makeIdentity(3, leaf.fingerprint, 5, leaf.ecu_uid));
+    handler.gate.onSubscriptionsReady(true, 1, 1);
+
+    auto r = client->getSubscriptionReadiness();
+    EXPECT_TRUE(r.cloud_ready);
+    EXPECT_EQ(r.ecu_uid, "INTEG-ECU-1");
+    EXPECT_EQ(r.session_context.daemon_epoch, handler.gate.getDaemonEpoch());
+    EXPECT_EQ(r.session_context.connection_generation, 5u);
+    EXPECT_EQ(r.session_context.cert_session_generation, 3u);
+    EXPECT_EQ(r.publish_contract_version, kPublishSessionContractVersion);
+}
+
+// CR-017 §4: typed 事件同样携带 ecu_uid 与可校验会话上下文
+TEST_F(MqttCloudReadinessIntegTest, EventCarriesEcuUidAndSessionContext) {
+    TestCert tc = createTestCert("integ-ecu-2");
+    LeafIdentity leaf = leafIdentityForCert(tc);
+
+    std::mutex m;
+    CloudReadinessSnapshot got;
+    bool received = false;
+    auto sub = client->subscribeCloudReadinessChanged([&](const CloudReadinessSnapshot& s) {
+        std::lock_guard<std::mutex> l(m);
+        got = s; received = true;
+    });
+    ASSERT_TRUE(sub.isActive());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    handler.gate.onConnectionState(ConnectionState::CONNECTED, 5);
+    handler.gate.setTlsSessionIdentity(makeIdentity(3, leaf.fingerprint, 5, leaf.ecu_uid));
+    handler.gate.onSubscriptionsReady(true, 1, 1);
+    for (int i = 0; i < 50 && !received; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(received);
+    std::lock_guard<std::mutex> l(m);
+    EXPECT_EQ(got.ecu_uid, "INTEG-ECU-2");
+    EXPECT_EQ(got.session_context.daemon_epoch, handler.gate.getDaemonEpoch());
+    EXPECT_EQ(got.session_context.cert_session_generation, 3u);
 }

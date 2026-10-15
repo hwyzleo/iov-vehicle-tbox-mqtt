@@ -48,9 +48,21 @@ public:
         s.connected = true;
         s.contract_version = kCloudReadinessContractVersion;
         s.contract_supported = true;
+        // CR-017 §4
+        s.ecu_uid = "ECU-READY";
+        s.session_context.daemon_epoch = "epoch-abc";
+        s.session_context.connection_generation = 4;
+        s.session_context.cert_session_generation = 9;
+        s.publish_contract_version = publish_contract.load();
         return s;
     }
-    PublishResult onPublishRoute(const RoutePublishRequest&) override { return PublishResult{}; }
+    // CR-017: 模拟 daemon 公布的发布契约版本；旧 daemon 为 0
+    std::atomic<uint32_t> publish_contract{kPublishSessionContractVersion};
+    std::atomic<int> route_calls{0};
+    PublishResult onPublishRoute(const RoutePublishRequest&) override {
+        route_calls.fetch_add(1);
+        return PublishResult{};
+    }
     std::pair<int32_t, bool> onSubscribeRoutedDownlinkEventChannel(
         const std::string&, int) override { return {0, true}; }
     std::pair<int32_t, bool> onSubscribeCloudReadinessEventChannel(int client_fd) override {
@@ -87,6 +99,12 @@ std::string readinessJson(uint64_t seq, bool ready = true, uint64_t cert_gen = 9
     j["owner_generations"] = nlohmann::json::object();
     j["mandatory_count"] = 1;
     j["mandatory_active"] = 1;
+    // CR-017 §4
+    j["ecu_uid"] = "ECU-EVT";
+    j["session_context"] = {{"daemon_epoch", "epoch-evt"},
+                            {"connection_generation", 4},
+                            {"cert_session_generation", cert_gen}};
+    j["publish_contract_version"] = kPublishSessionContractVersion;
     return j.dump();
 }
 
@@ -254,6 +272,39 @@ TEST_F(MqttClientReadinessTest, QueryReturnsFullSnapshot) {
     EXPECT_EQ(r.event_sequence, 7u);
 }
 
+// CR-017 §4: 查询返回 ecu_uid / session_context / publish 契约版本
+TEST_F(MqttClientReadinessTest, QueryReturnsEcuUidAndSessionContext) {
+    auto r = client->getSubscriptionReadiness();
+    EXPECT_EQ(r.ecu_uid, "ECU-READY");
+    EXPECT_EQ(r.session_context.daemon_epoch, "epoch-abc");
+    EXPECT_EQ(r.session_context.connection_generation, 4u);
+    EXPECT_EQ(r.session_context.cert_session_generation, 9u);
+    EXPECT_EQ(r.publish_contract_version, kPublishSessionContractVersion);
+}
+
+// CR-017 §4: typed 事件解析 ecu_uid / session_context
+TEST_F(MqttClientReadinessTest, EventParsesEcuUidAndSessionContext) {
+    std::mutex m;
+    CloudReadinessSnapshot got;
+    bool received = false;
+    auto sub = client->subscribeCloudReadinessChanged([&](const CloudReadinessSnapshot& s) {
+        std::lock_guard<std::mutex> l(m);
+        got = s; received = true;
+    });
+    ASSERT_TRUE(sub.isActive());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    push(readinessJson(1));
+    for (int i = 0; i < 50 && !received; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(received);
+    std::lock_guard<std::mutex> l(m);
+    EXPECT_EQ(got.ecu_uid, "ECU-EVT");
+    EXPECT_EQ(got.session_context.daemon_epoch, "epoch-evt");
+    EXPECT_EQ(got.session_context.cert_session_generation, 9u);
+    EXPECT_EQ(got.publish_contract_version, kPublishSessionContractVersion);
+}
+
 // 参数非法：空 callback 返回非活跃句柄
 TEST_F(MqttClientReadinessTest, EmptyCallbackInactive) {
     auto sub = client->subscribeCloudReadinessChanged(CloudReadinessCallback{});
@@ -269,4 +320,38 @@ TEST_F(MqttClientReadinessTest, CancelIdempotent) {
     EXPECT_FALSE(sub.isActive());
     sub.cancel();  // 幂等
     EXPECT_FALSE(sub.isActive());
+}
+
+// CR-017 §19.6: 新 SDK + 旧 daemon（不支持 publish 契约）时本机拒绝 keyprov 发布，
+// 不发出无保护请求。
+TEST_F(MqttClientReadinessTest, PublishRouteWithSessionRejectedWhenPublishContractUnsupported) {
+    handler.publish_contract.store(0);  // 旧 daemon
+    auto r = client->getSubscriptionReadiness();
+    EXPECT_EQ(r.publish_contract_version, 0u);
+
+    PublishOptions opts;
+    SessionContext sc;
+    sc.daemon_epoch = "epoch-abc";
+    sc.connection_generation = 4;
+    sc.cert_session_generation = 9;
+    opts.expected_session = sc;
+
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-old-daemon", {0x01}, opts);
+    EXPECT_FALSE(res.accepted);
+    EXPECT_EQ(res.reason_code, session_reason::kPublishContextUnsupported);
+    EXPECT_EQ(res.error, ErrorCode::MQTT_1004);
+    EXPECT_FALSE(res.retryable);
+    EXPECT_EQ(handler.route_calls.load(), 0);  // 未发出请求
+}
+
+// CR-017: daemon 公布兼容 publish 契约时，携带 expected_session 正常发出
+TEST_F(MqttClientReadinessTest, PublishRouteWithSessionSentWhenPublishContractSupported) {
+    auto r = client->getSubscriptionReadiness();
+    EXPECT_EQ(r.publish_contract_version, kPublishSessionContractVersion);
+
+    PublishOptions opts;
+    opts.expected_session = r.session_context;
+    auto res = client->publishRoute("tsp", kKeyprovUplinkRouteId, "kp-new-daemon", {0x01}, opts);
+    EXPECT_NE(res.reason_code, session_reason::kPublishContextUnsupported);
+    EXPECT_EQ(handler.route_calls.load(), 1);
 }

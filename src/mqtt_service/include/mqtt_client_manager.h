@@ -39,6 +39,11 @@ public:
     // Disconnect from broker
     void disconnect();
 
+    // CR-017 §19.3.2: 彻底丢弃本地 mosquitto 实例及其内部 QoS 未决发送队列，
+    // 用于会话身份/证书切换时防止旧 bytes 被底层自动重发带入新连接。
+    // 下次 connect() 会重建全新实例；同时清零旧 TlsSessionIdentity。
+    void reset();
+
     // Publish message (Design §5)
     PublishResult publish(const std::string& topic,
                          const std::vector<uint8_t>& payload,

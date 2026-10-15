@@ -278,12 +278,14 @@ bool MqttService::startExternal() {
     cred_mgr_.subscribeTlsCredentialChanged([this]() {
         // 先撤销旧会话 Cloud Ready，保证调用方精确失效旧 generation
         if (cloud_ready_gate_) {
+            std::lock_guard<std::mutex> lock(session_guard_mutex_);
             cloud_ready_gate_->revokeSession("credential_changed");
         }
         // CR-005 §7 cleanup 顺序: 标记 generation 失效 -> 清理旧 TLS context -> 状态机转 CERT_WAIT
         cred_mgr_.invalidateCredential();
         tls_adapter_.destroyContext();
-        client_manager_->disconnect();
+        // CR-017 §19.3.2: 丢弃本地未决发送队列，旧会话 bytes 不得进入新连接
+        client_manager_->reset();
         state_machine_->onCredentialChanged();
     });
 
@@ -1009,6 +1011,7 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                 auto identity = client_manager_->getTlsSessionIdentity();
                 if (identity.valid) {
                     identity.connection_generation = state_machine_->getConnectionGeneration();
+                    std::lock_guard<std::mutex> lock(session_guard_mutex_);
                     cloud_ready_gate_->setTlsSessionIdentity(identity);
                 }
             }
@@ -1020,6 +1023,7 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             auto identity = client_manager_->getTlsSessionIdentity();
             if (identity.valid) {
                 identity.connection_generation = state_machine_->getConnectionGeneration();
+                std::lock_guard<std::mutex> lock(session_guard_mutex_);
                 cloud_ready_gate_->setTlsSessionIdentity(identity);
             }
         }
@@ -1034,7 +1038,8 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
                     {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1009")}
                 }
             );
-            client_manager_->disconnect();
+            // CR-017 §11.3/§19.4: 身份变化时丢弃旧会话未决队列与新 clientId 隔离
+            client_manager_->reset();
             state_machine_->onProvisionChanged();
             return;
         }
@@ -1479,6 +1484,56 @@ std::shared_ptr<const EffectiveRouteTable> MqttService::getRouteTable() const {
 // ============================================================
 
 PublishResult MqttService::publishRoute(const RoutePublishRequest& req) {
+    // CR-017 §5, §19.3: 校验 + 实际发送在同一串行化边界内完成。
+    // 会话身份切换（setTlsSessionIdentity/revokeSession）同样持此锁，
+    // 因此校验通过后不可能在提交连接前发生换证/重连。
+    std::lock_guard<std::mutex> lock(session_guard_mutex_);
+
+    // CR-017 §5: capability-gated (keyprov) 上行强制携带并校验预期会话上下文。
+    // 普通业务保持既有行为，不受 session guard 影响。
+    auto route = route_table_ ? route_table_->lookupRoute(req.key)
+                              : std::optional<ResolvedRoute>{};
+    const bool capability_gated =
+        route.has_value() && !route->definition.readiness_scope.empty() &&
+        (route->definition.direction == SnapshotDirection::UP ||
+         route->definition.direction == SnapshotDirection::BIDIRECTIONAL);
+
+    if (capability_gated) {
+        // CR-017 §19.5: 只记录 reason/generation 摘要，不输出完整 UID/Topic/payload
+        auto reject = [&](ErrorCode err, const char* reason, bool retryable) -> PublishResult {
+            MqttLogAdapter::publish().warn(
+                "mqtt.session.publish.rejected",
+                "会话绑定发布被拒绝",
+                {
+                    {"owner", tbox::fw::log::FieldValue::makeString(req.key.owner)},
+                    {"route_id_hash", tbox::fw::log::FieldValue::makeString(
+                        topicTemplate(req.key.route_id))},
+                    {"reason_code", tbox::fw::log::FieldValue::makeString(reason)},
+                    {"error_code", tbox::fw::log::FieldValue::makeString(
+                        errorCodeToString(err))}
+                }
+            );
+            PublishResult r;
+            r.accepted = false;
+            r.error = err;
+            r.reason_code = reason;
+            r.retryable = retryable;
+            return r;
+        };
+
+        if (!req.expected_session.has_value()) {
+            return reject(ErrorCode::MQTT_1004, session_reason::kPublishContextRequired, false);
+        }
+        const SessionContext& sc = req.expected_session.value();
+        if (sc.daemon_epoch.empty()) {
+            return reject(ErrorCode::MQTT_1004, session_reason::kPublishContextUnsupported, false);
+        }
+        if (!cloud_ready_gate_ || !cloud_ready_gate_->validateSession(sc)) {
+            // 刷新快照、等待就绪后对账重试；不得当作 PROV 绑定故障
+            return reject(ErrorCode::MQTT_1009, session_reason::kPublishContextStale, true);
+        }
+    }
+
     return route_publisher_->publishRoute(req, route_table_, *template_resolver_);
 }
 

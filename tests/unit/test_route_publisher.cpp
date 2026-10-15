@@ -303,3 +303,28 @@ TEST(RoutePublisherTest, KeyprovContractUnsupportedNotProjected) {
     EXPECT_FALSE(result.accepted);
     EXPECT_EQ(result.reason_code, capability_reason::kKeyprovDisabled);
 }
+
+// CR-017 §19.5: Envelope bytes 与网络 PUBLISH payload 逐字节相同（透明传输）。
+// RoutePublisher 不解析 payload，也不解释 expected_session（由 MqttService guard 负责）。
+TEST(RoutePublisherTest, KeyprovPublishIsByteTransparent) {
+    RoutePublisherTestEnv env;
+    setupKeyprov(env, true, kSubscriptionCatalogContractVersion);
+    env.is_connected = true;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", kKeyprovUplinkRouteId};
+    req.msg_id = "kp_bytes";
+    // 含似 unknown fields 的任意二进制
+    req.payload = {0x08, 0x00, 0xFF, 0x10, 0x7F, 0x00, 0x80, 0x01, 0x02};
+    SessionContext sc;
+    sc.daemon_epoch = "epoch-1";
+    sc.connection_generation = 1;
+    sc.cert_session_generation = 1;
+    req.expected_session = sc;
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_TRUE(result.accepted);
+    EXPECT_TRUE(env.broker_called);
+    EXPECT_EQ(env.broker_payload, req.payload);  // 逐字节一致
+    EXPECT_EQ(env.broker_topic, "vehicle/ECU123/up/keyprov");
+}
