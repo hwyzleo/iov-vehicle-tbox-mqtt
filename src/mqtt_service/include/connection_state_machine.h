@@ -85,11 +85,19 @@ public:
     void setSubscriptionGateDeadline(std::chrono::steady_clock::time_point deadline);
     void onSubscriptionGateTimeout();
 
-    // ---- CR-005 §7: connection generation ----
+    // ---- CR-005 §7 / CR-017 §3, §19: connection generation ----
     uint64_t getConnectionGeneration() const;
     void invalidateConnectionGeneration();
 
+    /// CR-017: 提交一个有效连接上下文，返回新的非零 connection generation。
+    /// 首次提交 0 -> 1；后续连接上下文替换 N -> N+1（uint64 回绕跳过 0）。
+    /// 调用方为“成功 TLS + MQTT CONNECT/CONNACK、准备提交有效身份快照”的连接建立点。
+    uint64_t commitActiveConnection();
+
 private:
+    /// 已持锁的 commit 实现，供状态机内部转换调用。
+    uint64_t commitActiveConnectionLocked();
+
     StateChangeCallback transitionTo(ConnectionState new_state);
     void calculateNextRetry();
     void calculateNextCredentialPoll();  // CR-005 §6: CERT_WAIT 独立退避
@@ -120,7 +128,10 @@ private:
     // CR-007 §6: SUBSCRIPTION_WAIT 门闩超时 deadline
     std::chrono::steady_clock::time_point subscription_gate_deadline_;
 
-    // CR-005 §7: connection generation（凭据变化时递增，阻止旧 callback 重入 CONNECTED）
+    // CR-005 §7 / CR-017 §3: connection generation。
+    // 0 = 当前不存在可发布的有效连接上下文；有效连接建立并提交身份快照时 0 -> 1，
+    // 之后每次连接上下文被替换（重连/凭据变化/绑定失效/显式 invalidate）N -> N+1，
+    // uint64 回绕时跳过 0。ready=true 时该值必不为 0。
     uint64_t connection_generation_ = 0;
 
     // CR-007 §7: 门闩超时降级标记（不得发布 Cloud Ready）
@@ -130,6 +141,9 @@ private:
     std::condition_variable timer_cv_;
     std::atomic<bool> timer_running_{false};
 };
+
+/// CR-017: 计算下一个非零 connection generation（0 -> 1、N -> N+1，uint64 回绕跳过 0）。
+uint64_t next_nonzero_connection_generation(uint64_t current);
 
 } // namespace mqtt
 } // namespace tbox

@@ -305,13 +305,17 @@ CloudReadinessGate::getCapabilities() const {
 bool CloudReadinessGate::evaluateLocked(const std::string& reason,
                                         CloudReadinessSnapshot& out) {
     // CR-017 §3: daemon epoch 随机源失败时不得宣告身份绑定能力就绪。
+    // CR-017 §3/§19: 有效身份上下文 = daemon epoch 可用且 connection generation 非零。
+    // generation==0 表示尚未提交任何可发布连接上下文，此时不得宣告身份就绪。
+    const bool identity_context_valid =
+        daemon_epoch_valid_ && connection_generation_ != 0;
     bool new_ready = isConnectedState(connection_state_) &&
                      subscriptions_ready_ &&
                      !degraded_ &&
-                     daemon_epoch_valid_ &&
+                     identity_context_valid &&
                      connection_state_ != ConnectionState::CONNECTED_DEGRADED;
-    // CR-017 §3: epoch 不可用时给出明确、可区分的 identity reason
-    const std::string effective_reason = daemon_epoch_valid_
+    // CR-017 §3: epoch/上下文不可用时给出明确、可区分的 identity reason
+    const std::string effective_reason = identity_context_valid
         ? reason
         : session_reason::kSessionIdentityInvalid;
     last_reason_ = effective_reason;

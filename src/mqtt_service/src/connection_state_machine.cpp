@@ -6,6 +6,13 @@
 namespace tbox {
 namespace mqtt {
 
+// CR-017: connection generation 回绕安全递增：0 -> 1、N -> N+1；
+// uint64 溢出时跳过 0（0 保留给“无有效连接上下文”）。
+uint64_t next_nonzero_connection_generation(uint64_t current) {
+    const uint64_t next = current + 1;
+    return next == 0 ? 1 : next;
+}
+
 ConnectionStateMachine::ConnectionStateMachine() {
     state_info_.state = ConnectionState::INIT;
 }
@@ -120,6 +127,9 @@ void ConnectionStateMachine::onConnectionSuccess() {
         // CR-005 §7: 检查 connection generation，阻止旧 callback 重入 CONNECTED
         if (state_info_.state == ConnectionState::CONNECTING) {
             state_info_.retry_count = 0;
+            // CR-017 §3/§19: 成功 TLS + MQTT CONNECT/CONNACK 即提交一个有效连接上下文。
+            // 首次 0 -> 1，普通重连 N -> N+1；旧 expected_session 因此不再匹配。
+            commitActiveConnectionLocked();
             cb = transitionTo(ConnectionState::CONNECTED);
         }
     }
@@ -264,7 +274,8 @@ void ConnectionStateMachine::onProvisionChanged() {
         if (state_info_.state == ConnectionState::CONNECTED ||
             state_info_.state == ConnectionState::CONNECTING ||
             state_info_.state == ConnectionState::RECONNECTING) {
-            connection_generation_++;  // Invalidate connection generation
+            connection_generation_ =
+                next_nonzero_connection_generation(connection_generation_);  // Invalidate connection generation
             state_info_.last_error = "Provision binding changed";
             state_info_.retry_count = 0;
             provision_poll_count_ = 0;
@@ -315,7 +326,8 @@ void ConnectionStateMachine::onCredentialChanged() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_info_.state == ConnectionState::CONNECTED ||
             state_info_.state == ConnectionState::CONNECTING) {
-            connection_generation_++;  // 标记失效，阻止旧 callback 重入 CONNECTED
+            connection_generation_ =
+                next_nonzero_connection_generation(connection_generation_);  // 标记失效，阻止旧 callback 重入 CONNECTED
             state_info_.last_error = "Credential changed/restarted";
             credential_poll_count_ = 0;
             calculateNextCredentialPoll();
@@ -473,9 +485,21 @@ uint64_t ConnectionStateMachine::getConnectionGeneration() const {
     return connection_generation_;
 }
 
+uint64_t ConnectionStateMachine::commitActiveConnectionLocked() {
+    connection_generation_ =
+        next_nonzero_connection_generation(connection_generation_);
+    return connection_generation_;
+}
+
+uint64_t ConnectionStateMachine::commitActiveConnection() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return commitActiveConnectionLocked();
+}
+
 void ConnectionStateMachine::invalidateConnectionGeneration() {
     std::lock_guard<std::mutex> lock(mutex_);
-    connection_generation_++;
+    connection_generation_ =
+        next_nonzero_connection_generation(connection_generation_);
 }
 
 ConnectionStateMachine::StateChangeCallback ConnectionStateMachine::transitionTo(ConnectionState new_state) {

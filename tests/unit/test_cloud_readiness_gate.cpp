@@ -352,3 +352,57 @@ TEST(CloudReadinessGateTest, RevokeKeepsEcuUidInFalseSnapshot) {
     EXPECT_EQ(revoked.ecu_uid, "ECU-REVOKED");
     EXPECT_EQ(revoked.cert_session_generation, 5u);
 }
+
+// ============================================================
+// CR-017 §3 / §19: connection generation 非零与一致性不变量
+// ============================================================
+
+TEST(CloudReadinessGateTest, ZeroConnectionGenerationBlocksReady) {
+    // generation==0 表示尚未提交有效连接上下文：即使连接/订阅就绪也不得 Cloud Ready
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 0);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 1, 1);
+    EXPECT_FALSE(gate.isCloudReady());
+    auto r = gate.getReadiness();
+    EXPECT_FALSE(r.cloud_ready);
+    EXPECT_EQ(r.reason_code, session_reason::kSessionIdentityInvalid);
+}
+
+TEST(CloudReadinessGateTest, ReadyImpliesNonzeroGeneration) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 3);
+    gate.setTlsSessionIdentity(makeIdentity(2));
+    gate.onSubscriptionsReady(true, 1, 1);
+    auto r = gate.getReadiness();
+    EXPECT_TRUE(r.cloud_ready);
+    EXPECT_NE(r.connection_generation, 0u);
+    // 顶层 generation 与 session_context 必须来自同一份不可变快照
+    EXPECT_EQ(r.connection_generation, r.session_context.connection_generation);
+}
+
+TEST(CloudReadinessGateTest, OldGenerationSessionIsStaleAfterContextReplacement) {
+    // 重连后上下文替换：旧 expected_session 必须判 stale
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CONNECTED, 1);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 1, 1);
+
+    SessionContext old_ctx;
+    old_ctx.daemon_epoch = gate.getDaemonEpoch();
+    old_ctx.connection_generation = 1;
+    old_ctx.cert_session_generation = 1;
+    EXPECT_TRUE(gate.validateSession(old_ctx));
+
+    // 第二段连接：generation 1 -> 2，cert session 1 -> 2
+    gate.setTlsSessionIdentity(makeIdentity(2));
+    gate.revokeSession("connection_lost");
+    gate.onConnectionState(ConnectionState::CONNECTED, 2);
+    gate.onSubscriptionsReady(true, 1, 1);
+    EXPECT_FALSE(gate.validateSession(old_ctx));
+
+    SessionContext new_ctx = old_ctx;
+    new_ctx.connection_generation = 2;
+    new_ctx.cert_session_generation = 2;
+    EXPECT_TRUE(gate.validateSession(new_ctx));
+}

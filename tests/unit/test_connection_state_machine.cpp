@@ -2,6 +2,7 @@
 #include "connection_state_machine.h"
 #include "store.h"
 #include <filesystem>
+#include <limits>
 #include <thread>
 #include <chrono>
 
@@ -378,4 +379,107 @@ TEST(ConnectionStateMachineTest, DegradedDoesNotReachCloudReady) {
     sm.setDegraded(false);
     sm.onSubscriptionsReady();
     EXPECT_EQ(sm.getCurrentState(), ConnectionState::CLOUD_READY);
+}
+
+// ============================================================
+// CR-017 §3 / §19: connection generation 生命周期
+// ============================================================
+
+TEST(ConnectionStateMachineTest, ConnectionGenerationStartsAtZero) {
+    // 0 = 尚无有效连接上下文
+    ConnectionStateMachine sm;
+    EXPECT_EQ(sm.getConnectionGeneration(), 0u);
+}
+
+TEST(ConnectionStateMachineTest, CommitActiveConnectionIsOneBasedAndMonotonic) {
+    ConnectionStateMachine sm;
+    EXPECT_EQ(sm.commitActiveConnection(), 1u);
+    EXPECT_EQ(sm.getConnectionGeneration(), 1u);
+    EXPECT_EQ(sm.commitActiveConnection(), 2u);
+    EXPECT_EQ(sm.getConnectionGeneration(), 2u);
+}
+
+TEST(ConnectionStateMachineTest, NextNonzeroGenerationSkipsZeroOnWrap) {
+    EXPECT_EQ(next_nonzero_connection_generation(0u), 1u);
+    EXPECT_EQ(next_nonzero_connection_generation(1u), 2u);
+    EXPECT_EQ(next_nonzero_connection_generation(41u), 42u);
+    // uint64 回绕不得回到 0
+    EXPECT_EQ(next_nonzero_connection_generation(
+                  std::numeric_limits<uint64_t>::max()), 1u);
+}
+
+TEST(ConnectionStateMachineTest, ColdStartCommitsFirstGenerationOnConnect) {
+    // 冷启动：0 -> 首次有效会话 1
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
+    ASSERT_EQ(sm.getConnectionGeneration(), 0u);  // 尚未提交有效连接上下文
+
+    sm.onConnectionSuccess();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CONNECTED);
+    EXPECT_EQ(sm.getConnectionGeneration(), 1u);
+}
+
+TEST(ConnectionStateMachineTest, ReconnectYieldsNewGeneration) {
+    // 普通断线重连：1 -> 2（不依赖 PROV/凭据变化）
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    ASSERT_EQ(sm.getConnectionGeneration(), 1u);
+
+    sm.onDisconnect();
+    ASSERT_EQ(sm.getCurrentState(), ConnectionState::RECONNECTING);
+    sm.onRetryTimeout();
+    ASSERT_EQ(sm.getCurrentState(), ConnectionState::CONNECTING);
+    sm.onConnectionSuccess();
+    EXPECT_EQ(sm.getConnectionGeneration(), 2u);
+}
+
+TEST(ConnectionStateMachineTest, InvalidationNeverProducesZero) {
+    // 显式 invalidate 也必须产生非零 generation
+    ConnectionStateMachine sm;
+    sm.invalidateConnectionGeneration();
+    EXPECT_NE(sm.getConnectionGeneration(), 0u);
+    sm.invalidateConnectionGeneration();
+    EXPECT_NE(sm.getConnectionGeneration(), 0u);
+}
+
+TEST(ConnectionStateMachineTest, CredentialChangeInvalidatesGeneration) {
+    // 换证：旧连接上下文失效，generation 必须前进且非零
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    const uint64_t gen1 = sm.getConnectionGeneration();
+    ASSERT_NE(gen1, 0u);
+
+    sm.onCredentialChanged();  // CONNECTED -> CERT_WAIT
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+    EXPECT_GT(sm.getConnectionGeneration(), gen1);
+    EXPECT_NE(sm.getConnectionGeneration(), 0u);
+}
+
+TEST(ConnectionStateMachineTest, ProvisionChangeInvalidatesGeneration) {
+    // PROV 绑定变化：旧连接上下文失效，generation 必须前进且非零
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    const uint64_t gen1 = sm.getConnectionGeneration();
+    ASSERT_NE(gen1, 0u);
+
+    sm.onProvisionChanged();  // CONNECTED -> PROV_WAIT
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
+    EXPECT_GT(sm.getConnectionGeneration(), gen1);
+    EXPECT_NE(sm.getConnectionGeneration(), 0u);
 }
