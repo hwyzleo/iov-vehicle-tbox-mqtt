@@ -18,6 +18,7 @@
 //   cloud_ready=false（仍携带旧身份），随后才销毁旧 TLS session/context。
 
 #include "mqtt_types.h"
+#include "trusted_time_types.h"
 #include "tbox/mqtt/types.h"
 #include <functional>
 #include <map>
@@ -67,6 +68,13 @@ public:
 
     /// 返回与事件一致的最新已提交快照（含 identity 与 event_sequence）。
     CloudReadinessSnapshot getReadiness() const;
+
+    // ---- DSN-CR-018 §8: 可信时间门禁状态 ----
+    /// 时间门禁状态变化 → 原子更新快照。
+    /// cloud_ready = 既有全局连接订阅条件 AND effective_time_condition；
+    /// 时间失信为共享故障：所有 enabled capability ready=false（reason 指向时间），
+    /// capability disabled 保留 disabled 主因。事件与查询同一版本（原子提交→sequence→投递）。
+    void onTimeGateState(const TimeGateStatus& status);
 
     // ---- CR-017 §3, §4: daemon epoch 与会话上下文校验 ----
     /// 进程级 daemon epoch（启动时生成一次）；随机源失败时为空。
@@ -152,6 +160,18 @@ private:
     std::map<std::string, CapabilityReadiness> capabilities_;
     std::map<std::string, uint64_t> capability_sequences_;
     std::map<std::string, bool> capability_downlink_rejected_;
+
+    // DSN-CR-018 §8: 可信时间门禁状态（与快照同一原子提交边界）
+    bool require_trusted_time_ = false;
+    bool time_gate_bypassed_ = false;
+    bool time_gate_ready_ = false;
+    std::string time_trust_state_;
+    std::string time_source_;
+    std::string time_reason_;
+    std::string time_failure_reason_;  // 时间失信时 enabled capability 的 not-ready reason
+    uint64_t time_source_epoch_ = 0;
+    int64_t time_lease_remaining_ms_ = -1;
+    uint64_t time_gate_generation_ = 0;
 };
 
 } // namespace mqtt

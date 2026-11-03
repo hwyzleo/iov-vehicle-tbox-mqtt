@@ -328,3 +328,86 @@ TEST(RoutePublisherTest, KeyprovPublishIsByteTransparent) {
     EXPECT_EQ(env.broker_payload, req.payload);  // 逐字节一致
     EXPECT_EQ(env.broker_topic, "vehicle/ECU123/up/keyprov");
 }
+
+// ============================================================
+// DSN-CR-018 §7.2: 离线受理 provenance 填充
+// ============================================================
+
+TEST(RoutePublisherTest, OfflineAcceptFillsTrustedProvenance) {
+    RoutePublisherTestEnv env;
+    env.setupRoutes("ECU123", 1);
+    env.is_connected = false;
+    // 注入时间门禁：强制可信受理 → provenance TRUSTED + 保守 UTC 区间
+    env.publisher.setTimeAdmissionFn([]() -> TimeAdmission {
+        TimeAdmission ad;
+        ad.allowed = true;
+        ad.provenance = TimeProvenance::TRUSTED;
+        ad.source = "PlatformSync";
+        ad.source_epoch = 7;
+        ad.time_gate_generation = 3;
+        ad.utc_earliest_ms = 1000000;
+        ad.utc_latest_ms = 1002000;
+        return ad;
+    });
+
+    RoutePublishRequest req;
+    req.key = {"tsp", "fota.up"};
+    req.msg_id = "m1";
+    req.payload = {0x01};
+    auto r = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_TRUE(r.accepted);
+    EXPECT_TRUE(env.enqueue_called);
+    EXPECT_EQ(env.enqueued_msg.time_provenance, TimeProvenance::TRUSTED);
+    EXPECT_EQ(env.enqueued_msg.time_source, "PlatformSync");
+    EXPECT_EQ(env.enqueued_msg.time_source_epoch, 7u);
+    EXPECT_EQ(env.enqueued_msg.time_gate_generation_at_accept, 3u);
+    EXPECT_EQ(env.enqueued_msg.utc_earliest_ms, 1000000);
+    EXPECT_EQ(env.enqueued_msg.utc_latest_ms, 1002000);
+}
+
+TEST(RoutePublisherTest, OfflineAcceptRejectedWhenTimeDenied) {
+    RoutePublisherTestEnv env;
+    env.setupRoutes("ECU123", 1);
+    env.is_connected = false;
+    env.publisher.setTimeAdmissionFn([]() -> TimeAdmission {
+        TimeAdmission ad;
+        ad.allowed = false;
+        ad.reason = TimeGateReason::SampleExpired;
+        return ad;
+    });
+
+    RoutePublishRequest req;
+    req.key = {"tsp", "fota.up"};
+    req.msg_id = "m1";
+    req.payload = {0x01};
+    auto r = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(r.accepted);
+    ASSERT_TRUE(r.error.has_value());
+    EXPECT_EQ(r.error.value(), ErrorCode::MQTT_1022);
+    EXPECT_TRUE(r.retryable);
+    EXPECT_EQ(r.reason_code, time_reason::kPublishUnavailable);
+    EXPECT_FALSE(env.enqueue_called);  // 不写离线队列
+    EXPECT_FALSE(env.broker_called);
+}
+
+TEST(RoutePublisherTest, OnlineSendRecheckedBeforePublish) {
+    RoutePublisherTestEnv env;
+    env.setupRoutes("ECU123", 1);
+    env.is_connected = true;
+    // 发送前二次核查：运行期失信 → 拒绝提交 PUBLISH
+    env.publisher.setTimeAdmissionFn([]() -> TimeAdmission {
+        TimeAdmission ad;
+        ad.allowed = false;
+        ad.reason = TimeGateReason::Untrusted;
+        return ad;
+    });
+
+    RoutePublishRequest req;
+    req.key = {"tsp", "fota.up"};
+    req.msg_id = "m1";
+    req.payload = {0x01};
+    auto r = env.publisher.publishRoute(req, env.table, env.resolver);
+    EXPECT_FALSE(r.accepted);
+    EXPECT_EQ(r.error.value(), ErrorCode::MQTT_1022);
+    EXPECT_FALSE(env.broker_called);  // 未提交实际发送
+}

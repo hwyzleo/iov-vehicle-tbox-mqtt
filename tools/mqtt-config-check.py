@@ -77,6 +77,9 @@ RE_TEST_CERT_PATH = re.compile(r"(^|/)(tests?|fixtures?|test-data)/.*\.(pem|crt|
 # mock endpoint 标记
 RE_MOCK = re.compile(r"\bmock\b", re.I)
 
+# DSN-CR-018 §14：fake 时间提供方标记（production 拒绝；dev/test 显式注入）
+RE_FAKE = re.compile(r"\bfake\b|FakeTest", re.I)
+
 # 不受控 / 个人 / build tree 路径前缀
 UNCONTROLLED_PATH_PREFIXES = ("/home/", "/Users/", "~/", "../", "..\\", "/build/")
 
@@ -252,10 +255,31 @@ class SchemaValidator:
             self._perr("mqtt.broker_host: mock endpoint not allowed in production")
         # 任何 string 值含 mock 标记
         self._scan_all_strings(node, "mqtt", self._mock_scan_cb)
+        # DSN-CR-018 §9/§10.1：production 强制可信时间门禁
+        # - require_trusted_time 必须 true（缺键也视为未显式开启 → production 拒绝）
+        # - 拒绝 fake 构造标记（FakeTest/fake 仅 dev/test fixture）
+        tt_require = self._get_path(node, ["mqtt", "trusted_time", "require_trusted_time"])
+        if tt_require is None:
+            self._perr(
+                "mqtt.trusted_time.require_trusted_time: missing in production; "
+                "trusted time gate must be explicitly enabled (DSN-CR-018 §9)"
+            )
+        elif not isinstance(tt_require, bool) or not tt_require:
+            self._perr(
+                "mqtt.trusted_time.require_trusted_time: must be true in production; "
+                "false bypass is dev/test only (DSN-CR-018 §10.1)"
+            )
+        self._scan_all_strings(node, "mqtt", self._fake_scan_cb)
 
     def _mock_scan_cb(self, value: str, path: str):
         if RE_MOCK.search(value):
             self._perr(f"{path}: contains 'mock' marker not allowed in production")
+
+    def _fake_scan_cb(self, value: str, path: str):
+        # DSN-CR-018 §14：FakeTrustedTimeProvider 仅 dev/test fixture，
+        # production 构造/schema/build 必须拒绝 FakeTest/fake 标记
+        if RE_FAKE.search(value):
+            self._perr(f"{path}: contains fake time-provider marker not allowed in production")
 
     def _scan_all_strings(self, node: Any, path: str, cb):
         if isinstance(node, dict):

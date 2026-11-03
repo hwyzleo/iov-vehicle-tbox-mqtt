@@ -52,7 +52,11 @@ enum class ConnectionState {
     SUBSCRIPTION_WAIT,    // 等待 required owner 完整快照（门闩）
     SUBSCRIBING,          // CONNACK 后收敛 Broker 订阅
     CONNECTED_DEGRADED,   // mandatory 失败/门闩超时，连接在但未 Cloud Ready
-    CLOUD_READY           // CONNECTED && SUBSCRIPTIONS_READY
+    CLOUD_READY,          // CONNECTED && SUBSCRIPTIONS_READY
+    // ---- DSN-CR-018 §4: 可信时间门禁（新增值追加在尾部，保证既有枚举数值不变）----
+    // 逻辑上位于 PROV_WAIT 之前（强制模式时间不可信时不建立云连接），
+    // 但数值必须追加在 CLOUD_READY 之后，禁止在中间插入造成原值漂移。
+    TIME_WAIT             // 时间不可信/租约耗尽/时钟未对齐/依赖未满足，不建立云连接
 };
 
 /// 将 ConnectionState 转为可读字符串
@@ -69,6 +73,7 @@ inline std::string connectionStateToString(ConnectionState state) {
         case ConnectionState::SUBSCRIBING:        return "SUBSCRIBING";
         case ConnectionState::CONNECTED_DEGRADED: return "CONNECTED_DEGRADED";
         case ConnectionState::CLOUD_READY:        return "CLOUD_READY";
+        case ConnectionState::TIME_WAIT:          return "TIME_WAIT";
         default: return "UNKNOWN";
     }
 }
@@ -348,6 +353,31 @@ constexpr const char* kKeyprovPayloadTooLarge   = "KEYPROV_PAYLOAD_TOO_LARGE";
 constexpr const char* kKeyprovDownlinkBackpressure = "KEYPROV_DOWNLINK_BACKPRESSURE";
 } // namespace capability_reason
 
+/// DSN-CR-018 §5 稳定 reason code（脱敏，不含身份/Topic/payload）
+///
+/// 与 MQTT-1020~1023 错误码配套的语义 reason；数字码已登记，
+/// 底层 SEC TimeReason / framework transport error / Broker Reason Code 分层保留。
+/// time_gate_bypassed 是开发风险状态，不作为“门禁已通过”的 reason。
+namespace time_reason {
+// MQTT-1020：时间信任或执行时钟不足
+constexpr const char* kUntrusted            = "time_untrusted";
+constexpr const char* kUnknown             = "time_unknown";
+constexpr const char* kSampleExpired       = "time_sample_expired";
+constexpr const char* kClockNotAligned     = "time_clock_not_aligned";
+// MQTT-1021：时间依赖／契约不可用
+constexpr const char* kProviderUnavailable = "time_provider_unavailable";
+constexpr const char* kQueryTimeout        = "time_query_timeout";
+constexpr const char* kContractUnsupported = "time_contract_unsupported";
+constexpr const char* kSampleMalformed     = "time_sample_malformed";
+// MQTT-1022：上行因时间门禁拒绝
+constexpr const char* kPublishUnavailable  = "publish_time_unavailable";
+// MQTT-1023：历史消息安全隔离／终结
+constexpr const char* kQueueProvenanceUnknown = "queue_time_provenance_unknown";
+constexpr const char* kQueueTransportExpired  = "queue_transport_expired";
+// 开发旁路风险状态（不作为门禁通过）
+constexpr const char* kBypassed             = "time_gate_bypassed";
+} // namespace time_reason
+
 /// 单条业务订阅项 (CR-007 §3; TSP DSN-CR-004 §3; CR-015 §3)
 struct SubscriptionItem {
     std::string route_id;        // owner 内稳定唯一
@@ -488,6 +518,18 @@ struct CloudReadinessSnapshot {
     bool contract_supported = true;         // false = UNSUPPORTED_CONTRACT_VERSION
     // ---- CR-015 §18.3: capability readiness map（与独立查询读取同一原子状态）----
     std::map<std::string, CapabilityReadiness> capabilities;
+    // ---- DSN-CR-018 §8: 可信时间门禁状态（只读；string 表示避免 SDK 依赖 daemon 内部枚举）----
+    // cloud_ready = 既有全局连接订阅条件 AND effective_time_condition（§8）。
+    // 时间失信是共享故障：所有 enabled capability ready=false，downlink 亦退出。
+    bool require_trusted_time = false;   // 门禁是否强制（production 必须 true）
+    bool time_gate_bypassed = false;     // 开发旁路（require=false，不伪造 time_gate_ready）
+    bool time_gate_ready = false;        // 门禁放行（仅强制模式有意义；旁路下不伪造 true）
+    std::string time_trust_state;        // "Trusted"/"Untrusted"/"Unknown"
+    std::string time_source;             // "PlatformSync"/"HardwareRtc"/"FakeTest"/"None"/"ContractUnsupported"
+    std::string time_reason;             // time_untrusted 等（time_reason::*）
+    uint64_t time_source_epoch = 0;
+    int64_t time_lease_remaining_ms = -1;  // -1 = 无有效租约
+    uint64_t time_gate_generation = 0;
 };
 
 /// 源兼容别名：既有调用方仍可使用 SubscriptionReadiness。

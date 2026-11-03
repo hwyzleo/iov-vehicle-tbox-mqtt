@@ -63,6 +63,10 @@ public:
         size_t inflight_count;
         size_t acked_count;
         size_t dropped_count;
+        // DSN-CR-018 §7.3: 终结/隔离计数（本地状态，不伪造云业务回执）
+        size_t quarantined_count;
+        size_t expired_count;
+        size_t provenance_unknown_count;
     };
     QueueStats getStats() const;
 

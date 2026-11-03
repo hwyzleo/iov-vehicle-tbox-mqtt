@@ -23,6 +23,10 @@ void RoutePublisher::setIsConnectedFn(IsConnectedFn fn) {
     is_connected_fn_ = std::move(fn);
 }
 
+void RoutePublisher::setTimeAdmissionFn(TimeAdmissionFn fn) {
+    time_admission_fn_ = std::move(fn);
+}
+
 PublishResult RoutePublisher::publishRoute(
         const RoutePublishRequest& req,
         const std::shared_ptr<const EffectiveRouteTable>& route_table,
@@ -121,6 +125,18 @@ PublishResult RoutePublisher::publishRoute(
             return result;
         }
 
+        // DSN-CR-018 §7.1: 实际交连接发送队列前再检查时间租约与代际
+        if (time_admission_fn_) {
+            auto ad = time_admission_fn_();
+            if (!ad.allowed) {
+                result.accepted = false;
+                result.error = ErrorCode::MQTT_1022;
+                result.reason_code = time_reason::kPublishUnavailable;
+                result.retryable = true;
+                return result;
+            }
+        }
+
         if (broker_publish_fn_) {
             bool ok = broker_publish_fn_(route->expanded_topic, req.payload,
                                          static_cast<QoS>(qos));
@@ -143,6 +159,19 @@ PublishResult RoutePublisher::publishRoute(
             return result;
         }
 
+        // DSN-CR-018 §7.1: 受理（离线入队）同样过时间门禁；不可用时拒绝写入
+        TimeAdmission ad;
+        if (time_admission_fn_) {
+            ad = time_admission_fn_();
+            if (!ad.allowed) {
+                result.accepted = false;
+                result.error = ErrorCode::MQTT_1022;
+                result.reason_code = time_reason::kPublishUnavailable;
+                result.retryable = true;
+                return result;
+            }
+        }
+
         // 离线: 构造 OutboundMessage 入队 (CR-009 §6.2, §9)
         OutboundMessage msg;
         msg.msg_id = req.msg_id;
@@ -154,6 +183,13 @@ PublishResult RoutePublisher::publishRoute(
         msg.priority = req.priority;
         msg.created_at = std::chrono::steady_clock::now();
         msg.state = MessageState::PENDING;
+        // DSN-CR-018 §7.2: 受理 provenance（旁路期标记 BYPASS，恢复强制后不盲发）
+        msg.time_provenance = ad.provenance;
+        msg.time_source = ad.source;
+        msg.time_source_epoch = ad.source_epoch;
+        msg.time_gate_generation_at_accept = ad.time_gate_generation;
+        msg.utc_earliest_ms = ad.utc_earliest_ms;
+        msg.utc_latest_ms = ad.utc_latest_ms;
 
         if (queue_enqueue_fn_ && queue_enqueue_fn_(msg)) {
             result.accepted = true;

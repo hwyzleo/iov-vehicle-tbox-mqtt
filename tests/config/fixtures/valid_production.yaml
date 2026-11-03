@@ -34,3 +34,14 @@ mqtt:
     reconcile_timeout_ms: 10000
     suback_retry_max: 3
     owner_lease_ms: 0
+  # DSN-CR-018: production 强制可信时间门禁
+  trusted_time:
+    require_trusted_time: true
+    query_timeout_ms: 500
+    refresh_interval_ms: 500
+    cache_max_age_ms: 1000
+    retry:
+      initial_backoff_ms: 1000
+      max_backoff_ms: 30000
+      multiplier: 2.0
+      jitter_ratio: 0.2

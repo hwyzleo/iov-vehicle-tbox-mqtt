@@ -55,7 +55,8 @@ void ConnectionStateMachine::start() {
             state_info_.state == ConnectionState::SUBSCRIPTION_WAIT ||
             state_info_.state == ConnectionState::SUBSCRIBING ||
             state_info_.state == ConnectionState::CLOUD_READY ||
-            state_info_.state == ConnectionState::CONNECTED_DEGRADED) {
+            state_info_.state == ConnectionState::CONNECTED_DEGRADED ||
+            state_info_.state == ConnectionState::TIME_WAIT) {  // DSN-CR-018 §4.1: 重启后重新查时间
             state_info_.state = ConnectionState::PROV_WAIT;
             state_info_.last_error = "Restarted, re-entering PROV_WAIT";
             state_info_.retry_count = 0;
@@ -373,6 +374,58 @@ void ConnectionStateMachine::onCredentialPollTimeout() {
 // CR-007 §7: 订阅门闩与 Cloud Ready 事件
 // ============================================================
 
+// ============================================================
+// CR-007 §7: 订阅门闩与 Cloud Ready 事件
+// ============================================================
+
+// ============================================================
+// DSN-CR-018 §4: 可信时间门禁事件
+// ============================================================
+
+void ConnectionStateMachine::onTimeGateReady() {
+    // §4.1: TIME_WAIT -> PROV_WAIT（重置时间连续失败计数；重新确认绑定再判凭据）
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_info_.state == ConnectionState::TIME_WAIT) {
+            state_info_.retry_count = 0;
+            provision_poll_count_ = 0;
+            calculateNextProvisionPoll();
+            cb = transitionTo(ConnectionState::PROV_WAIT);
+        }
+    }
+    if (cb) cb(ConnectionState::PROV_WAIT);
+}
+
+void ConnectionStateMachine::onTimeGateInvalid(const std::string& reason) {
+    // §4.1 仲裁：时间不满足 > PROV/CERT/网络/订阅。任意前置/在线态 -> TIME_WAIT。
+    // 在线态由上层先完成有序撤销（Cloud Ready/capability/连接上下文/断链），
+    // 本方法只负责状态迁移；不虚增 connection_generation（§6.2）。
+    StateChangeCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto cur = state_info_.state;
+        const bool eligible =
+            cur == ConnectionState::PROV_WAIT ||
+            cur == ConnectionState::CERT_WAIT ||
+            cur == ConnectionState::CONNECTING ||
+            cur == ConnectionState::CONNECTED ||
+            cur == ConnectionState::RECONNECTING ||
+            cur == ConnectionState::SUBSCRIPTION_WAIT ||
+            cur == ConnectionState::SUBSCRIBING ||
+            cur == ConnectionState::CONNECTED_DEGRADED ||
+            cur == ConnectionState::CLOUD_READY ||
+            cur == ConnectionState::OFFLINE;
+        if (eligible) {
+            state_info_.last_error = reason;
+            state_info_.retry_count = 0;
+            cb = transitionTo(ConnectionState::TIME_WAIT);
+        }
+        // TIME_WAIT 自环：保持（时间退避由 TrustedTimeGate 独立管理）
+    }
+    if (cb) cb(ConnectionState::TIME_WAIT);
+}
+
 void ConnectionStateMachine::onGateSatisfied() {
     StateChangeCallback cb;
     {
@@ -680,7 +733,8 @@ void ConnectionStateMachine::timerLoop() {
             onSubscriptionGateTimeout();
             lock.lock();
         } else {
-            // Not in RECONNECTING or CERT_WAIT; sleep until state changes or we stop
+            // Not in RECONNECTING, CERT_WAIT, PROV_WAIT or SUBSCRIPTION_WAIT;
+            // sleep until state changes or we stop (TIME_WAIT 等待外部时间门禁事件)
             timer_cv_.wait(lock, [this] {
                 return !timer_running_ ||
                        state_info_.state == ConnectionState::RECONNECTING ||

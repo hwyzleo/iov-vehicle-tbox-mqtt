@@ -51,13 +51,17 @@ set(PROV_CLIENT_LIB tbox::prov_client)
 # yaml-cpp 头文件随 TBoxFramework 一起安装在 ${FRAMEWORK_INCLUDE_DIR} 下，
 # 不再探测 brew / conda 路径。
 
+# 本机环境防护（CR-018 测试基建修复）：${TBOX_PREFIX}/include 下可能存在其它
+# package（如 CCU framework）扁平安装的 log.h/log_types.h，普通 -I 会以 quoted
+# include 优先命中并遮蔽 framework 的 -isystem include/tbox-framework（后者在
+# CMake 对同名路径去重后仅保留 -isystem 且排序靠后）。因此测试不重复加入
+# SEC/PROV/framework 的普通 -I：头文件目录由链接的导入目标以 -isystem 提供
+# （顺序与 mqtt_service_lib 一致：tbox-framework 先于 ${TBOX_PREFIX}/include）。
+# 需要 SEC/PROV 头但未链接对应 client 的目标须显式补链接（见各 add_executable）。
 set(TEST_COMMON_INCLUDES
     ${PROJECT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/include
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/types
-    ${FRAMEWORK_INCLUDE_DIR}
-    ${SEC_INCLUDE_DIR}
-    ${PROV_INCLUDE_DIR}
     ${MOSQUITTO_INCLUDE_DIRS}
 )
 
@@ -72,7 +76,7 @@ add_executable(test_connection_state_machine
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_connection_state_machine PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_connection_state_machine GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_connection_state_machine GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_credential_manager
     unit/test_credential_manager.cpp
@@ -125,14 +129,14 @@ add_executable(test_offline_cache_queue
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_offline_cache_queue PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_offline_cache_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_offline_cache_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_route_bridge
     unit/test_route_bridge.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/route_bridge.cpp
 )
 target_include_directories(test_route_bridge PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_route_bridge GTest::gtest_main pthread)
+target_link_libraries(test_route_bridge GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_config_manager
     unit/test_config_manager.cpp
@@ -141,7 +145,7 @@ add_executable(test_config_manager
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_config_manager PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_config_manager GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_config_manager GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_mqtt_service_integration
     unit/test_mqtt_service_integration.cpp
@@ -170,7 +174,7 @@ add_executable(test_mqtt_ipc_protocol
     unit/test_mqtt_ipc_protocol.cpp
 )
 target_include_directories(test_mqtt_ipc_protocol PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_mqtt_ipc_protocol GTest::gtest_main nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_ipc_protocol GTest::gtest_main nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} ${FRAMEWORK_LIB})
 
 # Dispatcher (CR-004 §10)
 add_executable(test_mqtt_ipc_dispatcher
@@ -180,7 +184,7 @@ add_executable(test_mqtt_ipc_dispatcher
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_ipc_dispatcher PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_mqtt_ipc_dispatcher GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_ipc_dispatcher GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # Retry policy (CR-004 §10)
 add_executable(test_mqtt_retry_policy
@@ -198,7 +202,7 @@ add_executable(test_mqtt_dispatch_queue
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_dispatch_queue PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_mqtt_dispatch_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_mqtt_dispatch_queue GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # Client SDK (CR-004 §10): 真实 framework-ipc Server/Client 起socket
 add_executable(test_mqtt_client
@@ -210,7 +214,7 @@ add_executable(test_mqtt_client
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_client PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
-target_link_libraries(test_mqtt_client GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_client GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # CR-010 §11.1: Routed downlink SDK 单元测试
 add_executable(test_mqtt_client_routed
@@ -222,7 +226,7 @@ add_executable(test_mqtt_client_routed
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_client_routed PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
-target_link_libraries(test_mqtt_client_routed GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_client_routed GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # CR-014 §5: Cloud Ready 快照/事件 SDK 单元测试
 add_executable(test_mqtt_client_readiness
@@ -234,7 +238,7 @@ add_executable(test_mqtt_client_readiness
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_client_readiness PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
-target_link_libraries(test_mqtt_client_readiness GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_client_readiness GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # CR-010 §11.2: Routed downlink SDK 集成测试
 add_executable(test_mqtt_routed_downlink
@@ -246,7 +250,7 @@ add_executable(test_mqtt_routed_downlink
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_routed_downlink PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
-target_link_libraries(test_mqtt_routed_downlink GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_routed_downlink GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 # CR-014 §8: Cloud Ready 契约集成测试（daemon 组件 -> IPC -> SDK）
 add_executable(test_mqtt_cloud_readiness
@@ -349,7 +353,7 @@ add_executable(test_owner_snapshot_registry
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_owner_snapshot_registry PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_owner_snapshot_registry GTest::gtest_main pthread)
+target_link_libraries(test_owner_snapshot_registry GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_effective_subscription_table
     unit/test_effective_subscription_table.cpp
@@ -359,14 +363,14 @@ add_executable(test_effective_subscription_table
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_effective_subscription_table PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_effective_subscription_table GTest::gtest_main pthread)
+target_link_libraries(test_effective_subscription_table GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_startup_subscription_gate
     unit/test_startup_subscription_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/startup_subscription_gate.cpp
 )
 target_include_directories(test_startup_subscription_gate PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_startup_subscription_gate GTest::gtest_main pthread)
+target_link_libraries(test_startup_subscription_gate GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_applied_subscription_manifest
     unit/test_applied_subscription_manifest.cpp
@@ -375,7 +379,7 @@ add_executable(test_applied_subscription_manifest
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_applied_subscription_manifest PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_applied_subscription_manifest GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_applied_subscription_manifest GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_cloud_readiness_gate
     unit/test_cloud_readiness_gate.cpp
@@ -383,7 +387,7 @@ add_executable(test_cloud_readiness_gate
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/daemon_epoch.cpp
 )
 target_include_directories(test_cloud_readiness_gate PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_cloud_readiness_gate GTest::gtest_main pthread)
+target_link_libraries(test_cloud_readiness_gate GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_broker_subscription_reconciler
     unit/test_broker_subscription_reconciler.cpp
@@ -393,7 +397,7 @@ add_executable(test_broker_subscription_reconciler
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_broker_subscription_reconciler PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_broker_subscription_reconciler GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_broker_subscription_reconciler GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_test(NAME OwnerSnapshotRegistryTest COMMAND test_owner_snapshot_registry)
 add_test(NAME EffectiveSubscriptionTableTest COMMAND test_effective_subscription_table)
@@ -411,7 +415,7 @@ add_executable(test_topic_template_validator
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
 )
 target_include_directories(test_topic_template_validator PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_topic_template_validator GTest::gtest_main pthread)
+target_link_libraries(test_topic_template_validator GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME TopicTemplateValidatorTest COMMAND test_topic_template_validator)
 
 add_executable(test_topic_template_resolver
@@ -420,7 +424,7 @@ add_executable(test_topic_template_resolver
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/topic_template_validator.cpp
 )
 target_include_directories(test_topic_template_resolver PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_topic_template_resolver GTest::gtest_main pthread)
+target_link_libraries(test_topic_template_resolver GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME TopicTemplateResolverTest COMMAND test_topic_template_resolver)
 
 add_executable(test_route_projection
@@ -433,7 +437,7 @@ add_executable(test_route_projection
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_route_projection PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_route_projection GTest::gtest_main pthread)
+target_link_libraries(test_route_projection GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME RouteProjectionTest COMMAND test_route_projection)
 
 add_executable(test_route_publisher
@@ -449,7 +453,7 @@ add_executable(test_route_publisher
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_route_publisher PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_route_publisher GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_route_publisher GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME RoutePublisherTest COMMAND test_route_publisher)
 
 add_executable(test_downlink_route_dispatcher
@@ -466,7 +470,7 @@ add_executable(test_downlink_route_dispatcher
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_downlink_route_dispatcher PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_downlink_route_dispatcher GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_downlink_route_dispatcher GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME DownlinkRouteDispatcherTest COMMAND test_downlink_route_dispatcher)
 
 # ============================================================
@@ -489,7 +493,7 @@ add_executable(test_subscription_catalog
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/subscription_catalog.cpp
 )
 target_include_directories(test_subscription_catalog PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_subscription_catalog GTest::gtest_main pthread)
+target_link_libraries(test_subscription_catalog GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME SubscriptionCatalogTest COMMAND test_subscription_catalog)
 
 add_executable(test_mqtt_client_capability
@@ -501,7 +505,7 @@ add_executable(test_mqtt_client_capability
     ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/mqtt_context.cpp
 )
 target_include_directories(test_mqtt_client_capability PRIVATE ${TEST_COMMON_INCLUDES} ${CMAKE_SOURCE_DIR}/src/mqtt_client/src)
-target_link_libraries(test_mqtt_client_capability GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread)
+target_link_libraries(test_mqtt_client_capability GTest::gtest_main ${FRAMEWORK_LIB} nlohmann_json::nlohmann_json pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME MqttClientCapabilityTest COMMAND test_mqtt_client_capability)
 
 add_executable(test_mqtt_keyprov_capability
@@ -532,7 +536,7 @@ add_executable(test_mqtt_log_events
     ${LOG_TEST_SOURCES}
 )
 target_include_directories(test_mqtt_log_events PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_mqtt_log_events GTest::gtest_main ${FRAMEWORK_LIB} pthread)
+target_link_libraries(test_mqtt_log_events GTest::gtest_main ${FRAMEWORK_LIB} pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 
 add_executable(test_mqtt_log_context
     unit/test_mqtt_log_context.cpp
@@ -580,12 +584,38 @@ add_test(NAME ConfigSchemaTest
 # CR-016: SEC/PROV IPC client 自动恢复、计数与 flush 测试
 # ============================================================
 
+# DSN-CR-018: 可信时间门禁（租约/退避/代际/旁路）
+add_executable(test_trusted_time_gate
+    unit/test_trusted_time_gate.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_service/src/trusted_time_gate.cpp
+)
+target_include_directories(test_trusted_time_gate PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_trusted_time_gate GTest::gtest_main ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} pthread)
+add_test(NAME TrustedTimeGateTest COMMAND test_trusted_time_gate)
+
+# DSN-CR-018 §7.3: 队列恢复判定矩阵（纯函数）
+add_executable(test_queue_replay_policy
+    unit/test_queue_replay_policy.cpp
+)
+target_include_directories(test_queue_replay_policy PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_queue_replay_policy GTest::gtest_main ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} pthread)
+add_test(NAME QueueReplayPolicyTest COMMAND test_queue_replay_policy)
+
+# DSN-CR-018: service 级时间门禁（AT-01/02/10 部分）
+add_executable(test_mqtt_time_gate_service
+    unit/test_mqtt_time_gate_service.cpp
+)
+target_include_directories(test_mqtt_time_gate_service PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_directories(test_mqtt_time_gate_service PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_mqtt_time_gate_service mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} ${MOSQUITTO_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto pthread)
+add_test(NAME MqttTimeGateServiceTest COMMAND test_mqtt_time_gate_service)
+
 # 退避/计数工具（header-only）
 add_executable(test_dependency_recovery
     unit/test_dependency_recovery.cpp
 )
 target_include_directories(test_dependency_recovery PRIVATE ${TEST_COMMON_INCLUDES})
-target_link_libraries(test_dependency_recovery GTest::gtest_main pthread)
+target_link_libraries(test_dependency_recovery GTest::gtest_main pthread ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB})
 add_test(NAME DependencyRecoveryTest COMMAND test_dependency_recovery)
 
 # 关键 warn/error 集中 flush（独立进程，单独初始化 Logger 文件 sink）

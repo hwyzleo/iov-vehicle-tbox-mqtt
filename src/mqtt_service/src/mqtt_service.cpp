@@ -10,6 +10,7 @@
 #include "subscription_catalog.h"
 #include "mqtt_log_adapter.h"
 #include "mqtt_context.h"
+#include "queue_replay_policy.h"
 #include "utils.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -63,7 +64,8 @@ MqttService::MqttService(std::shared_ptr<hwyz::store::Store> store,
       route_table_(std::make_shared<const EffectiveRouteTable>()),
       route_publisher_(std::make_unique<RoutePublisher>()),
       downlink_dispatcher_(std::make_unique<DownlinkRouteDispatcher>()),
-      legacy_guard_(std::make_unique<LegacyTopicGuard>()) {
+      legacy_guard_(std::make_unique<LegacyTopicGuard>()),
+      time_gate_(std::make_unique<TrustedTimeGate>()) {
 }
 
 MqttService::~MqttService() {
@@ -144,6 +146,28 @@ bool MqttService::initializeLocal() {
     reconciler_->setSubackRetryMax(subscription_config_.suback_retry_max);
     effective_table_->setEcuUid(prov_mgr_.getEcuUid());
 
+    // DSN-CR-018 §9: 配置并装配可信时间门禁
+    // - 配置来自只读 framework-config（mqtt.trusted_time.*），非法值 fail-closed；
+    // - provider 用生产工厂（SEC 配对契约落地前 = ContractUnsupported → 强制模式 TIME_WAIT）；
+    // - 测试经 setTimeGateProviderForTest 注入 Fake。
+    std::string tt_err;
+    if (!time_gate_->configure(config_manager_->getTrustedTimeConfig(), &tt_err)) {
+        MqttLogAdapter::connection().error(
+            "mqtt.time_gate.config_invalid",
+            "可信时间门禁配置非法，保持 fail-closed（TIME_WAIT）",
+            {{"reason", tbox::fw::log::FieldValue::makeString(tt_err)}}
+        );
+    }
+    time_gate_->setProvider(createDefaultTimeProvider());
+    time_gate_->setChangeCallback(
+        [this](const TimeGateStatus& status, bool ready_changed) {
+            onTimeGateChanged(status, ready_changed);
+        });
+    time_gate_->setEventCallback(
+        [this](TrustedTimeGate::EventKind kind, const TimeGateStatus& status) {
+            publishTimeGateEvent(kind, status);
+        });
+
     // CR-009 §5: 初始化模板解析器身份
     template_resolver_->setIdentity(prov_mgr_.getEcuUid(), prov_mgr_.getGeneration());
 
@@ -162,6 +186,11 @@ bool MqttService::initializeLocal() {
             auto s = state_machine_->getCurrentState();
             return s == ConnectionState::CONNECTED || s == ConnectionState::CLOUD_READY ||
                    s == ConnectionState::SUBSCRIBING || s == ConnectionState::CONNECTED_DEGRADED;
+        });
+    // DSN-CR-018 §7.1: 发送/受理前二次核查时间门禁（与 publishRoute 的 session_guard 串行）
+    route_publisher_->setTimeAdmissionFn(
+        [this]() -> TimeAdmission {
+            return time_gate_->checkAdmission();
         });
 
     // CR-009 §7: DownlinkRouteDispatcher 回调装配
@@ -224,6 +253,13 @@ bool MqttService::initializeLocal() {
     }
 
     return true;
+}
+
+void MqttService::setTimeGateProviderForTest(
+        std::shared_ptr<ITrustedTimeProvider> provider) {
+    if (time_gate_) {
+        time_gate_->setProvider(std::move(provider));
+    }
 }
 
 bool MqttService::startExternal() {
@@ -301,6 +337,14 @@ bool MqttService::startExternal() {
     // callback reads PROV binding and transitions to CERT_WAIT if valid.
     state_machine_->start();
 
+    // DSN-CR-018 §4: 启动可信时间门禁（首次查询立即执行）。
+    // 强制模式（require=true）且时间未就绪 → 立即进入 TIME_WAIT（优先于 PROV_WAIT）；
+    // 旁路模式（require=false）保持旧行为，仅 shadow 观测。
+    time_gate_->start();
+    if (time_gate_->isEnforced() && !time_gate_->isReady()) {
+        state_machine_->onTimeGateInvalid("time_not_ready_on_startup");
+    }
+
     return true;
 }
 
@@ -313,6 +357,10 @@ void MqttService::beginShutdown() {
     ipc_reject_new_ = true;
     if (cloud_ready_gate_ && cloud_ready_gate_->isCloudReady()) {
         cloud_ready_gate_->setDegraded(true, "shutting_down");
+    }
+    // DSN-CR-018 §4.2: 取消全部时间门禁 timer，禁止新查询（幂等）
+    if (time_gate_) {
+        time_gate_->stop();
     }
 }
 
@@ -466,6 +514,14 @@ PublishResult MqttService::publishEnvelope(const PublishEnvelope& env) {
         return result;
     }
 
+    // DSN-CR-018 §7.1: 强制模式时间门禁（帧边界校验之后、Route/identity 校验之前）
+    if (time_gate_->isEnforced()) {
+        auto ad = time_gate_->checkAdmission();
+        if (!ad.allowed) {
+            return rejectTimeUnavailable("legacy", topicTemplate(env.topic));
+        }
+    }
+
     // CR-009 §10.2: Legacy 完整 Topic 必须经过 LegacyTopicGuard 校验
     // 仅当身份有效且有 owner 启用 route API 时校验（混合模式安全守卫）
     if (template_resolver_->isIdentityValid() && snapshot_registry_->ownerCount() > 0) {
@@ -494,6 +550,14 @@ PublishResult MqttService::publishEnvelope(const PublishEnvelope& env) {
         msg.created_at = std::chrono::steady_clock::now();
         msg.state = MessageState::PENDING;
         msg.identity_generation = prov_mgr_.getGeneration();  // CR-006 §7
+        // DSN-CR-018 §7.2: 受理 provenance（旁路期标记 BYPASS，恢复强制后不盲发）
+        auto t_ad = time_gate_->checkAdmission();
+        msg.time_provenance = t_ad.provenance;
+        msg.time_source = t_ad.source;
+        msg.time_source_epoch = t_ad.source_epoch;
+        msg.time_gate_generation_at_accept = t_ad.time_gate_generation;
+        msg.utc_earliest_ms = t_ad.utc_earliest_ms;
+        msg.utc_latest_ms = t_ad.utc_latest_ms;
 
         if (cache_queue_->enqueue(msg)) {
             // accepted: 离线时成功写入离线队列 (CR-004 §5.2)
@@ -873,6 +937,37 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
             new_state, state_machine_->getConnectionGeneration());
     }
 
+    // DSN-CR-018 §4: 强制模式时间硬前置。
+    // TIME_WAIT 优先于 PROV/CERT/网络/订阅；时间不可用时任何前置工作都不推进。
+    const bool time_blocked =
+        time_gate_->isEnforced() && !time_gate_->checkAdmission().allowed;
+    if (time_blocked &&
+        new_state != ConnectionState::TIME_WAIT &&
+        new_state != ConnectionState::INIT) {
+        state_machine_->onTimeGateInvalid("time_not_ready");
+        return;
+    }
+
+    if (new_state == ConnectionState::TIME_WAIT) {
+        // §11: mqtt.time_gate.waiting（首次 WARN，后续由限频/状态事件覆盖）
+        auto st = time_gate_->getStatus();
+        MqttLogAdapter::connection().warn(
+            "mqtt.time_gate.waiting",
+            "可信时间不可用，保持 TIME_WAIT（不建立云连接）",
+            {
+                {"time_reason", tbox::fw::log::FieldValue::makeString(
+                    timeGateReasonToString(st.reason))},
+                {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(st.retry_count))},
+                {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                    static_cast<int64_t>(st.backoff_ms.count()))},
+                {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1020")}
+            }
+        );
+        // 时间门禁独立退避轮询，无需额外触发；本地 IPC/快照注册仍可用
+        return;
+    }
+
     // CR-006 §4: PROV_WAIT 状态读取 PROV 绑定
     if (new_state == ConnectionState::PROV_WAIT) {
         // CR-016 §5: 先恢复 IPC transport，再查询绑定；
@@ -1066,6 +1161,22 @@ void MqttService::onConnectionStateChanged(ConnectionState new_state) {
         while (!cache_queue_->empty()) {
             auto msg = cache_queue_->dequeue();
             if (msg.has_value()) {
+                // DSN-CR-018 §7.1: 发送前二次核查时间租约与代际（运行期失信时停止补发）
+                auto t_ad = time_gate_->checkAdmission();
+                if (time_gate_->isEnforced() && !t_ad.allowed) {
+                    MqttLogAdapter::offline_queue().warn(
+                        "mqtt.offline_queue.time_rejected",
+                        "时间门禁关闭，停止补发缓存消息",
+                        {{"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1022")}}
+                    );
+                    break;
+                }
+                // DSN-CR-018 §7.3 / REQ-CR-019 §5: 恢复判定矩阵
+                // （终结态不重放；旧格式/旁路/来源不可信隔离不盲发；旁路模式保持旧行为）
+                if (!replayQueueItem(*msg, cache_queue_.get(), t_ad,
+                                     time_gate_->isEnforced())) {
+                    continue;  // 已终结/隔离，跳过
+                }
                 // CR-006 §7: Skip messages with stale identity generation
                 if (msg->identity_generation != 0 &&
                     msg->identity_generation != current_gen) {
@@ -1350,6 +1461,174 @@ void MqttService::publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot)
     );
 }
 
+// ============================================================
+// DSN-CR-018 §6/§8: 可信时间门禁状态变化处理
+// ============================================================
+
+void MqttService::onTimeGateChanged(const TimeGateStatus& status, bool ready_changed) {
+    // §8: readiness 快照时间字段原子更新（cloud_ready 纳入 effective_time_condition）
+    if (cloud_ready_gate_) {
+        cloud_ready_gate_->onTimeGateState(status);
+    }
+    if (!ready_changed) {
+        return;
+    }
+    if (status.time_gate_ready) {
+        // 时间恢复：TIME_WAIT -> PROV_WAIT（重新走绑定→凭据→订阅门闩→连接）
+        state_machine_->onTimeGateReady();
+        return;
+    }
+
+    // §6.2 运行期失信有序撤销（reason 指向时间）
+    const std::string reason = timeGateReasonToString(status.reason);
+    const std::string effective = reason.empty() ? time_reason::kUnknown : reason;
+    // 1) 关闭新受理/发送：gate 撤销时已递增 time_gate_generation，
+    //    publish 路径的 checkAdmission 拒绝新消息（§7.1）。
+    // 2) 原子撤销 Cloud Ready 与全部 enabled capability readiness：onTimeGateState 已完成。
+    // 3) 停止旧连接库自动重连/重发与下行分发：受控 DISCONNECT 后丢弃 mosquitto 实例
+    //    （旧回调仅允许完成真实结果记账，不激活新状态）。
+    client_manager_->disconnect();
+    client_manager_->reset();
+    // 4) 状态机 → TIME_WAIT（不虚增 connection generation；下次 attempt 才分配新代际）
+    state_machine_->onTimeGateInvalid(effective);
+    // 5) 清理 TLS context（内存凭据句柄由下一次 CERT_WAIT 重新获取）
+    tls_adapter_.destroyContext();
+}
+
+// DSN-CR-018 §7.3 / REQ-CR-019 §5: 历史项恢复判定矩阵（内存级）
+// 返回 false = 已终结/隔离，调用方跳过；enforced=false（旁路）保持旧行为全部重放
+bool MqttService::replayQueueItem(OutboundMessage& msg, OfflineCacheQueue* queue,
+                                  const TimeAdmission& current_admission,
+                                  bool enforced) {
+    if (msg.isTerminal()) return false;  // 已终结不重放
+    const auto decision = evaluateQueueReplay(msg, current_admission, enforced);
+    switch (decision) {
+        case QueueReplayDecision::kReplay:
+            return true;
+        case QueueReplayDecision::kExpiredTerminal:
+            msg.state = MessageState::EXPIRED_TERMINAL;
+            msg.terminal_reason = time_reason::kQueueTransportExpired;
+            queue->updateMessageState(msg.msg_id, msg.state);
+            logQueueTerminal(msg, "mqtt.offline_queue.time_expired",
+                             time_reason::kQueueTransportExpired);
+            return false;
+        case QueueReplayDecision::kQuarantined:
+        case QueueReplayDecision::kProvenanceUnknown:
+            msg.state = MessageState::QUARANTINED;
+            msg.terminal_reason = time_reason::kQueueProvenanceUnknown;
+            queue->updateMessageState(msg.msg_id, msg.state);
+            logQueueTerminal(msg, "mqtt.offline_queue.time_quarantined",
+                             time_reason::kQueueProvenanceUnknown);
+            return false;
+    }
+    return true;
+}
+
+void MqttService::logQueueTerminal(const OutboundMessage& msg, const char* event,
+                                   const char* reason) {
+    // §11: mqtt.offline_queue.time_quarantined/time_expired（聚合/限频；脱敏 msg_id 摘要）
+    MqttLogAdapter::offline_queue().warn(
+        event,
+        "历史消息因时间安全被隔离/终结",
+        {
+            {"msg_id_hash", tbox::fw::log::FieldValue::makeString(msgIdHash(msg.msg_id))},
+            {"terminal_reason", tbox::fw::log::FieldValue::makeString(reason)},
+            {"queue_schema", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(msg.queue_schema_version))},
+            {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1023")}
+        }
+    );
+}
+
+PublishResult MqttService::rejectTimeUnavailable(const char* owner,
+                                                const std::string& route_id_hash) {
+    // §11: mqtt.publish.time_rejected（脱敏：owner/route hash/reason，不输出 payload）
+    auto st = time_gate_->getStatus();
+    MqttLogAdapter::publish().warn(
+        "mqtt.publish.time_rejected",
+        "上行因可信时间门禁被拒绝（可重试）",
+        {
+            {"owner", tbox::fw::log::FieldValue::makeString(owner == nullptr ? "" : owner)},
+            {"route_id_hash", tbox::fw::log::FieldValue::makeString(route_id_hash)},
+            {"time_reason", tbox::fw::log::FieldValue::makeString(
+                timeGateReasonToString(st.reason))},
+            {"time_gate_generation", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(st.time_gate_generation))},
+            {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1022")}
+        }
+    );
+    PublishResult r;
+    r.accepted = false;
+    r.error = ErrorCode::MQTT_1022;
+    r.reason_code = time_reason::kPublishUnavailable;
+    r.retryable = true;  // 时间恢复后上层可用原业务幂等键重试
+    return r;
+}
+
+void MqttService::publishTimeGateEvent(TrustedTimeGate::EventKind kind,
+                                       const TimeGateStatus& status) {
+    // §11: 时间门禁日志事件（脱敏；无有效样本的 duration 不写 0）。
+    switch (kind) {
+        case TrustedTimeGate::EventKind::kReady:
+            MqttLogAdapter::connection().info(
+                "mqtt.time_gate.ready",
+                "可信时间恢复，门禁放行",
+                {{"time_source", tbox::fw::log::FieldValue::makeString(
+                     timeSourceToString(status.source))},
+                 {"time_reason", tbox::fw::log::FieldValue::makeString(
+                     timeGateReasonToString(status.reason))},
+                 {"time_gate_generation", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(status.time_gate_generation))}}
+            );
+            break;
+        case TrustedTimeGate::EventKind::kTrustLost:
+            MqttLogAdapter::connection().warn(
+                "mqtt.time_gate.trust_lost",
+                "运行期时间失信，撤销就绪并主动断链",
+                {{"time_reason", tbox::fw::log::FieldValue::makeString(
+                     timeGateReasonToString(status.reason))},
+                 {"time_gate_generation", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(status.time_gate_generation))},
+                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1020")}}
+            );
+            break;
+        case TrustedTimeGate::EventKind::kQueryFailed:
+            MqttLogAdapter::connection().warn(
+                "mqtt.time_gate.query_failed",
+                "可信时间查询失败，保持门禁关闭",
+                {{"time_reason", tbox::fw::log::FieldValue::makeString(
+                     timeGateReasonToString(status.reason))},
+                 {"retry_count", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(status.retry_count))},
+                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1021")}}
+            );
+            break;
+        case TrustedTimeGate::EventKind::kRetryScheduled:
+            MqttLogAdapter::connection().debug(
+                "mqtt.time_gate.retry_scheduled",
+                "时间重试已调度",
+                {{"retry_count", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(status.retry_count))},
+                 {"backoff_ms", tbox::fw::log::FieldValue::makeInt(
+                     static_cast<int64_t>(status.backoff_ms.count()))}}
+            );
+            break;
+        case TrustedTimeGate::EventKind::kBypassChanged:
+            MqttLogAdapter::connection().warn(
+                "mqtt.time_gate.bypassed",
+                "可信时间门禁被旁路（require=false，开发风险状态）",
+                {{"profile", tbox::fw::log::FieldValue::makeString("dev/test")},
+                 {"time_reason", tbox::fw::log::FieldValue::makeString(
+                     time_reason::kBypassed)},
+                 {"error_code", tbox::fw::log::FieldValue::makeString("MQTT-1020")}}
+            );
+            break;
+        case TrustedTimeGate::EventKind::kWaiting:
+            // 状态机 TIME_WAIT 分支已记录 mqtt.time_gate.waiting，此处不重复
+            break;
+    }
+}
+
 // CR-015 §18.3: 根据 owner 快照 + catalog + 当前投影/收敛状态刷新 capability readiness
 void MqttService::refreshCapabilityReadiness() {
     if (!cloud_ready_gate_) return;
@@ -1488,6 +1767,15 @@ PublishResult MqttService::publishRoute(const RoutePublishRequest& req) {
     // 会话身份切换（setTlsSessionIdentity/revokeSession）同样持此锁，
     // 因此校验通过后不可能在提交连接前发生换证/重连。
     std::lock_guard<std::mutex> lock(session_guard_mutex_);
+
+    // DSN-CR-018 §7.1: 强制模式时间门禁（与连接选择/提交串行化，防 TOCTOU）
+    if (time_gate_->isEnforced()) {
+        auto ad = time_gate_->checkAdmission();
+        if (!ad.allowed) {
+            return rejectTimeUnavailable(req.key.owner.c_str(),
+                                         topicTemplate(req.key.route_id));
+        }
+    }
 
     // CR-017 §5: capability-gated (keyprov) 上行强制携带并校验预期会话上下文。
     // 普通业务保持既有行为，不受 session guard 影响。

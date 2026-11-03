@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mqtt_types.h"
+#include "trusted_time_types.h"
 #include "config.h"
 #include "store.h"
 #include <functional>
@@ -47,10 +48,14 @@ public:
     // Get subscription snapshot config (CR-007 §6)
     SubscriptionConfig getSubscriptionConfig() const;
 
+    // DSN-CR-018 §9: 可信时间门禁配置（只读静态，不参与 applyConfig(OTA)）
+    TrustedTimeConfig getTrustedTimeConfig() const;
+
 private:
     void notifyChange();
     OfflineQueueConfig readOfflineQueueConfig() const;
     SubscriptionConfig readSubscriptionConfig() const;
+    TrustedTimeConfig readTrustedTimeConfig() const;
     // CR-008: 从全局 ConfigManager 快照读取配置字段（loadFromFramework/loadFromGlobal 共用）
     bool readConfigFromSnapshot(const std::string& config_root);
 
@@ -61,6 +66,7 @@ private:
     std::shared_ptr<const hwyz::config::ImmutableConfigView> config_snapshot_;
     OfflineQueueConfig offline_queue_config_;
     SubscriptionConfig subscription_config_;
+    TrustedTimeConfig trusted_time_config_;
     mutable std::mutex mutex_;
 };
 

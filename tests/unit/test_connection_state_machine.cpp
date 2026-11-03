@@ -483,3 +483,65 @@ TEST(ConnectionStateMachineTest, ProvisionChangeInvalidatesGeneration) {
     EXPECT_GT(sm.getConnectionGeneration(), gen1);
     EXPECT_NE(sm.getConnectionGeneration(), 0u);
 }
+
+// ============================================================
+// DSN-CR-018 §4: TIME_WAIT 状态
+// ============================================================
+
+// 时间失效：任意前置/在线态 -> TIME_WAIT；ready 恢复 -> PROV_WAIT
+TEST(ConnectionStateMachineTest, TimeGateInvalidToTimeWaitThenReadyToProvWait) {
+    ConnectionStateMachine sm;
+    sm.start();  // PROV_WAIT
+    sm.onProvisionReady();  // CERT_WAIT
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CERT_WAIT);
+
+    // 运行期时间失效（如 CERT_WAIT 期间）
+    sm.onTimeGateInvalid("time_untrusted");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+
+    // 时间恢复 -> PROV_WAIT（重新确认绑定）
+    sm.onTimeGateReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
+}
+
+// TIME_WAIT 自环：再次失效保持 TIME_WAIT
+TEST(ConnectionStateMachineTest, TimeWaitSelfLoopOnRepeatedInvalid) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onTimeGateInvalid("time_untrusted");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+    sm.onTimeGateInvalid("time_provider_unavailable");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+    // 时间不可用不消耗网络重试，不转为 OFFLINE
+    sm.onTimeGateInvalid("time_query_timeout");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+}
+
+// 在线失信：CONNECTED/CLOUD_READY -> TIME_WAIT
+TEST(ConnectionStateMachineTest, TrustLossFromOnlineGoesToTimeWait) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onProvisionReady();
+    sm.onCertificateReady();
+    sm.onGateSatisfied();
+    sm.onConnectionSuccess();
+    sm.onSubscribing();
+    sm.onSubscriptionsReady();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::CLOUD_READY);
+
+    sm.onTimeGateInvalid("time_sample_expired");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+}
+
+// 重启后 TIME_WAIT 恢复为 PROV_WAIT（重新走全链）
+TEST(ConnectionStateMachineTest, RestartDowngradesTimeWaitToProvWait) {
+    ConnectionStateMachine sm;
+    sm.start();
+    sm.onTimeGateInvalid("time_untrusted");
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::TIME_WAIT);
+
+    // 模拟重启（start 内部 restoreState 降级）
+    sm.stop();
+    sm.start();
+    EXPECT_EQ(sm.getCurrentState(), ConnectionState::PROV_WAIT);
+}

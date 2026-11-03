@@ -65,3 +65,19 @@ mqtt:
     reconcile_timeout_ms: 10000      # SUBACK 收敛超时
     suback_retry_max: 3              # SUBACK 重试上限
     owner_lease_ms: 0                # 0=关闭自动过期，避免进程抖动误删订阅
+
+  # --- Trusted time gate (DSN-CR-018 §9) ---
+  # 安全缺省 true：强制模式时间不可信时不建立云连接、不接受上行入队、不发送。
+  # production profile 必须 true（tools/mqtt-config-check.py 校验）；
+  # false 仅允许显式 dev/test 配置（config/dev/**），不安装到 runtime。
+  # SEC 配对契约（DEP-TIME-01）未落地前，强制模式将持续 TIME_WAIT（fail-closed）。
+  trusted_time:
+    require_trusted_time: true
+    query_timeout_ms: 500
+    refresh_interval_ms: 500
+    cache_max_age_ms: 1000
+    retry:
+      initial_backoff_ms: 1000
+      max_backoff_ms: 30000
+      multiplier: 2.0
+      jitter_ratio: 0.2

@@ -107,6 +107,7 @@ bool ConfigManager::readConfigFromSnapshot(const std::string& config_root) {
     // Read offline queue config
     offline_queue_config_ = readOfflineQueueConfig();
     subscription_config_ = readSubscriptionConfig();
+    trusted_time_config_ = readTrustedTimeConfig();
 
     MqttLogAdapter::ipc().info(
         "mqtt.config.loaded",
@@ -267,6 +268,11 @@ SubscriptionConfig ConfigManager::getSubscriptionConfig() const {
     return subscription_config_;
 }
 
+TrustedTimeConfig ConfigManager::getTrustedTimeConfig() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return trusted_time_config_;
+}
+
 void ConfigManager::notifyChange() {
     if (change_callback_) {
         change_callback_();
@@ -306,6 +312,40 @@ SubscriptionConfig ConfigManager::readSubscriptionConfig() const {
             subs_section->getInt("suback_retry_max", 3));
         config.owner_lease_ms = static_cast<uint64_t>(
             subs_section->getInt("owner_lease_ms", 0));
+    }
+
+    return config;
+}
+
+// DSN-CR-018 §9: 可信时间门禁配置（纯读取；缺省安全 true；非法值由
+// TrustedTimeConfig::validate 在门禁初始化时拒绝 → fail-closed）
+TrustedTimeConfig ConfigManager::readTrustedTimeConfig() const {
+    TrustedTimeConfig config;
+    if (!config_snapshot_) {
+        return config;
+    }
+
+    auto tt_section = config_snapshot_->getSection("mqtt.trusted_time");
+    if (tt_section) {
+        config.require_trusted_time =
+            tt_section->getBool("require_trusted_time", true);
+        config.query_timeout_ms = Duration(
+            tt_section->getInt("query_timeout_ms", 500));
+        config.refresh_interval_ms = Duration(
+            tt_section->getInt("refresh_interval_ms", 500));
+        config.cache_max_age_ms = Duration(
+            tt_section->getInt("cache_max_age_ms", 1000));
+        auto retry_section = tt_section->getSection("retry");
+        if (retry_section) {
+            config.retry_initial_backoff_ms = Duration(
+                retry_section->getInt("initial_backoff_ms", 1000));
+            config.retry_max_backoff_ms = Duration(
+                retry_section->getInt("max_backoff_ms", 30000));
+            config.retry_multiplier =
+                retry_section->getDouble("multiplier", 2.0);
+            config.retry_jitter_ratio =
+                retry_section->getDouble("jitter_ratio", 0.2);
+        }
     }
 
     return config;

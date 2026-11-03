@@ -82,7 +82,9 @@ std::string createConfigDir(const std::string& tag, const std::string& store_roo
             << "    socket_path: " << ipc_sock << "\n"
             << "  offline_queue:\n"
             << "    max_size: 100\n"
-            << "    drop_policy: drop_oldest\n";
+            << "    drop_policy: drop_oldest\n"
+            << "  trusted_time:\n"
+            << "    require_trusted_time: false\n";
     }
     return tmp_dir.string();
 }

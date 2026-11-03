@@ -26,6 +26,11 @@ enum class ErrorCode : uint32_t {
     MQTT_1011 = 1011,  // Mandatory Subscription 未就绪、门闩超时或 Cloud Ready 收敛失败 (CR-007 §11)
     MQTT_1012 = 1012,  // Topic 模板、变量或运行时实例化失败 (CR-009 §11)
     MQTT_1013 = 1013,  // Routed downlink SDK 事件缺失、非法、owner 不匹配或 base64 解码失败 (CR-010 §9)
+    // ---- DSN-CR-018 §5: 可信时间门禁类别（已核查本仓 1014~1019 空闲、消费方零引用后正式登记）----
+    MQTT_1020 = 1020,  // 时间信任或执行时钟不足（time_untrusted/time_unknown/time_sample_expired/time_clock_not_aligned）→ TIME_WAIT；新上行 retryable unavailable
+    MQTT_1021 = 1021,  // 时间依赖／契约不可用（time_provider_unavailable/time_query_timeout/time_contract_unsupported/time_sample_malformed）→ TIME_WAIT；恢复 SEC／持续轮询
+    MQTT_1022 = 1022,  // 上行因时间门禁拒绝（publish_time_unavailable）→ accepted=false，关联底层 time_reason
+    MQTT_1023 = 1023,  // 历史消息安全隔离／终结（queue_time_provenance_unknown/queue_transport_expired）→ 本地消息状态／计数，不伪造云业务回执
 };
 
 /// 将 ErrorCode 转为可读字符串 (CR-003 §6)
@@ -44,6 +49,10 @@ inline std::string errorCodeToString(ErrorCode code) {
         case ErrorCode::MQTT_1011: return "MQTT-1011";
         case ErrorCode::MQTT_1012: return "MQTT-1012";
         case ErrorCode::MQTT_1013: return "MQTT-1013";
+        case ErrorCode::MQTT_1020: return "MQTT-1020";
+        case ErrorCode::MQTT_1021: return "MQTT-1021";
+        case ErrorCode::MQTT_1022: return "MQTT-1022";
+        case ErrorCode::MQTT_1023: return "MQTT-1023";
         default: return "MQTT-UNKNOWN";
     }
 }

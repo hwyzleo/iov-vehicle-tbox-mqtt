@@ -38,8 +38,22 @@ enum class MessageState {
     PENDING,
     INFLIGHT,
     ACKED,
-    DROPPED
+    DROPPED,
+    // ---- DSN-CR-018 §7.3 / REQ-CR-019: 终结/隔离态（本地状态记录，不伪造云业务回执）----
+    QUARANTINED,          ///< 隔离待处理（来源不可信/旁路期/期限不确定），不自动重放
+    EXPIRED_TERMINAL,     ///< 传输期限已终结，不重放
+    PROVENANCE_UNKNOWN    ///< 来源不可信终结（旧格式/无可信受理标记）
 };
+
+/// 受理时间 provenance（DSN-CR-018 §7.2，内存级；为持久化预留）
+enum class TimeProvenance : uint8_t {
+    TRUSTED = 0,   ///< 强制模式可信受理
+    BYPASS  = 1,   ///< 旁路期受理（dev/test，恢复强制后不盲发）
+    UNKNOWN = 2    ///< 无标记/旧格式/来源不可判定
+};
+
+/// 队列 schema 版本（DSN-CR-018 §7.2；当前 v1 = provenance/期限元数据）
+constexpr uint32_t kQueueSchemaVersionCurrent = 1;
 
 // ============================================================
 // daemon 内部配置/状态 (设计 §3)
@@ -262,8 +276,25 @@ struct OutboundMessage {
     MessageState state = MessageState::PENDING;
     uint64_t identity_generation = 0;  // CR-006 §7: 入队时绑定身份 generation，身份变化后跳过过期消息
 
+    // ---- DSN-CR-018 §7.2 / REQ-CR-019: 受理 provenance 与外置期限元数据（内存级）----
+    uint32_t queue_schema_version = kQueueSchemaVersionCurrent;
+    TimeProvenance time_provenance = TimeProvenance::UNKNOWN;
+    std::string time_source;             // 非秘密来源标识
+    uint64_t time_source_epoch = 0;
+    uint64_t time_gate_generation_at_accept = 0;
+    int64_t utc_earliest_ms = 0;         // 受理时保守 UTC 区间 [earliest, latest]
+    int64_t utc_latest_ms = 0;
+    int64_t external_deadline_ms = 0;    // 外置传输截止（0=未提供；由可信 owner 声明，不从 payload 读取）
+    std::string terminal_reason;         // 终结/隔离原因（脱敏 reason code）
+
     /// 是否为 route-based 消息（CR-009 §9）
     bool isRouteBased() const { return !route.owner.empty(); }
+    /// 是否已终结/隔离（DSN-CR-018 §7.3：不自动重放）
+    bool isTerminal() const {
+        return state == MessageState::QUARANTINED ||
+               state == MessageState::EXPIRED_TERMINAL ||
+               state == MessageState::PROVENANCE_UNKNOWN;
+    }
 };
 
 /// LWT 配置 (设计 §3)

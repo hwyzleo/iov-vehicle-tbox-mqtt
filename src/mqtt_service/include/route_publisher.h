@@ -15,6 +15,7 @@
 // accepted/PUBACK、msg_id 幂等、unknown outcome 和 QoS 重发语义保持不变 (CR-009 §6.2)。
 
 #include "mqtt_types.h"
+#include "trusted_time_types.h"
 #include "tbox/mqtt/types.h"
 #include "effective_route_table.h"
 #include "topic_template_resolver.h"
@@ -39,12 +40,17 @@ public:
     /// 连接状态查询回调
     using IsConnectedFn = std::function<bool()>;
 
+    /// DSN-CR-018 §7.1: 发送前二次核查（时间租约与代际；与连接选择串行化）
+    using TimeAdmissionFn = std::function<TimeAdmission()>;
+
     RoutePublisher();
     ~RoutePublisher();
 
     void setBrokerPublishFn(BrokerPublishFn fn);
     void setQueueEnqueueFn(QueueEnqueueFn fn);
     void setIsConnectedFn(IsConnectedFn fn);
+    /// DSN-CR-018: 注入发送前时间门禁核查（缺省不拦截，保持旧行为）
+    void setTimeAdmissionFn(TimeAdmissionFn fn);
 
     /// Route-based 发布 (CR-009 §6)
     /// @param req 发布请求（owner/route_id/msg_id/payload/qos/priority）
@@ -59,6 +65,7 @@ private:
     BrokerPublishFn broker_publish_fn_;
     QueueEnqueueFn queue_enqueue_fn_;
     IsConnectedFn is_connected_fn_;
+    TimeAdmissionFn time_admission_fn_;
 };
 
 } // namespace mqtt

@@ -84,6 +84,16 @@ std::string cloudReadinessToJson(const CloudReadinessSnapshot& r) {
         caps[cap] = nlohmann::json::parse(capabilityReadinessToJson(cr));
     }
     j["capabilities"] = caps;
+    // DSN-CR-018 §8: 可信时间门禁状态（只读诊断，非秘密）
+    j["require_trusted_time"] = r.require_trusted_time;
+    j["time_gate_bypassed"] = r.time_gate_bypassed;
+    j["time_gate_ready"] = r.time_gate_ready;
+    j["time_trust_state"] = r.time_trust_state;
+    j["time_source"] = r.time_source;
+    j["time_reason"] = r.time_reason;
+    j["time_source_epoch"] = r.time_source_epoch;
+    j["time_lease_remaining_ms"] = r.time_lease_remaining_ms;
+    j["time_gate_generation"] = r.time_gate_generation;
     return j.dump();
 }
 

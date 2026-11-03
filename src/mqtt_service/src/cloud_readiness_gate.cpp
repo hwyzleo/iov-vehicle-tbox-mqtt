@@ -164,6 +164,42 @@ void CloudReadinessGate::revokeSession(const std::string& reason) {
 }
 
 // ============================================================
+// DSN-CR-018 §8: 可信时间门禁状态
+// ============================================================
+
+void CloudReadinessGate::onTimeGateState(const TimeGateStatus& status) {
+    ChangeCallback cb;
+    CapabilityChangeCallback ccb;
+    CloudReadinessSnapshot snap;
+    std::vector<CapabilityReadiness> cap_events;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        require_trusted_time_ = status.require_trusted_time;
+        time_gate_bypassed_ = status.bypassed;
+        time_gate_ready_ = status.time_gate_ready;
+        time_trust_state_ = timeTrustStateToString(status.trust_state);
+        time_source_ = timeSourceToString(status.source);
+        time_reason_ = timeGateReasonToString(status.reason);
+        time_source_epoch_ = status.source_epoch;
+        time_lease_remaining_ms_ = status.lease_remaining.count();
+        time_gate_generation_ = status.time_gate_generation;
+        // 时间失信为共享故障：enabled capability 的 not-ready reason 指向时间
+        time_failure_reason_ =
+            (status.require_trusted_time && !status.time_gate_ready)
+                ? timeGateReasonToString(status.reason)
+                : std::string{};
+        // 原子提交：cloud_ready 纳入 effective_time_condition，事件与查询同一版本
+        changed = evaluateLocked("time_gate_changed", snap);
+        if (changed) cb = callback_;
+        reevaluateCapabilitiesLocked(cap_events);
+        if (!cap_events.empty()) ccb = capability_callback_;
+    }
+    if (cb) cb(snap);
+    if (ccb) for (const auto& e : cap_events) ccb(e);
+}
+
+// ============================================================
 // CR-015 §18.3: capability-scoped readiness
 // ============================================================
 
@@ -227,6 +263,11 @@ void CloudReadinessGate::reevaluateCapabilitiesLocked(
                                                current.uplink_ready,
                                                current.downlink_suback_ready,
                                                rejected);
+        // DSN-CR-018 §8: 时间失信是共享故障，enabled capability 的 not-ready reason
+        // 指向时间（disabled 保留 disabled 主因；诊断附带 global time failure）
+        if (!time_failure_reason_.empty() && current.enabled) {
+            next.reason_code = time_failure_reason_;
+        }
         if (capabilityChanged(current, next)) {
             next.event_sequence = ++capability_sequences_[cap];
             current = next;
@@ -309,15 +350,21 @@ bool CloudReadinessGate::evaluateLocked(const std::string& reason,
     // generation==0 表示尚未提交任何可发布连接上下文，此时不得宣告身份就绪。
     const bool identity_context_valid =
         daemon_epoch_valid_ && connection_generation_ != 0;
+    // DSN-CR-018 §8: effective_time_condition = NOT require_trusted_time OR time_gate_ready
+    const bool time_condition_ok = !require_trusted_time_ || time_gate_ready_;
     bool new_ready = isConnectedState(connection_state_) &&
                      subscriptions_ready_ &&
                      !degraded_ &&
                      identity_context_valid &&
-                     connection_state_ != ConnectionState::CONNECTED_DEGRADED;
+                     connection_state_ != ConnectionState::CONNECTED_DEGRADED &&
+                     time_condition_ok;
     // CR-017 §3: epoch/上下文不可用时给出明确、可区分的 identity reason
-    const std::string effective_reason = identity_context_valid
-        ? reason
-        : session_reason::kSessionIdentityInvalid;
+    const std::string effective_reason = !identity_context_valid
+        ? session_reason::kSessionIdentityInvalid
+        : (!time_condition_ok
+               ? (time_failure_reason_.empty() ? time_reason::kUnknown
+                                               : time_failure_reason_)
+               : reason);
     last_reason_ = effective_reason;
     cloud_ready_ = new_ready;
 
@@ -358,6 +405,16 @@ CloudReadinessSnapshot CloudReadinessGate::buildSnapshotLocked(
     s.session_context.daemon_epoch = daemon_epoch_;
     s.session_context.connection_generation = connection_generation_;
     s.session_context.cert_session_generation = identity_.cert_session_generation;
+    // DSN-CR-018 §8: 可信时间门禁状态（与查询同一版本）
+    s.require_trusted_time = require_trusted_time_;
+    s.time_gate_bypassed = time_gate_bypassed_;
+    s.time_gate_ready = time_gate_ready_;
+    s.time_trust_state = time_trust_state_;
+    s.time_source = time_source_;
+    s.time_reason = time_reason_;
+    s.time_source_epoch = time_source_epoch_;
+    s.time_lease_remaining_ms = time_lease_remaining_ms_;
+    s.time_gate_generation = time_gate_generation_;
     s.capabilities = capabilities_;
     return s;
 }
@@ -380,7 +437,17 @@ bool CloudReadinessGate::snapshotChanged(const CloudReadinessSnapshot& a,
            a.connected != b.connected ||
            a.owner_generations != b.owner_generations ||
            a.mandatory_count != b.mandatory_count ||
-           a.mandatory_active != b.mandatory_active;
+           a.mandatory_active != b.mandatory_active ||
+           // DSN-CR-018 §8: 时间门禁字段变化也触发事件
+           a.require_trusted_time != b.require_trusted_time ||
+           a.time_gate_bypassed != b.time_gate_bypassed ||
+           a.time_gate_ready != b.time_gate_ready ||
+           a.time_trust_state != b.time_trust_state ||
+           a.time_source != b.time_source ||
+           a.time_reason != b.time_reason ||
+           a.time_source_epoch != b.time_source_epoch ||
+           a.time_lease_remaining_ms != b.time_lease_remaining_ms ||
+           a.time_gate_generation != b.time_gate_generation;
 }
 
 bool CloudReadinessGate::isCloudReady() const {

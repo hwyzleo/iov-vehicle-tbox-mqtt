@@ -62,7 +62,9 @@ std::string makeConfig(const std::string& dir,
           << "  offline_queue:\n    max_size: 100\n"
           << "  ipc:\n    socket_path: \"" << socket_path << "\"\n"
           << "    dispatch_queue_size: 1024\n"
-          << "    subscriber_queue_size: 128\n";
+          << "    subscriber_queue_size: 128\n"
+          << "  trusted_time:\n"
+          << "    require_trusted_time: false\n";
     }
     return dir;
 }

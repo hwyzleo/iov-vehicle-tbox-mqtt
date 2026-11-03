@@ -41,7 +41,9 @@ std::string createE2EConfigDir() {
             << "    credential_profile: mqtt\n"
             << "    min_version: \"1.2\"\n"
             << "    max_version: \"1.3\"\n"
-            << "    handshake_timeout_ms: 10000\n";
+            << "    handshake_timeout_ms: 10000\n"
+            << "  trusted_time:\n"
+            << "    require_trusted_time: false\n";
     }
 
     return tmp_dir.string();

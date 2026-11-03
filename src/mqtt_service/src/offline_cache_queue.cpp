@@ -120,7 +120,7 @@ std::vector<OutboundMessage> OfflineCacheQueue::getMessagesByState(MessageState 
 OfflineCacheQueue::QueueStats OfflineCacheQueue::getStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    QueueStats stats = {0, 0, 0, 0, 0};
+    QueueStats stats = {0, 0, 0, 0, 0, 0, 0, 0};
     stats.total_count = message_map_.size();
 
     for (const auto& pair : message_map_) {
@@ -136,6 +136,15 @@ OfflineCacheQueue::QueueStats OfflineCacheQueue::getStats() const {
                 break;
             case MessageState::DROPPED:
                 stats.dropped_count++;
+                break;
+            case MessageState::QUARANTINED:
+                stats.quarantined_count++;
+                break;
+            case MessageState::EXPIRED_TERMINAL:
+                stats.expired_count++;
+                break;
+            case MessageState::PROVENANCE_UNKNOWN:
+                stats.provenance_unknown_count++;
                 break;
         }
     }

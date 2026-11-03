@@ -44,7 +44,9 @@ std::string createTempConfigDir() {
             << "    handshake_timeout_ms: 10000\n"
             << "  offline_queue:\n"
             << "    max_size: 100\n"
-            << "    drop_policy: drop_oldest\n";
+            << "    drop_policy: drop_oldest\n"
+            << "  trusted_time:\n"
+            << "    require_trusted_time: false\n";
     }
 
     return tmp_dir.string();

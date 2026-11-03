@@ -123,6 +123,44 @@ fields:
           reconcile_timeout_ms: {type: integer, min: 0}
           suback_retry_max: {type: integer, min: 0}
           owner_lease_ms: {type: integer, min: 0}
+      # DSN-CR-018 §9: 可信时间门禁（新增提案键；production profile 强制 require=true）
+      trusted_time:
+        type: map
+        fields:
+          require_trusted_time:
+            type: boolean
+            # production 必须 true；false 仅显式 dev/test（见 tools/mqtt-config-check.py profile 规则）
+          query_timeout_ms:
+            type: integer
+            min: 50
+            max: 1000
+          refresh_interval_ms:
+            type: integer
+            min: 100
+            max: 1000
+          cache_max_age_ms:
+            type: integer
+            min: 100
+            max: 1000
+          retry:
+            type: map
+            fields:
+              initial_backoff_ms:
+                type: integer
+                min: 100
+                max: 10000
+              max_backoff_ms:
+                type: integer
+                min: 100
+                max: 60000
+              multiplier:
+                type: number
+                min: 1.0
+                max: 4.0
+              jitter_ratio:
+                type: number
+                min: 0.0
+                max: 0.5
 
 # --- 禁止字段（任何 profile 下出现即失败） ---
 # 本地 TLS credential 回退 / secret / 身份字段（REQ-002 / §17.3 / CR-005 §8）

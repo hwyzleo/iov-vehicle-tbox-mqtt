@@ -271,3 +271,54 @@ TEST(ConfigManagerTest, OtaConfigVersionCheck) {
     cleanupTempConfigDir(config_dir);
     cleanupTempStoreDir(store_dir);
 }
+
+// ============================================================
+// DSN-CR-018 §9: trusted_time 配置读取与缺省
+// ============================================================
+
+TEST(ConfigManagerTrustedTimeTest, DefaultRequireTrueWhenSectionMissing) {
+    std::string dir = createTempConfigDir();
+    ConfigManager config;
+    ASSERT_TRUE(config.loadFromFramework(dir));
+    auto tt = config.getTrustedTimeConfig();
+    // 安全缺省：缺键也默认 true（DSN-CR-018 §9）
+    EXPECT_TRUE(tt.require_trusted_time);
+    EXPECT_EQ(tt.query_timeout_ms.count(), 500);
+    EXPECT_EQ(tt.refresh_interval_ms.count(), 500);
+    EXPECT_EQ(tt.cache_max_age_ms.count(), 1000);
+    EXPECT_EQ(tt.retry_initial_backoff_ms.count(), 1000);
+    EXPECT_EQ(tt.retry_max_backoff_ms.count(), 30000);
+    EXPECT_EQ(tt.retry_multiplier, 2.0);
+    EXPECT_EQ(tt.retry_jitter_ratio, 0.2);
+    cleanupTempConfigDir(dir);
+}
+
+TEST(ConfigManagerTrustedTimeTest, ReadExplicitSection) {
+    std::string dir = createTempConfigDir();
+    auto conf_d = std::filesystem::path(dir) / "conf.d" / "mqtt.yaml";
+    {
+        std::ofstream ofs(conf_d, std::ios::app);
+        ofs << "  trusted_time:\n"
+            << "    require_trusted_time: false\n"
+            << "    query_timeout_ms: 700\n"
+            << "    refresh_interval_ms: 800\n"
+            << "    cache_max_age_ms: 900\n"
+            << "    retry:\n"
+            << "      initial_backoff_ms: 2000\n"
+            << "      max_backoff_ms: 45000\n"
+            << "      multiplier: 3.0\n"
+            << "      jitter_ratio: 0.3\n";
+    }
+    ConfigManager config;
+    ASSERT_TRUE(config.loadFromFramework(dir));
+    auto tt = config.getTrustedTimeConfig();
+    EXPECT_FALSE(tt.require_trusted_time);
+    EXPECT_EQ(tt.query_timeout_ms.count(), 700);
+    EXPECT_EQ(tt.refresh_interval_ms.count(), 800);
+    EXPECT_EQ(tt.cache_max_age_ms.count(), 900);
+    EXPECT_EQ(tt.retry_initial_backoff_ms.count(), 2000);
+    EXPECT_EQ(tt.retry_max_backoff_ms.count(), 45000);
+    EXPECT_EQ(tt.retry_multiplier, 3.0);
+    EXPECT_EQ(tt.retry_jitter_ratio, 0.3);
+    cleanupTempConfigDir(dir);
+}

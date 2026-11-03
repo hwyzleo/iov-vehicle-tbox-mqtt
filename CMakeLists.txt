@@ -95,6 +95,8 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/legacy_topic_guard.cpp
     # CR-015: 编译期受控 SubscriptionCatalog
     src/mqtt_service/src/subscription_catalog.cpp
+    # DSN-CR-018: 可信时间门禁
+    src/mqtt_service/src/trusted_time_gate.cpp
 )
 
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})

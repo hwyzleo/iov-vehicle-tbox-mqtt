@@ -17,6 +17,7 @@
 #include "route_publisher.h"
 #include "downlink_route_dispatcher.h"
 #include "legacy_topic_guard.h"
+#include "trusted_time_gate.h"
 #include "store.h"
 #include "ipc.h"
 #include <functional>
@@ -35,6 +36,7 @@ class ConfigManager;
 class CredentialManager;
 class SecTlsKeyAdapter;
 class ProvisionIdentityManager;
+class TrustedTimeGate;
 
 /// Main MQTT service (设计 §5, CR-004 §2)
 ///
@@ -112,6 +114,11 @@ public:
     bool applyConfig(const ConnectionConfig& config,
                      ConnectionConfig::Source source);
 
+    // ---- DSN-CR-018 测试钩子（仅测试；生产路径不经此接口）----
+    /// 注入时间提供方（须在 startExternal 前调用）；Fake 仅 dev/test fixture，
+    /// production 工厂与 schema 拒绝。未注入时使用 createDefaultTimeProvider()。
+    void setTimeGateProviderForTest(std::shared_ptr<ITrustedTimeProvider> provider);
+
     // ---- MqttIpcDispatcher::ServiceHandler 实现 (CR-004 §3) ----
     std::pair<int32_t, bool> onPublish(const PublishEnvelope& env) override;
     std::pair<int32_t, bool> onSubscribe(const Route& route, int client_fd) override;
@@ -156,6 +163,8 @@ private:
     std::unique_ptr<OfflineCacheQueue> cache_queue_;
     std::unique_ptr<RouteBridge> route_bridge_;
     std::unique_ptr<ConfigManager> config_manager_;
+    // DSN-CR-018: 可信时间门禁（独立退避/租约/代际权威）
+    std::unique_ptr<TrustedTimeGate> time_gate_;
     // CR-008: 外部依赖以引用注入，所有权归 MqttApplication
     ProvisionIdentityManager& prov_mgr_;
     CredentialManager& cred_mgr_;
@@ -199,6 +208,19 @@ private:
     void reconcileSubscriptions();
     void evaluateCloudReadiness();
     void publishCloudReadyEvent(const CloudReadinessSnapshot& snapshot);
+    // DSN-CR-018 §8: 时间门禁状态变化 → 更新 Cloud Readiness 快照并评估
+    void onTimeGateChanged(const TimeGateStatus& status, bool ready_changed);
+    void publishTimeGateEvent(TrustedTimeGate::EventKind kind,
+                              const TimeGateStatus& status);
+    // DSN-CR-018 §7.1: 时间门禁拒绝结果（MQTT-1022，retryable unavailable，不污染去重）
+    PublishResult rejectTimeUnavailable(const char* owner,
+                                        const std::string& route_id_hash);
+    // DSN-CR-018 §7.3 / REQ-CR-019 §5: 历史项恢复判定矩阵
+    // 返回 false = 已终结/隔离，调用方跳过；enforced=false（旁路）保持旧行为全部重放
+    bool replayQueueItem(OutboundMessage& msg, OfflineCacheQueue* queue,
+                         const TimeAdmission& current_admission, bool enforced);
+    void logQueueTerminal(const OutboundMessage& msg, const char* event,
+                          const char* reason);
     // CR-015: capability readiness 刷新与事件发布
     void refreshCapabilityReadiness();
     void publishCapabilityEvent(const CapabilityReadiness& readiness);

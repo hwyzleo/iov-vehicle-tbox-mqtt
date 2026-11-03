@@ -90,3 +90,19 @@ mqtt:
     reconcile_timeout_ms: 10000      # SUBACK 收敛超时
     suback_retry_max: 3              # SUBACK 重试上限
     owner_lease_ms: 0                # 0=关闭自动过期，避免进程抖动误删订阅
+
+  # --- Trusted time gate (DSN-CR-018 §9/§10.1) ---
+  # DEVELOPMENT-ONLY 旁路：真实时间来源（SEC 配对契约 DEP-TIME-01）落地前，
+  # 隔离开发环境显式 require=false 保持旧连接/入队行为（P0 fail-open 阶段风险，
+  # 由开发配置启用者与项目维护者承担，production 禁止）。
+  # 强制模式单测/集成测试显式 require=true 并注入 Fake 提供方（不进入本文件）。
+  trusted_time:
+    require_trusted_time: false
+    query_timeout_ms: 500
+    refresh_interval_ms: 500
+    cache_max_age_ms: 1000
+    retry:
+      initial_backoff_ms: 1000
+      max_backoff_ms: 30000
+      multiplier: 2.0
+      jitter_ratio: 0.2

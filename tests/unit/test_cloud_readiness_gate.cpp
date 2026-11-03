@@ -406,3 +406,111 @@ TEST(CloudReadinessGateTest, OldGenerationSessionIsStaleAfterContextReplacement)
     new_ctx.cert_session_generation = 2;
     EXPECT_TRUE(gate.validateSession(new_ctx));
 }
+
+// ============================================================
+// DSN-CR-018 §8: 可信时间门禁字段与共享失效
+// ============================================================
+
+namespace {
+TimeGateStatus makeTimeStatus(bool ready, bool require = true,
+                              const char* reason = "time_untrusted") {
+    TimeGateStatus st;
+    st.require_trusted_time = require;
+    st.bypassed = !require;
+    st.time_gate_ready = ready;
+    st.trust_state = ready ? TimeTrustState::Trusted : TimeTrustState::Untrusted;
+    st.source = TimeSource::PlatformSync;
+    st.reason = ready ? TimeGateReason::None : TimeGateReason::Untrusted;
+    st.source_epoch = 1;
+    st.lease_remaining = std::chrono::milliseconds(500);
+    st.time_gate_generation = ready ? 1 : 2;
+    return st;
+}
+}
+
+// cloud_ready = 既有连接订阅条件 AND effective_time_condition（§8）
+TEST(CloudReadinessGateTimeTest, TimeGateBlocksReadyWhenEnforcedNotReady) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CLOUD_READY, 1);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 2, 2);
+
+    // 时间失信（强制）→ cloud_ready 必须为 false
+    gate.onTimeGateState(makeTimeStatus(false));
+    EXPECT_FALSE(gate.isCloudReady());
+    auto snap = gate.getReadiness();
+    EXPECT_TRUE(snap.require_trusted_time);
+    EXPECT_FALSE(snap.time_gate_ready);
+    EXPECT_EQ(snap.time_trust_state, "Untrusted");
+    EXPECT_EQ(snap.time_reason, "time_untrusted");
+    EXPECT_EQ(snap.time_gate_generation, 2u);
+
+    // 时间恢复 → cloud_ready 恢复
+    gate.onTimeGateState(makeTimeStatus(true));
+    EXPECT_TRUE(gate.isCloudReady());
+    EXPECT_TRUE(gate.getReadiness().time_gate_ready);
+    EXPECT_EQ(gate.getReadiness().time_reason, "");
+}
+
+// 时间失信：所有 enabled capability ready=false，reason 指向时间；
+// disabled 保留 disabled 主因（§8）
+TEST(CloudReadinessGateTimeTest, TimeFailureRevokesEnabledCapabilities) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CLOUD_READY, 1);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 2, 2);
+    gate.setCapabilityState(kCapabilitySecurityKeyprov, /*enabled=*/true,
+                            /*contract=*/true, /*snapshot=*/true,
+                            /*uplink=*/true, /*owner_gen=*/1);
+    gate.setCapabilityDownlinkReady(kCapabilitySecurityKeyprov, true);
+    EXPECT_TRUE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+
+    // 时间失信 → capability ready=false，reason 指向时间
+    gate.onTimeGateState(makeTimeStatus(false));
+    auto cap = gate.getCapabilityReadiness(kCapabilitySecurityKeyprov);
+    EXPECT_FALSE(cap.ready);
+    EXPECT_EQ(cap.reason_code, "time_untrusted");
+
+    // 时间恢复 → capability 恢复
+    gate.onTimeGateState(makeTimeStatus(true));
+    EXPECT_TRUE(gate.getCapabilityReadiness(kCapabilitySecurityKeyprov).ready);
+}
+
+// 旁路（require=false）：不拦截 cloud_ready，但 time_gate_bypassed 标记
+TEST(CloudReadinessGateTimeTest, BypassDoesNotGateReady) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CLOUD_READY, 1);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 2, 2);
+
+    gate.onTimeGateState(makeTimeStatus(false, /*require=*/false));
+    EXPECT_TRUE(gate.isCloudReady());  // 旁路不改变旧结果
+    auto snap = gate.getReadiness();
+    EXPECT_TRUE(snap.time_gate_bypassed);
+    EXPECT_FALSE(snap.require_trusted_time);
+}
+
+// 事件 sequence 与查询同一版本（原子提交 → 递增 → 投递）
+TEST(CloudReadinessGateTimeTest, TimeEventSequenceConsistent) {
+    CloudReadinessGate gate;
+    gate.onConnectionState(ConnectionState::CLOUD_READY, 1);
+    gate.setTlsSessionIdentity(makeIdentity(1));
+    gate.onSubscriptionsReady(true, 1, 1);
+
+    const uint64_t seq_before = gate.getReadiness().event_sequence;
+    CloudReadinessSnapshot cb_snap;
+    bool cb_fired = false;
+    gate.setCallback([&](const CloudReadinessSnapshot& s) {
+        cb_snap = s;
+        cb_fired = true;
+    });
+
+    gate.onTimeGateState(makeTimeStatus(false));
+    EXPECT_TRUE(cb_fired);
+    auto snap = gate.getReadiness();
+    EXPECT_GT(snap.event_sequence, seq_before);
+    // 事件携带的快照与查询读取同一版本（原子提交 → 递增 sequence → 投递）
+    EXPECT_EQ(cb_snap.event_sequence, snap.event_sequence);
+    EXPECT_EQ(cb_snap.cloud_ready, snap.cloud_ready);
+    EXPECT_FALSE(cb_snap.cloud_ready);
+}

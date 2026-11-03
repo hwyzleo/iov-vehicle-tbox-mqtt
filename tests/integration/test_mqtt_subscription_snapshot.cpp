@@ -48,7 +48,9 @@ std::string createTempConfigDir() {
             << "    subscriber_queue_size: 128\n    slow_subscriber_policy: disconnect\n"
             << "  subscriptions:\n    required_owners: [\"tsp\"]\n"
             << "    startup_wait_timeout_ms: 5000\n    reconcile_timeout_ms: 10000\n"
-            << "    suback_retry_max: 3\n    owner_lease_ms: 0\n";
+            << "    suback_retry_max: 3\n    owner_lease_ms: 0\n"
+            << "  trusted_time:\n"
+            << "    require_trusted_time: false\n";
     }
     return tmp.string();
 }

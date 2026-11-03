@@ -78,6 +78,14 @@ public:
     void onMandatoryFailed(const std::string& reason);
     /// Cloud Ready 丢失（新 generation/mandatory 变化）：CLOUD_READY -> SUBSCRIBING
     void onCloudReadyLost();
+
+    // ---- DSN-CR-018 §4: 可信时间门禁事件 ----
+    /// 时间门禁就绪：TIME_WAIT -> PROV_WAIT（重置 PROV 计数，重新确认绑定再判凭据）
+    void onTimeGateReady();
+    /// 时间门禁失效：任意前置/在线态 -> TIME_WAIT。
+    /// 在线态由上层先完成有序撤销（readiness/连接上下文），再调用本方法；
+    /// 本方法不虚增 connection_generation（下次实际连接 attempt 才分配新代际，§6.2）。
+    void onTimeGateInvalid(const std::string& reason);
     bool isDegraded() const;
     void setDegraded(bool d);
 
