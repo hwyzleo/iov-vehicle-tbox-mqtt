@@ -172,6 +172,13 @@ struct PublishOptions {
     std::string trace_id;
     std::string request_id;
     std::optional<SessionContext> expected_session;  // CR-017：会话绑定 guard
+    /// DSN-CR-018 §7.2/§7.3：外置传输截止（绝对 epoch 毫秒，0=未提供）。
+    ///
+    /// 由可信 owner 从自身协议信封声明，daemon 不解析 payload 取值。
+    /// 声明后进入 OutboundMessage.external_deadline_ms，历史项恢复时参与
+    /// evaluateQueueReplay 判定（可信时间保守区间比较 → 终结/隔离，不盲发）。
+    /// 未声明（0）时恢复判定跳过期限检查，退化为旧行为。
+    int64_t external_deadline_ms = 0;
 };
 
 // ============================================================

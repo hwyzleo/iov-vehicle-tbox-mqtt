@@ -1129,6 +1129,11 @@ PublishResult Client::publishRoute(const std::string& owner,
     }
     params["trace_id"] = options.trace_id;
     params["request_id"] = options.request_id;
+    // DSN-CR-018 §7.2：外置传输截止（绝对 epoch 毫秒）。0 = 未声明则不下传，
+    // 保持与旧 daemon 的线兼容（旧 daemon 忽略未知键）。
+    if (options.external_deadline_ms > 0) {
+        params["external_deadline_ms"] = options.external_deadline_ms;
+    }
     if (options.expected_session.has_value()) {
         nlohmann::json sc = nlohmann::json::object();
         sc["daemon_epoch"] = options.expected_session->daemon_epoch;

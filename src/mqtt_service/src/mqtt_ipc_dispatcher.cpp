@@ -531,6 +531,15 @@ std::pair<int32_t, std::string> MqttIpcDispatcher::handlePublishRoute(
     req.trace_id = j.value("trace_id", "");
     req.request_id = j.value("request_id", "");
 
+    // DSN-CR-018 §7.2: 可信 owner 声明的外置传输截止（绝对 epoch 毫秒）。
+    // 非正值/非整数一律视为未声明（0），不报错——缺省行为是跳过期限判定，
+    // 不是拒绝发布（拒绝会让未升级的调用方全部失败）。
+    if (j.contains("external_deadline_ms") &&
+        j["external_deadline_ms"].is_number_integer()) {
+        const int64_t deadline = j["external_deadline_ms"].get<int64_t>();
+        req.external_deadline_ms = deadline > 0 ? deadline : 0;
+    }
+
     // CR-017 §5: 可选预期会话上下文（keyprov.uplink 必填，由 daemon 强制）
     if (j.contains("expected_session") && j["expected_session"].is_object()) {
         const auto& es = j["expected_session"];

@@ -411,3 +411,45 @@ TEST(RoutePublisherTest, OnlineSendRecheckedBeforePublish) {
     EXPECT_EQ(r.error.value(), ErrorCode::MQTT_1022);
     EXPECT_FALSE(env.broker_called);  // 未提交实际发送
 }
+
+// ---------------------------------------------------------------------------
+// DSN-CR-018 §7.2: external_deadline_ms 承载
+//
+// 调用方（可信 owner）声明的外置传输截止必须原样落到 OutboundMessage，
+// 供历史项恢复时 evaluateQueueReplay 判定终结/隔离。daemon 不解析 payload。
+// ---------------------------------------------------------------------------
+TEST(RoutePublisherTest, OfflineEnqueueCarriesExternalDeadline) {
+    RoutePublisherTestEnv env;
+    env.setupRoutes("ECU123", 1);
+    env.is_connected = false;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", "fota.up"};
+    req.msg_id = "msg_deadline_1";
+    req.payload = {0x03};
+    req.external_deadline_ms = 1767225600000LL;  // 2026-01-01T00:00:00Z
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+
+    ASSERT_TRUE(result.accepted);
+    ASSERT_TRUE(env.enqueue_called);
+    EXPECT_EQ(env.enqueued_msg.external_deadline_ms, 1767225600000LL);
+}
+
+TEST(RoutePublisherTest, OfflineEnqueueWithoutDeadlineKeepsZero) {
+    RoutePublisherTestEnv env;
+    env.setupRoutes("ECU123", 1);
+    env.is_connected = false;
+
+    RoutePublishRequest req;
+    req.key = {"tsp", "fota.up"};
+    req.msg_id = "msg_deadline_2";
+    req.payload = {0x04};
+    // 未声明：恢复判定跳过期限检查（退化为旧行为）
+
+    auto result = env.publisher.publishRoute(req, env.table, env.resolver);
+
+    ASSERT_TRUE(result.accepted);
+    ASSERT_TRUE(env.enqueue_called);
+    EXPECT_EQ(env.enqueued_msg.external_deadline_ms, 0);
+}

@@ -190,6 +190,9 @@ PublishResult RoutePublisher::publishRoute(
         msg.time_gate_generation_at_accept = ad.time_gate_generation;
         msg.utc_earliest_ms = ad.utc_earliest_ms;
         msg.utc_latest_ms = ad.utc_latest_ms;
+        // DSN-CR-018 §7.2: 承载可信 owner 声明的外置传输截止（不解析 payload）。
+        // 0 = 未声明，恢复判定跳过期限检查（退化为旧行为）。
+        msg.external_deadline_ms = req.external_deadline_ms;
 
         if (queue_enqueue_fn_ && queue_enqueue_fn_(msg)) {
             result.accepted = true;

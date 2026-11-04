@@ -245,6 +245,9 @@ struct RoutePublishRequest {
     std::string request_id;
     // CR-017 §5: 调用方构造报文时使用的预期会话上下文；keyprov.uplink 必填。
     std::optional<SessionContext> expected_session;
+    // DSN-CR-018 §7.2: 可信 owner 声明的外置传输截止（绝对 epoch 毫秒，0=未提供）。
+    // daemon 不从 payload 读取；仅承载调用方声明值，用于历史项恢复判定。
+    int64_t external_deadline_ms = 0;
 };
 
 /// Route-based 下行事件 (CR-009 §3, §7)

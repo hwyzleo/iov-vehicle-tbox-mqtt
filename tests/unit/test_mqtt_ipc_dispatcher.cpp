@@ -432,3 +432,58 @@ TEST_F(MqttIpcDispatcherTest, PublishRouteResponseCarriesReasonAndRetryable) {
     EXPECT_EQ(parsed["reason_code"], session_reason::kPublishContextStale);
     EXPECT_TRUE(parsed["retryable"].get<bool>());
 }
+
+// ---------------------------------------------------------------------------
+// DSN-CR-018 §7.2: external_deadline_ms 解析
+// 由可信 owner 显式声明；daemon 不从 payload 读取。非法/非正值视为未声明（0），
+// 不拒绝发布——否则未升级的调用方会全部失败。
+// ---------------------------------------------------------------------------
+TEST_F(MqttIpcDispatcherTest, PublishRouteParsesExternalDeadline) {
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = "fota.uplink";
+    j["msg_id"] = "mp-dl-1";
+    j["external_deadline_ms"] = 1767225600000LL;  // 2026-01-01T00:00:00Z
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 940);
+
+    ASSERT_TRUE(handler.has_route_req);
+    EXPECT_EQ(handler.last_route_req.external_deadline_ms, 1767225600000LL);
+}
+
+TEST_F(MqttIpcDispatcherTest, PublishRouteWithoutExternalDeadlineIsZero) {
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = "fota.uplink";
+    j["msg_id"] = "mp-dl-2";
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 941);
+
+    ASSERT_TRUE(handler.has_route_req);
+    EXPECT_EQ(handler.last_route_req.external_deadline_ms, 0);
+}
+
+TEST_F(MqttIpcDispatcherTest, PublishRouteRejectsMalformedExternalDeadline) {
+    // 负值与非整数类型都按未声明处理，且不影响受理
+    json j;
+    j["owner"] = "tsp";
+    j["route_id"] = "fota.uplink";
+    j["msg_id"] = "mp-dl-3";
+    j["external_deadline_ms"] = -1;
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 942);
+    ASSERT_TRUE(handler.has_route_req);
+    EXPECT_EQ(handler.last_route_req.external_deadline_ms, 0);
+
+    handler.has_route_req = false;
+    j["msg_id"] = "mp-dl-4";
+    j["external_deadline_ms"] = "not-a-number";
+
+    dispatcher->dispatch(
+        static_cast<uint32_t>(ipc::MethodId::PUBLISH_ROUTE), j.dump(), 943);
+    ASSERT_TRUE(handler.has_route_req);
+    EXPECT_EQ(handler.last_route_req.external_deadline_ms, 0);
+}
