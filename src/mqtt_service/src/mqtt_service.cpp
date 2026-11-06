@@ -12,6 +12,7 @@
 #include "mqtt_context.h"
 #include "queue_replay_policy.h"
 #include "utils.h"
+#include "sec_time_provider.h"
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <set>
@@ -43,7 +44,8 @@ std::string fingerprintPrefix(const std::string& ref) {
 MqttService::MqttService(std::shared_ptr<hwyz::store::Store> store,
                          ProvisionIdentityManager& prov_mgr,
                          CredentialManager& cred_mgr,
-                         SecTlsKeyAdapter& tls_adapter)
+                         SecTlsKeyAdapter& tls_adapter,
+                         const std::string& sec_socket_path)
     : state_machine_(std::make_unique<ConnectionStateMachine>()),
       client_manager_(std::make_unique<MqttClientManager>()),
       cache_queue_(std::make_unique<OfflineCacheQueue>(1000)),
@@ -52,6 +54,7 @@ MqttService::MqttService(std::shared_ptr<hwyz::store::Store> store,
       prov_mgr_(prov_mgr),
       cred_mgr_(cred_mgr),
       tls_adapter_(tls_adapter),
+      sec_socket_path_(sec_socket_path),
       store_(std::move(store)),
       snapshot_registry_(std::make_unique<OwnerSnapshotRegistry>()),
       effective_table_(std::make_unique<EffectiveSubscriptionTable>()),
@@ -158,7 +161,11 @@ bool MqttService::initializeLocal() {
             {{"reason", tbox::fw::log::FieldValue::makeString(tt_err)}}
         );
     }
-    time_gate_->setProvider(createDefaultTimeProvider());
+    // DSN-CR-018 §9 / TBOX-SEC-DSN-CR-024：可信时间门禁接入生产 SEC provider
+    // （替换默认 ContractUnsupported）：未认证 NTP → SEC Untrusted → 门禁保持
+    // TIME_WAIT；SEC 不可达 → ProviderUnavailable → TIME_WAIT（fail-closed）。
+    time_provider_ = createSecTimeProvider(sec_socket_path_);
+    time_gate_->setProvider(time_provider_);
     time_gate_->setChangeCallback(
         [this](const TimeGateStatus& status, bool ready_changed) {
             onTimeGateChanged(status, ready_changed);

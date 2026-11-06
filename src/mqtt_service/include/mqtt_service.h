@@ -54,10 +54,12 @@ public:
     /// @param prov_mgr   PROV 身份管理器
     /// @param cred_mgr   SEC 凭据管理器
     /// @param tls_adapter SEC TLS key adapter
+    /// @param sec_socket_path SEC daemon IPC socket 路径（可信时间 provider 用）
     MqttService(std::shared_ptr<hwyz::store::Store> store,
                 ProvisionIdentityManager& prov_mgr,
                 CredentialManager& cred_mgr,
-                SecTlsKeyAdapter& tls_adapter);
+                SecTlsKeyAdapter& tls_adapter,
+                const std::string& sec_socket_path = "/tmp/tbox-sec.sock");
     ~MqttService();
 
     // ---- CR-008 分阶段生命周期 ----
@@ -169,6 +171,8 @@ private:
     ProvisionIdentityManager& prov_mgr_;
     CredentialManager& cred_mgr_;
     SecTlsKeyAdapter& tls_adapter_;
+    std::string sec_socket_path_;   ///< SEC daemon IPC socket（可信时间 provider）
+    std::shared_ptr<ITrustedTimeProvider> time_provider_;  ///< 生产 SEC 时间 provider（保持连接存活）
     std::shared_ptr<hwyz::store::Store> store_;  // 注入（ConfigManager/StateMachine 需 shared_ptr）
 
     // IPC (CR-004 §2)

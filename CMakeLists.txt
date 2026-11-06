@@ -97,6 +97,8 @@ set(MQTT_SERVICE_SOURCES
     src/mqtt_service/src/subscription_catalog.cpp
     # DSN-CR-018: 可信时间门禁
     src/mqtt_service/src/trusted_time_gate.cpp
+    # TBOX-SEC-DSN-CR-024: SEC 配对可信时间 provider
+    src/mqtt_service/src/sec_time_provider.cpp
 )
 
 add_library(mqtt_service_lib ${MQTT_SERVICE_SOURCES})

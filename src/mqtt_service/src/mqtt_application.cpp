@@ -95,7 +95,8 @@ bool MqttApplication::initialize() {
 
     // ---- c. MqttService（注入外部依赖）----
     service_ = std::make_unique<MqttService>(
-        state_store_, *prov_client_, *credential_manager_, *tls_manager_);
+        state_store_, *prov_client_, *credential_manager_, *tls_manager_,
+        sec_socket_path);
 
     // ---- d. initializeLocal（本地能力：配置/队列/订阅/IPC 先可用）----
     if (!service_->initializeLocal()) {

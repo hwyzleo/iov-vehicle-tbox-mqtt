@@ -610,6 +610,14 @@ target_link_directories(test_mqtt_time_gate_service PRIVATE ${MOSQUITTO_LIBRARY_
 target_link_libraries(test_mqtt_time_gate_service mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} ${MOSQUITTO_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto pthread)
 add_test(NAME MqttTimeGateServiceTest COMMAND test_mqtt_time_gate_service)
 
+# TBOX-SEC-DSN-CR-024: SEC 配对可信时间 provider（envelope 映射 + 不可达 fail-closed）
+add_executable(test_sec_time_provider
+    unit/test_sec_time_provider.cpp
+)
+target_include_directories(test_sec_time_provider PRIVATE ${TEST_COMMON_INCLUDES})
+target_link_libraries(test_sec_time_provider mqtt_service_lib GTest::gtest_main ${FRAMEWORK_LIB} ${SEC_CLIENT_LIB} ${PROV_CLIENT_LIB} pthread)
+add_test(NAME SecTimeProviderTest COMMAND test_sec_time_provider)
+
 # 退避/计数工具（header-only）
 add_executable(test_dependency_recovery
     unit/test_dependency_recovery.cpp
